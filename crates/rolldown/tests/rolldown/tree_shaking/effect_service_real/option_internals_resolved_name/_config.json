@@ -1,0 +1,9 @@
+{
+  "_comment": "Uses the real effect package from the repository devDependencies. Runs with effectServiceShakingAssumeNoReflection.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true,
+      "effectServiceShakingAssumeNoReflection": true
+    }
+  }
+}
