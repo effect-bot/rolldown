@@ -43,8 +43,8 @@ const runPromise = async (self) => {
 // ../node_modules/effect/Context.js
 const Service = (key) => {
 	const self = make(async (context) => {
-		if (!context.has(key)) throw new Error(`Service not found: ${key}`);
-		return context.get(key);
+		if (!context.has(self.key)) throw new Error(`Service not found: ${self.key}`);
+		return context.get(self.key);
 	});
 	self.key = key;
 	self.of = (service) => service;
