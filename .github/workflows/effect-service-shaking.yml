@@ -1,20 +1,24 @@
 name: Effect Service Shaking
 
-# Fork-owned CI for `experimental.effectServiceShaking`. Runs on standard
-# GitHub runners, independent of the upstream workflows and of the Effect repo.
+# Fork-owned CI for `experimental.effectServiceShaking`, scoped to Effect's
+# use case on Node: one Linux job that runs the Effect service fixtures and the
+# real-Effect gates through the JS API. It builds only the integration test
+# binary, the NAPI binding and the JS glue those checks need. The rest of
+# Rolldown's CI (full integration suite, test262, other targets, lints) is
+# intentionally not run here.
 
 on:
-  push:
-    branches:
-      - effect-service-demand-tests
+  # PR runs only, so a push to the PR branch does not start a second run.
   pull_request:
+    branches:
+      - effect-pinned-v1.2.16
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -22,14 +26,13 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  rust:
-    name: Native pass and regression suite
+  effect-service-shaking:
+    name: Effect service fixtures and real-Effect gates (Linux, Node 24)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
           persist-credentials: false
 
       - uses: pnpm/action-setup@v4
@@ -50,50 +53,40 @@ jobs:
         with:
           key: effect-service-shaking
 
-      - name: Effect service shaking fixtures (stub and real Effect)
+      - name: Effect service fixtures (stub and real Effect)
+        id: fixtures
         run: cargo test -p rolldown --test integration -- effect_service
 
-      - name: Full integration suite
-        run: cargo test -p rolldown --test integration
+      # The steps below still run when a fixture fails, so a failing fixture
+      # does not hide the JS API gate results.
+      - name: Effect service snapshots are up to date
+        if: ${{ !cancelled() && steps.fixtures.outcome != 'skipped' }}
+        run: |
+          changes=$(git status --porcelain -- crates/rolldown/tests/rolldown/tree_shaking/effect_service crates/rolldown/tests/rolldown/tree_shaking/effect_service_real)
+          if [ -n "$changes" ]; then
+            echo "$changes"
+            git diff -- crates/rolldown/tests/rolldown/tree_shaking
+            exit 1
+          fi
 
-      - name: Snapshots are up to date
-        run: git diff --exit-code -- crates/rolldown/tests
+      # Only the binding and the JS glue; the JS type check is not needed to
+      # run the gates.
+      - name: Build the NAPI binding (debug)
+        id: binding
+        if: ${{ !cancelled() && steps.fixtures.outcome != 'skipped' }}
+        run: pnpm --filter rolldown build-binding
 
-      - name: Clippy
-        run: cargo clippy -p rolldown --example effect_service_shaking -- -D warnings
+      - name: Build the JS glue
+        id: glue
+        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
+        run: pnpm --filter rolldown build-node
 
-  napi:
-    name: NAPI build and real-Effect gates through the JS API
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - uses: pnpm/action-setup@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - run: pnpm install --frozen-lockfile --ignore-scripts
-
-      - name: Install the pinned Rust toolchain
-        run: rustup show
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: effect-service-shaking-napi
-
-      # Builds the binding, the JS glue and type-checks the option types.
-      - name: Build the native package
-        run: pnpm --filter rolldown build-native:debug
-
-      # Bundles each real-Effect gate through the JS API with the option on,
-      # then runs the gate's own `_test.mjs` (behaviour and removal checks).
+      # Bundles the two real-Effect removal gates through the JS API with the
+      # option on, then runs each gate's own `_test.mjs` (behaviour and removal
+      # checks). Other `effect_service_real` fixtures are covered by the cargo
+      # step above.
       - name: Real-Effect gates through the JS API
+        if: ${{ !cancelled() && steps.glue.outcome == 'success' }}
         run: |
           cat > run-gates.mjs <<'SCRIPT'
           import { rolldown } from './packages/rolldown/dist/index.mjs'
@@ -102,7 +95,7 @@ jobs:
           import path from 'node:path'
 
           const root = 'crates/rolldown/tests/rolldown/tree_shaking/effect_service_real'
-          for (const name of fs.readdirSync(root)) {
+          for (const name of ['lifecycle', 'cross_module']) {
             const dir = path.resolve(root, name)
             const bundle = await rolldown({
               input: path.join(dir, 'main.js'),
