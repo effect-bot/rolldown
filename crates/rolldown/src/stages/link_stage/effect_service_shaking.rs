@@ -2888,18 +2888,14 @@ impl LinkStage<'_> {
     let mut prefixes = vec![None; self.module_table.modules.len()];
     let mut resolved_exports = vec![FxHashMap::default(); self.module_table.modules.len()];
     for module in &self.module_table.modules {
-      match module.as_normal() {
-        Some(normal) => {
-          namespaces
-            .insert(self.symbols.canonical_ref_for(normal.namespace_object_ref), normal.idx);
-          prefixes[normal.idx.index()] = trusted_prefix(normal.id.as_str());
-          resolved_exports[normal.idx.index()] = self.metas[normal.idx]
-            .resolved_exports
-            .iter()
-            .map(|(name, export)| (name.to_string(), export.symbol_ref))
-            .collect();
-        }
-        None => {}
+      if let Some(normal) = module.as_normal() {
+        namespaces.insert(self.symbols.canonical_ref_for(normal.namespace_object_ref), normal.idx);
+        prefixes[normal.idx.index()] = trusted_prefix(normal.id.as_str());
+        resolved_exports[normal.idx.index()] = self.metas[normal.idx]
+          .resolved_exports
+          .iter()
+          .map(|(name, export)| (name.to_string(), export.symbol_ref))
+          .collect();
       }
     }
     // External imports of untrusted code. Rolldown's own runtime imports
