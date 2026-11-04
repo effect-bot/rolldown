@@ -53,8 +53,14 @@ jobs:
         with:
           key: effect-service-shaking
 
-      - name: Effect service fixtures (stub and real Effect)
-        run: cargo test -p rolldown --test integration -- effect_service
+      # Compile once with the optimized `effect-verify` profile, then run the
+      # fixtures against the prebuilt binary under a hard 10 second budget. A
+      # timeout fails the job (exit 124); it is never treated as a pass.
+      - name: Build the Effect service fixture runner
+        run: cargo test --profile effect-verify -p rolldown --test integration --no-run
+
+      - name: Effect service fixtures (stub and real Effect, 10s budget)
+        run: timeout 10 cargo test --profile effect-verify -p rolldown --test integration -- effect_service
 
       - name: Effect service snapshots are up to date
         run: |

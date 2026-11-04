@@ -2899,16 +2899,29 @@ impl LinkStage<'_> {
             .map(|(name, export)| (name.to_string(), export.symbol_ref))
             .collect();
         }
-        None => {
-          if let Some(external) = module.as_external() {
-            let name = external.name.as_str();
-            let bare = name.strip_prefix("node:").unwrap_or(name);
-            let builtin = NODE_BUILTINS.contains(&bare) || name.starts_with("bun:");
-            if !builtin {
-              report.global_bailouts.push(format!("external import `{name}`"));
-            }
-          }
+        None => {}
+      }
+    }
+    // External imports of untrusted code. Rolldown's own runtime imports
+    // `node:module` on Node, which is trusted like the effect package.
+    let mut externals: FxHashSet<&str> = FxHashSet::default();
+    for module in &self.module_table.modules {
+      let Some(normal) = module.as_normal() else { continue };
+      if prefixes[normal.idx.index()].is_some() || normal.idx == self.runtime.id() {
+        continue;
+      }
+      for record in &normal.import_records {
+        let Some(target) = record.resolved_module else { continue };
+        if let Some(external) = self.module_table[target].as_external() {
+          externals.insert(external.name.as_str());
         }
+      }
+    }
+    for name in externals {
+      let bare = name.strip_prefix("node:").unwrap_or(name);
+      let builtin = NODE_BUILTINS.contains(&bare) || name.starts_with("bun:");
+      if !builtin {
+        report.global_bailouts.push(format!("external import `{name}`"));
       }
     }
     for entry in &self.user_defined_entry_modules {

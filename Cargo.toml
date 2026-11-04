@@ -339,3 +339,12 @@ opt-level = "s"
 # it will strip these information for non-debug files
 debug = "full"
 strip = "none"
+
+# Effect service shaking verification: the fixtures bundle the real `effect`
+# package four times each, which is parse-bound in an unoptimized build.
+[profile.effect-verify]
+inherits = "test"
+opt-level = 1
+
+[profile.effect-verify.package."*"]
+opt-level = 3

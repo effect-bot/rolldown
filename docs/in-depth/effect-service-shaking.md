@@ -59,44 +59,39 @@ A service keeps every method when:
 - a provider method may read `this`, the object has getters, spreads or an explicit `__proto__`, or a release callback takes anything other than a single plain parameter;
 - its Layer may leave the bundle or be used in an unrecognised way.
 
-Holding a Fiber or a Context is fine, and so is any Effect API. A Context only hands out a service through a lookup by key, and the pass tracks every key. The other ways to get a service out of a Context are sinks. When user code (anything outside the Effect and `@effect/platform-node` packages) reaches a sink, the pass is turned off for the whole build.
+Holding a Fiber or a Context is fine, and so is any Effect API. A Context only hands out a service through a lookup by key, and the pass tracks every key. The other ways to reach a service are handled in user code (anything outside the Effect and `@effect/platform-node` packages) as follows.
 
-These sinks apply in every mode:
-- reading a Context internal by name: `mapUnsafe`, `_flat`, `base`, `overlay`, `cacheRoot` or `toJSON`. Static reads, destructuring, constant computed names (`context["map" + "Unsafe"]`, a `const` holding the name) and constant names passed to `Object` or `Reflect` functions all count, on any object;
+These always turn the pass off for the whole build:
+- reading a Context internal by name: `mapUnsafe`, `_flat`, `base`, `overlay`, `cacheRoot` or `toJSON`, statically, by destructuring, through a constant computed name (`context["map" + "Unsafe"]`, a `const` holding the name) or as a constant argument of `Object` or `Reflect` functions;
+- `__lookupGetter__`, `__lookupSetter__`, `__defineGetter__` and `__defineSetter__`;
 - `Context.getOrUndefinedUnsafe` and `Context.makeUnsafe`, which work on key strings;
-- running code outside the module graph: `eval`, `Function`, `require`, any `.constructor` read, `with`, dynamic `import()`, the `vm`, `module`, `inspector` and `repl` builtins, and computed reads on the global object by a non-constant name;
-- exports from the entry module, and external imports other than Node builtins;
-- a `Context.Service` call that does not declare a module-level key with a literal string, and writes to a key's members.
+- running code outside the module graph: `eval`, `Function`, `require`, any `.constructor` read, `with`, dynamic `import()`, the `vm`, `module`, `inspector` and `repl` builtins (with or without `node:`), and computed reads on the global object by a non-constant name;
+- exports from the entry module, external imports from user code other than Node builtins, and a `Context.Service` call that does not declare a module-level key with a literal string.
 
-These sinks find a service without naming it:
-- enumeration: `Object.keys`, `values`, `entries`, `getOwnPropertyNames`, `getOwnPropertyDescriptors` and `getOwnPropertySymbols` (also through aliases, `.call` and destructuring), `Object` used as a value, any use of `Reflect`, `for...in` and `structuredClone`;
-- member reads by a non-constant name. Numeric indexes, `Symbol.iterator` and `Symbol.asyncIterator` are exempt;
-- `JSON.stringify` of anything but a constant. A replacer sees every service of a Context through `toJSON`, and the output includes literal properties the pass removes.
+Everything else depends on provenance: whether the value involved may hold an Effect runtime object (a Context, a Fiber, a service, or anything that leads to one). A value is clean only when the pass can show it holds none:
+- literals, strings, numbers, functions, and arrays and objects built from clean values;
+- results of ECMAScript builtins applied to clean values (`JSON.parse`, `structuredClone`, `Object.keys`, string and array methods);
+- `const`, `let` and `var` bindings whose every assignment is clean, and parameters of local functions that are only called directly, with clean arguments;
+- the success of `Effect.succeed`, `sync`, `gen`, `map`, `flatMap`, `tap`, `provide` and `all` over clean values, as seen by `yield*`, `Effect.runPromise` and the callbacks of `map`, `flatMap` and `tap`;
+- the results of user service methods whose every provider returns a clean value.
 
-They make the default mode safe. They also turn the pass off for most real programs, since plain `arr[i]` and `Object.keys` are common.
+Anything else may hold a runtime object: the result of any other Effect call, parameters of callbacks Effect calls, imports, `this`, caught errors and the global object. Writing such a value into any object or collection makes every object and array literal in user code unclean too.
 
-## Assuming no reflection
+When an operand may hold a runtime object, these turn the pass off:
+- enumeration and reflection: `Object.keys`, `values`, `entries`, `getOwnPropertyNames`, `getOwnPropertyDescriptor(s)`, `getOwnPropertySymbols`, `hasOwn`, any `Reflect` function, `for...in` and `structuredClone`;
+- member reads by a non-constant name, except numeric indexes such as `fibers[i]` in a counted loop;
+- serialization and formatting: `JSON.stringify`, template literals, `String()`, `+`, loose comparisons with a non-number, `toString`, `join`, string methods that coerce their arguments, `console`, `util`, `throw`, `Error` constructors and `super`, and the Effect APIs that format (`Effect.fail`, `die`, `log*`, `Console`, `Inspectable`, `Cause`, `Logger`).
 
-`experimental.effectServiceShakingAssumeNoReflection` turns off only the second list of sinks:
+These builtins must be called in place. Aliasing them (`const values = Object.values`), passing them around or using the global object as a value turns the pass off.
 
-```js
-export default {
-  experimental: {
-    effectServiceShaking: true,
-    effectServiceShakingAssumeNoReflection: true,
-  },
-};
-```
-
-With it, you promise that user code never enumerates, indexes by a non-constant name or serializes an Effect runtime object (a Context, a Fiber, a Layer, a service, or anything reached from them), or indexes the global object through an alias. A program that breaks the promise can read a removed method and fail at runtime. For example, `Object.values(context)` finds the service map and `context[["map", "Unsafe"].join("")]` builds an internal name the pass can't evaluate. Reads of Context internals by a constant name still turn the pass off.
+A static read on a value that may hold a runtime object (`value.unused()`, `const { unused } = value`, `"unused" in value`) keeps that method on every service, instead of turning the pass off.
 
 ## Assumptions
 
-In both modes the pass assumes that:
-- the Effect and `@effect/platform-node` packages don't inspect service values or expose them other than through a keyed lookup. This is not checked;
-- bundled code doesn't modify built-ins such as `Map.prototype`;
-- service lookups use keys created with `Context.Service`. A hand-made key object such as `{ key: "app/Store" }` passed to `Context.get` or `Effect.service` is not tracked;
-- printed output doesn't matter. `console.log(context)` lists the services and their properties, so removed methods disappear from it.
+The pass assumes that:
+- the Effect and `@effect/platform-node` packages don't enumerate, format or call service objects on behalf of user code other than through the APIs listed above, and don't store runtime objects into objects that user code created. This is not checked;
+- bundled code doesn't modify builtins such as `Map.prototype` in ways the provenance rules don't see;
+- printed output of user data doesn't change. Printing a value that may hold a runtime object turns the pass off.
 
 ## Inspecting the result
 
@@ -117,7 +112,9 @@ The `tree_shaking/effect_service_real` fixtures run against the published `effec
 | `run_options` | `writeOne` and its helper, with `RunOptions.onFiberStart` | the program result |
 | `retained_fiber` | `writeOne` and its helper, with a forked Fiber kept after it ends | the program result |
 
-The `internals_destructuring`, `enumeration`, `enumeration_alias`, `dynamic_name` and `json_literal` fixtures read a service through a sink and check that nothing is removed.
+`reflection_clean_data`, `provenance_success_channel`, `provenance_numeric_index` and `provenance_json_clean` enumerate, index and serialize user data and still remove `writeOne`. The other fixtures in `effect_service_real` reach a service through a Context, a forged key, a patched builtin, `Inspectable` or code outside the bundle, and check that every method stays.
+
+Once the `effect-verify` profile is built, `cargo test --profile effect-verify -p rolldown --test integration -- effect_service` runs every fixture in about 4 seconds. CI fails the step if it takes longer than 10 seconds.
 
 The analysis costs about 1.1–1.2x of an unoptimized build on Effect programs of 0.4–1.6 MB.
 
