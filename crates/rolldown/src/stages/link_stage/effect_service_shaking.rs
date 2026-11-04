@@ -359,6 +359,10 @@ struct Site {
   bindings: Vec<SymbolRef>,
 }
 
+/// A provider object literal found in an Effect expression: (span start,
+/// locals bound to it before it reaches a Context, keep every property).
+type FoundSite = (u32, Vec<SymbolRef>, bool);
+
 /// Reads of a provider object through locals bound before it reaches a
 /// Context: (site, (name, guards) list, escaped).
 type SiteBindingReads = (usize, Vec<(String, Vec<Guard>)>, bool);
@@ -516,16 +520,24 @@ impl Shared<'_> {
   }
 }
 
-fn contains_this(function_body: &oxc::ast::ast::FunctionBody<'_>) -> bool {
+/// Whether a function reads its receiver anywhere: parameters (defaults
+/// included) and body, but not nested non-arrow functions or classes.
+fn reads_this(function: &Function<'_>) -> bool {
   struct Finder(bool);
   impl<'a> VisitJs<'a> for Finder {
     fn visit_this_expression(&mut self, _it: &oxc::ast::ast::ThisExpression) {
       self.0 = true;
     }
     fn visit_function(&mut self, _it: &Function<'a>, _flags: oxc::semantic::ScopeFlags) {}
+    fn visit_class(&mut self, _it: &oxc::ast::ast::Class<'a>) {}
   }
   let mut finder = Finder(false);
-  finder.visit_function_body(function_body);
+  finder.visit_formal_parameters(&function.params);
+  if let Some(body) = &function.body {
+    finder.visit_function_body(body);
+  } else {
+    finder.0 = true;
+  }
   finder.0
 }
 
@@ -600,9 +612,11 @@ struct KeyCollector<'s, 'l> {
 
 impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
   fn visit_function(&mut self, it: &Function<'a>, flags: oxc::semantic::ScopeFlags) {
-    if let (Some(id), Some(body)) = (&it.id, &it.body) {
-      if matches!(it.r#type, FunctionType::FunctionDeclaration) && !contains_this(body) {
-        if let Some(symbol) = id.symbol_id.get() {
+    if let Some(id) = &it.id {
+      if matches!(it.r#type, FunctionType::FunctionDeclaration) && !reads_this(it) {
+        // A reassigned declaration may hold any function at runtime.
+        let scoping = self.shared.scoping(self.module);
+        if let Some(symbol) = id.symbol_id.get().filter(|s| !scoping.symbol_is_mutated(*s)) {
           self.this_free.push((self.module, symbol).into());
         }
       }
@@ -632,9 +646,7 @@ impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
         if self.kind == VariableDeclarationKind::Const {
           match strip(init) {
             Expression::ArrowFunctionExpression(_) => self.this_free.push(symbol_ref),
-            Expression::FunctionExpression(function)
-              if function.body.as_ref().is_some_and(|body| !contains_this(body)) =>
-            {
+            Expression::FunctionExpression(function) if !reads_this(function) => {
               self.this_free.push(symbol_ref);
             }
             _ => {}
@@ -661,6 +673,8 @@ struct UseCollector<'s, 'l, 'a> {
   guards: Vec<Guard>,
   top_stmt: usize,
   refs: FxHashMap<ReferenceId, RefInfo>,
+  /// Uses of exported bindings through a module namespace, `ns.binding`.
+  namespace_refs: Vec<(SymbolRef, RefInfo)>,
   /// Use-expression spans of key references already classified.
   classified: FxHashSet<u32>,
   /// Object literal spans recognised as provider sites -> site index.
@@ -751,11 +765,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
 
   /// Provider objects reachable from an Effect expression in the base case.
   /// Returns false when some source is not a recognised object literal.
-  fn effect_sites(
-    &self,
-    expr: &Expression<'a>,
-    found: &mut Vec<(u32, Option<SymbolRef>, bool)>,
-  ) -> bool {
+  fn effect_sites(&self, expr: &Expression<'a>, found: &mut Vec<FoundSite>) -> bool {
     let Expression::CallExpression(call) = strip(expr) else { return false };
     let args = &call.arguments;
     match self.shared.api_of(self.module, &call.callee) {
@@ -771,34 +781,32 @@ impl<'a> UseCollector<'_, '_, 'a> {
       Some("Effect.acquireRelease") if args.len() == 2 => {
         let mut acquired = vec![];
         let complete = args[0].as_expression().is_some_and(|e| self.effect_sites(e, &mut acquired));
-        // The release callback receives the acquired object.
-        let (binding, top) = match args[1].as_expression().map(strip) {
-          Some(Expression::ArrowFunctionExpression(f)) => match f.params.items.first() {
+        // The release callback receives the acquired object. Only a first
+        // parameter that is a plain binding is followed; a rest parameter,
+        // a pattern or `arguments` keeps the whole object.
+        let (params, reads_args) = match args[1].as_expression().map(strip) {
+          Some(Expression::ArrowFunctionExpression(f)) => (Some(&f.params), false),
+          Some(Expression::FunctionExpression(f)) => {
+            (Some(&f.params), f.body.as_ref().is_none_or(|body| reads_arguments(body)))
+          }
+          _ => (None, false),
+        };
+        let (binding, top): (Option<SymbolRef>, bool) = match params {
+          Some(params) if params.rest.is_none() && !reads_args => match params.items.first() {
             None => (None, false),
             Some(param) => match &param.pattern {
               BindingPattern::BindingIdentifier(id) => {
-                (id.symbol_id.get().map(|s| (self.module, s).into()), false)
+                (id.symbol_id.get().map(|s| (self.module, s).into()), id.symbol_id.get().is_none())
               }
               _ => (None, true),
             },
           },
-          Some(Expression::FunctionExpression(f)) => {
-            let reads_arguments = f.body.as_ref().is_none_or(|body| reads_arguments(body));
-            match f.params.items.first() {
-              None if !reads_arguments => (None, false),
-              Some(param) if !reads_arguments => match &param.pattern {
-                BindingPattern::BindingIdentifier(id) => {
-                  (id.symbol_id.get().map(|s| (self.module, s).into()), false)
-                }
-                _ => (None, true),
-              },
-              _ => (None, true),
-            }
-          }
           _ => (None, true),
         };
-        for (span, _, existing_top) in acquired {
-          found.push((span, binding, existing_top || top));
+        // Nested acquisitions keep the readers of every level.
+        for (span, mut bindings, existing_top) in acquired {
+          bindings.extend(binding);
+          found.push((span, bindings, existing_top || top));
         }
         complete
       }
@@ -810,7 +818,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
     &self,
     function: &Expression<'a>,
     generator: bool,
-    found: &mut Vec<(u32, Option<SymbolRef>, bool)>,
+    found: &mut Vec<FoundSite>,
   ) -> bool {
     let body = match strip(function) {
       Expression::ArrowFunctionExpression(f) if !generator && !f.r#async => {
@@ -834,14 +842,10 @@ impl<'a> UseCollector<'_, '_, 'a> {
     complete
   }
 
-  fn value_sites(
-    &self,
-    value: &Expression<'a>,
-    found: &mut Vec<(u32, Option<SymbolRef>, bool)>,
-  ) -> bool {
+  fn value_sites(&self, value: &Expression<'a>, found: &mut Vec<FoundSite>) -> bool {
     match strip(value) {
       Expression::ObjectExpression(object) => {
-        found.push((object.span.start, None, false));
+        found.push((object.span.start, vec![], false));
         true
       }
       Expression::CallExpression(call) => {
@@ -875,7 +879,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
     } else {
       self.effect_sites(value, &mut found)
     };
-    for (start, binding, top) in found {
+    for (start, bindings, top) in found {
       let index = *self.site_spans.entry(start).or_insert_with(|| {
         self.sites.push(Site {
           module: self.module,
@@ -889,9 +893,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
       let site = &mut self.sites[index];
       site.keys.insert(key.to_string());
       site.top |= top;
-      if let Some(binding) = binding {
-        site.bindings.push(binding);
-      }
+      site.bindings.extend(bindings);
     }
     self.providers.push((key.to_string(), container));
     let _ = span;
@@ -940,6 +942,32 @@ impl<'a> UseCollector<'_, '_, 'a> {
       _ => None,
     };
     let container = self.container_from(ident.span, self.path.len() - 1);
+    // `ns.binding` is a use of the exported binding, from the member's position.
+    if let Some(symbol) = symbol {
+      let canonical = self.shared.symbols.canonical_ref_for((self.module, symbol).into());
+      if let Resolved::Namespace(target) = self.shared.as_resolved(canonical) {
+        if let Some(AstKind::StaticMemberExpression(member)) = self.parent(0) {
+          if member.object.span() == ident.span {
+            if let Some(Resolved::Symbol(export)) =
+              self.shared.resolve_export(target, member.property.name.as_str())
+            {
+              let container = self.container_from(member.span, self.path.len().saturating_sub(2));
+              self.namespace_refs.push((
+                export,
+                RefInfo {
+                  span: member.span,
+                  top_stmt: self.top_stmt,
+                  chain: self.guards.clone(),
+                  member: None,
+                  container,
+                  root_symbol: None,
+                },
+              ));
+            }
+          }
+        }
+      }
+    }
     self.refs.insert(
       reference_id,
       RefInfo {
@@ -1015,9 +1043,8 @@ impl<'a> UseCollector<'_, '_, 'a> {
       }
       Some(Resolved::Namespace(target)) => {
         let Some(member_name) = member else {
-          if self.shared.prefixes[target.index()].is_some() {
-            self.bail_global(ident.span, "trusted module namespace used as a value");
-          }
+          // Every export of the module, Layers included, may escape through it.
+          self.bail_global(ident.span, "module namespace used as a value");
           return;
         };
         let resolved = self.shared.resolve_export(target, member_name);
@@ -1062,7 +1089,13 @@ impl<'a> UseCollector<'_, '_, 'a> {
         Some(kind) => format!("{kind:?}").split('(').next().unwrap_or_default().to_string(),
         None => "program".to_string(),
       };
-      self.bail_key(key, use_span, &format!("service key used in {parent}"));
+      // Opaque code holding a key may change its key string, which moves
+      // lookups to another service, so outside trusted modules this is global.
+      if self.trusted {
+        self.bail_key(key, use_span, &format!("service key used in {parent}"));
+      } else {
+        self.bail_global(use_span, &format!("service key `{key}` used in {parent}"));
+      }
     }
   }
 }
@@ -1141,7 +1174,13 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
             }
             self.consumers.push(Consumer { key, kind, chain: self.guards.clone() });
           }
-          (false, _) => self.bail_key(&key, it.span, "`yield*` outside an Effect generator"),
+          // A non-Effect driver receives the key itself.
+          (false, _) if self.trusted => {
+            self.bail_key(&key, it.span, "`yield*` outside an Effect generator");
+          }
+          (false, _) => {
+            self.bail_global(it.span, "service key yielded outside an Effect generator");
+          }
           (true, None) => {
             self.bail_key(
               &key,
@@ -1247,9 +1286,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_) => (true, false),
             Expression::TemplateLiteral(template) => (template.expressions.is_empty(), false),
-            Expression::FunctionExpression(function) => {
-              (true, function.body.as_ref().is_none_or(|body| contains_this(body)))
-            }
+            Expression::FunctionExpression(function) => (true, reads_this(function)),
             Expression::Identifier(_) => {
               let resolved = self.shared.resolve_expr(self.module, value);
               let this_free = matches!(resolved, Some(Resolved::Symbol(symbol)) if self.shared.this_free.contains(&symbol));
@@ -1516,6 +1553,7 @@ impl LinkStage<'_> {
     let mut providers = vec![];
     let mut guard_bindings = vec![];
     let mut refs: FxHashMap<ModuleIdx, FxHashMap<ReferenceId, RefInfo>> = FxHashMap::default();
+    let mut namespace_refs: Vec<(SymbolRef, RefInfo)> = vec![];
     let mut key_bailouts = vec![];
     let mut site_spans: FxHashMap<usize, (ModuleIdx, u32)> = FxHashMap::default();
     for module in &normal_modules {
@@ -1531,6 +1569,7 @@ impl LinkStage<'_> {
           guards: vec![],
           top_stmt: 0,
           refs: FxHashMap::default(),
+          namespace_refs: vec![],
           classified: FxHashSet::default(),
           site_spans: FxHashMap::default(),
           sites: &mut sites,
@@ -1550,6 +1589,7 @@ impl LinkStage<'_> {
         report.global_bailouts.extend(collector.global_bailouts);
         key_bailouts.extend(collector.key_bailouts);
         refs.insert(*module, collector.refs);
+        namespace_refs.extend(collector.namespace_refs);
       });
     }
 
@@ -1570,6 +1610,9 @@ impl LinkStage<'_> {
           imported_refs.entry(canonical).or_default().push(info);
         }
       }
+    }
+    for (export, info) in &namespace_refs {
+      imported_refs.entry(*export).or_default().push(info);
     }
     let references_of = |symbol: SymbolRef| -> Vec<&RefInfo> {
       let scoping = shared.scoping(symbol.owner);
