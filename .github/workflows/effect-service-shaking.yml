@@ -54,13 +54,9 @@ jobs:
           key: effect-service-shaking
 
       - name: Effect service fixtures (stub and real Effect)
-        id: fixtures
         run: cargo test -p rolldown --test integration -- effect_service
 
-      # The steps below still run when a fixture fails, so a failing fixture
-      # does not hide the JS API gate results.
       - name: Effect service snapshots are up to date
-        if: ${{ !cancelled() && steps.fixtures.outcome != 'skipped' }}
         run: |
           changes=$(git status --porcelain -- crates/rolldown/tests/rolldown/tree_shaking/effect_service crates/rolldown/tests/rolldown/tree_shaking/effect_service_real)
           if [ -n "$changes" ]; then
@@ -72,13 +68,9 @@ jobs:
       # Only the binding and the JS glue; the JS type check is not needed to
       # run the gates.
       - name: Build the NAPI binding (debug)
-        id: binding
-        if: ${{ !cancelled() && steps.fixtures.outcome != 'skipped' }}
         run: pnpm --filter rolldown build-binding
 
       - name: Build the JS glue
-        id: glue
-        if: ${{ !cancelled() && steps.binding.outcome == 'success' }}
         run: pnpm --filter rolldown build-node
 
       # Bundles the two real-Effect removal gates through the JS API with the
@@ -86,7 +78,6 @@ jobs:
       # checks). Other `effect_service_real` fixtures are covered by the cargo
       # step above.
       - name: Real-Effect gates through the JS API
-        if: ${{ !cancelled() && steps.glue.outcome == 'success' }}
         run: |
           cat > run-gates.mjs <<'SCRIPT'
           import { rolldown } from './packages/rolldown/dist/index.mjs'
