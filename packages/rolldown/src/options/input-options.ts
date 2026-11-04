@@ -740,18 +740,6 @@ export interface InputOptions {
      * @default false
      */
     effectServiceShaking?: boolean;
-    /**
-     * Let `effectServiceShaking` assume that user code never enumerates, dynamically
-     * indexes or serializes Effect runtime objects such as a `Context` or a `Fiber`.
-     *
-     * Without it, `Object.keys` / `values` / `entries`, `Reflect`, `for...in`,
-     * computed member reads with a non-constant key, `structuredClone` and
-     * `JSON.stringify` of a non-constant value in user code turn the optimization off.
-     * Reads of Context internals such as `mapUnsafe` turn it off either way.
-     *
-     * @default false
-     */
-    effectServiceShakingAssumeNoReflection?: boolean;
   };
   /**
    * Configure how the code is transformed. This process happens after the `transform` hook.

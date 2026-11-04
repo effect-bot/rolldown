@@ -22,25 +22,31 @@
 //! release and construction-time calls keep running.
 //!
 //! Anything outside the base case keeps every method of the key involved.
-//! Holding a Context or Fiber is fine: services leave a Context only through a
-//! keyed lookup, which is tracked, or through a sink, which disables the pass
-//! for the whole build:
-//! - Context internals read by name (`mapUnsafe`, `base`, `toJSON`, ...), and
-//!   code outside the module graph (entry exports, external modules, `eval`);
-//! - enumeration, member reads by a non-constant name and serialization, unless
-//!   `effectServiceShakingAssumeNoReflection` rules them out.
+//! Holding a Context or Fiber is fine. Services leave a Context through a
+//! keyed lookup, which is tracked, or through an operation the pass treats as a
+//! sink:
+//! - reading a Context internal by name (`mapUnsafe`, `base`, `toJSON`, ...) or
+//!   running code outside the module graph disables the pass;
+//! - reflection, serialization and formatting disable it when their operand
+//!   may hold an Effect runtime object, and a static read on such a value
+//!   demands that name on every service (see "provenance" below).
 
 use oxc::{
   allocator::Vec as ArenaVec,
   ast::{
     AstKind,
     ast::{
-      Argument, ArrayExpressionElement, AssignmentTargetPropertyIdentifier,
-      AssignmentTargetPropertyProperty, BinaryOperator, BindingPattern, BindingProperty,
-      CallExpression, ComputedMemberExpression, Expression, ForInStatement, Function, FunctionType,
-      IdentifierReference, ImportExpression, ObjectExpression, ObjectPropertyKind, PropertyKey,
-      PropertyKind, Statement, StaticMemberExpression, UnaryOperator, VariableDeclarationKind,
-      VariableDeclarator, WithStatement, YieldExpression,
+      Argument, ArrayExpressionElement, ArrowFunctionExpression, AssignmentExpression,
+      AssignmentOperator, AssignmentTarget, AssignmentTargetPropertyIdentifier,
+      AssignmentTargetPropertyProperty, AssignmentTargetWithDefault, BinaryExpression,
+      BinaryOperator, BindingPattern, BindingProperty, CallExpression, CatchClause, ChainElement,
+      Class, ComputedMemberExpression, Expression, ForInStatement, ForOfStatement,
+      ForStatementLeft, FormalParameters, Function, FunctionType, IdentifierReference,
+      ImportDeclaration, ImportExpression, NewExpression, ObjectExpression, ObjectPropertyKind,
+      Program, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
+      StaticMemberExpression, TemplateLiteral, ThrowStatement, UnaryOperator, UpdateExpression,
+      VariableDeclaration, VariableDeclarationKind, VariableDeclarator, WithStatement,
+      YieldExpression,
     },
   },
   ast_visit::{VisitJs, VisitJsMut, walk_js, walk_js_mut},
@@ -64,22 +70,15 @@ const CONTEXT_INTERNALS: &[&str] =
   &["mapUnsafe", "_flat", "base", "overlay", "cacheRoot", "toJSON"];
 // Context functions that read or build a service map by key string.
 const CONTEXT_INTERNAL_APIS: &[&str] = &["Context.getOrUndefinedUnsafe", "Context.makeUnsafe"];
+// Accessor reflection on any object: these reach a getter such as `mapUnsafe`
+// without reading it by name.
+const REFLECTIVE_MEMBERS: &[&str] =
+  &["__lookupGetter__", "__lookupSetter__", "__defineGetter__", "__defineSetter__"];
 // Ways to run code that is not part of the module graph, by global name or
 // member name (`globalThis.eval`, `fn.constructor`), in any mode.
 const CODE_LOADERS: &[&str] = &["eval", "Function", "require", "constructor"];
 const GLOBAL_OBJECTS: &[&str] =
   &["globalThis", "global", "self", "window", "frames", "parent", "top"];
-// `Object` members that enumerate the properties of an object, so they reach
-// Context internals without naming them. Disabled by
-// `effectServiceShakingAssumeNoReflection`, like every other enumeration.
-const ENUMERATING_OBJECT_MEMBERS: &[&str] = &[
-  "keys",
-  "values",
-  "entries",
-  "getOwnPropertyNames",
-  "getOwnPropertyDescriptors",
-  "getOwnPropertySymbols",
-];
 // Reading one of these on a service observes the whole object.
 const INHERITED_MEMBERS: &[&str] = &[
   "constructor",
@@ -250,6 +249,8 @@ struct Prop {
 #[derive(Debug)]
 struct Site {
   module: ModuleIdx,
+  /// Start of the object literal.
+  start: u32,
   keys: FxHashSet<String>,
   props: Vec<Prop>,
   /// Keep every property, e.g. a method may read `this`.
@@ -345,9 +346,6 @@ struct Shared<'l> {
   this_free: FxHashSet<SymbolRef>,
   /// `const` bindings holding a constant string.
   const_strings: FxHashMap<SymbolRef, String>,
-  /// `effectServiceShakingAssumeNoReflection`: enumeration, non-constant
-  /// computed reads and serialization are not sinks.
-  assume_no_reflection: bool,
 }
 
 impl Shared<'_> {
@@ -511,32 +509,6 @@ fn is_numeric(expr: &Expression<'_>) -> bool {
         | BinaryOperator::BitwiseXOR
         | BinaryOperator::BitwiseAnd
     ),
-    _ => false,
-  }
-}
-
-/// Whether a value has no part that could hold an Effect runtime object.
-fn is_constant_value(expr: &Expression<'_>) -> bool {
-  match strip(expr) {
-    Expression::StringLiteral(_)
-    | Expression::NumericLiteral(_)
-    | Expression::BooleanLiteral(_)
-    | Expression::NullLiteral(_)
-    | Expression::BigIntLiteral(_) => true,
-    Expression::TemplateLiteral(template) => template.expressions.is_empty(),
-    Expression::UnaryExpression(unary) => is_constant_value(&unary.argument),
-    Expression::ArrayExpression(array) => array.elements.iter().all(|element| match element {
-      ArrayExpressionElement::Elision(_) => true,
-      ArrayExpressionElement::SpreadElement(_) => false,
-      element => element.as_expression().is_some_and(is_constant_value),
-    }),
-    Expression::ObjectExpression(object) => object.properties.iter().all(|property| {
-      matches!(property, ObjectPropertyKind::ObjectProperty(property)
-        if property.kind == PropertyKind::Init
-          && !property.computed
-          && !property.method
-          && is_constant_value(&property.value))
-    }),
     _ => false,
   }
 }
@@ -722,18 +694,20 @@ struct UseCollector<'s, 'l, 'a> {
   guard_bindings: Vec<GuardBinding>,
   global_bailouts: Vec<String>,
   key_bailouts: Vec<(String, String)>,
+  /// Static reads in untrusted code: (receiver span, name, guards). A `None`
+  /// receiver is a value of unknown provenance.
+  name_reads: Vec<NameRead>,
+  /// The value destructured by the pattern being visited.
+  pattern_source: Option<Span>,
+  /// Keys with a provider whose objects were not all followed.
+  incomplete_keys: FxHashSet<String>,
 }
+
+type NameRead = (Option<(u32, u32)>, String, Vec<Guard>);
 
 impl<'a> UseCollector<'_, '_, 'a> {
   fn bail_global(&mut self, span: Span, reason: &str) {
     self.global_bailouts.push(format!("{reason} (module {:?} at {})", self.module, span.start));
-  }
-
-  /// A sink that `effectServiceShakingAssumeNoReflection` rules out.
-  fn bail_reflection(&mut self, span: Span, reason: &str) {
-    if !self.shared.assume_no_reflection {
-      self.bail_global(span, reason);
-    }
   }
 
   /// A property read or written by `name`, `None` when the name is not constant.
@@ -742,15 +716,18 @@ impl<'a> UseCollector<'_, '_, 'a> {
       Some(name) if CONTEXT_INTERNALS.contains(&name) => {
         self.bail_global(span, &format!("`{name}` may read Context internals"));
       }
+      Some(name) if REFLECTIVE_MEMBERS.contains(&name) => {
+        self.bail_global(span, &format!("`{name}` may reach a Context getter"));
+      }
       Some(name) if CODE_LOADERS.contains(&name) => {
         self.bail_global(span, &format!("`{name}` may run code outside the bundle"));
       }
-      Some(_) => {}
-      // The global object holds `eval` and `Function`.
+      // The global object holds `eval` and `Function`. Other non-constant
+      // names are checked against the object's provenance.
       None if on_global_object => {
         self.bail_global(span, "global object read by a non-constant name");
       }
-      None => self.bail_reflection(span, "member read by a non-constant name"),
+      Some(_) | None => {}
     }
   }
 
@@ -762,6 +739,24 @@ impl<'a> UseCollector<'_, '_, 'a> {
       key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
     };
     self.check_member_name(name.as_deref(), span, false);
+  }
+
+  fn property_name(&self, key: &PropertyKey<'a>, computed: bool) -> Option<String> {
+    if computed {
+      key.as_expression().and_then(|expr| self.shared.const_string(self.module, expr))
+    } else {
+      key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
+    }
+  }
+
+  /// A read of `name` on the value at `receiver`, or on an unknown value. It
+  /// demands `name` on every service if the value may hold one.
+  fn read_name(&mut self, receiver: Option<Span>, name: &str) {
+    self.name_reads.push((
+      receiver.map(|span| (span.start, span.end)),
+      name.to_string(),
+      self.guards.clone(),
+    ));
   }
 
   fn is_global(&self, expr: &Expression<'_>, names: &[&str]) -> bool {
@@ -952,15 +947,19 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// whether every source was followed does not matter here.
   fn provider(&mut self, key: &str, kind: &str, value: &Expression<'a>, container: Container) {
     let mut found = vec![];
-    if kind == "Layer.succeed" {
-      self.value_sites(value, &mut found);
+    let complete = if kind == "Layer.succeed" {
+      self.value_sites(value, &mut found)
     } else {
-      self.effect_sites(value, &mut found);
+      self.effect_sites(value, &mut found)
+    };
+    if !complete || found.is_empty() {
+      self.incomplete_keys.insert(key.to_string());
     }
     for (start, bindings, top) in found {
       let index = *self.site_spans.entry(start).or_insert_with(|| {
         self.sites.push(Site {
           module: self.module,
+          start,
           keys: FxHashSet::default(),
           props: vec![],
           top: false,
@@ -1122,41 +1121,10 @@ impl<'a> UseCollector<'_, '_, 'a> {
     resolved: Option<Resolved>,
   ) {
     let name = ident.name.as_str();
-    let member = match self.parent(0) {
-      Some(AstKind::StaticMemberExpression(member)) if member.object.span() == ident.span => {
-        Some(member)
-      }
-      _ => None,
-    };
-    let member_name = member.map(|member| member.property.name.as_str());
     match resolved {
       None if ident.reference_id.get().is_some() => match name {
         "eval" | "Function" | "require" => {
           self.bail_global(ident.span, &format!("`{name}` may run code outside the bundle"));
-        }
-        "Object" => match member_name {
-          Some(member) if ENUMERATING_OBJECT_MEMBERS.contains(&member) => {
-            self.bail_reflection(ident.span, &format!("`Object.{member}` enumerates properties"));
-          }
-          Some(_) => {}
-          None => self.bail_reflection(ident.span, "`Object` used as a value"),
-        },
-        "Reflect" => self.bail_reflection(ident.span, "`Reflect` reads properties by name"),
-        "structuredClone" => {
-          self.bail_reflection(ident.span, "`structuredClone` enumerates properties");
-        }
-        "JSON" => {
-          let constant_stringify = member.is_some_and(|member| {
-            member.property.name == "stringify"
-              && matches!(self.parent(1), Some(AstKind::CallExpression(call))
-              if call.callee.span() == member.span
-                && call.arguments.iter().all(|argument| {
-                  argument.as_expression().is_some_and(is_constant_value)
-                }))
-          });
-          if member_name != Some("parse") && !constant_stringify {
-            self.bail_reflection(ident.span, "`JSON` may serialize an Effect runtime object");
-          }
         }
         _ => {}
       },
@@ -1307,7 +1275,8 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     // `Reflect.get(context, "mapUnsafe")`, `Object.getOwnPropertyDescriptor(proto, "mapUnsafe")`.
     if !self.trusted {
       if let Expression::StaticMemberExpression(member) = callee {
-        if self.is_global(&member.object, &["Object", "Reflect"]) {
+        let builtin = self.shared.builtin_path(self.module, &member.object);
+        if matches!(builtin.as_deref(), Some("Object" | "Reflect")) {
           for argument in &it.arguments {
             let name =
               argument.as_expression().and_then(|expr| self.shared.const_string(self.module, expr));
@@ -1452,19 +1421,23 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       }
       _ => None,
     };
+    let kind = AstKind::VariableDeclarator(self.alloc(it));
+    self.enter_node(kind);
+    // Destructured names are read from the initializer.
+    let previous = self.pattern_source.take();
+    self.pattern_source = it.init.as_ref().map(GetSpan::span);
+    self.visit_binding_pattern(&it.id);
+    self.pattern_source = previous;
     if let Some(symbol) = guard {
-      let kind = AstKind::VariableDeclarator(self.alloc(it));
-      self.enter_node(kind);
-      self.visit_binding_pattern(&it.id);
       self.guards.push(Guard::Binding(symbol));
-      if let Some(init) = &it.init {
-        self.visit_expression(init);
-      }
-      self.guards.pop();
-      self.leave_node(kind);
-    } else {
-      walk_js::walk_variable_declarator(self, it);
     }
+    if let Some(init) = &it.init {
+      self.visit_expression(init);
+    }
+    if guard.is_some() {
+      self.guards.pop();
+    }
+    self.leave_node(kind);
   }
 
   fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
@@ -1503,6 +1476,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       && !matches!(self.shared.resolve_expr(self.module, &it.object), Some(Resolved::Namespace(_)))
     {
       self.check_member_name(Some(it.property.name.as_str()), it.span, false);
+      self.read_name(Some(it.object.span()), it.property.name.as_str());
     }
     walk_js::walk_static_member_expression(self, it);
   }
@@ -1512,6 +1486,9 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       let name = self.shared.member_key(self.module, &it.expression);
       let on_global_object = self.is_global(&it.object, GLOBAL_OBJECTS);
       self.check_member_name(name.as_deref(), it.span, on_global_object);
+      if let Some(name) = self.shared.const_string(self.module, &it.expression) {
+        self.read_name(Some(it.object.span()), &name);
+      }
     }
     walk_js::walk_computed_member_expression(self, it);
   }
@@ -1519,6 +1496,9 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
   fn visit_binding_property(&mut self, it: &BindingProperty<'a>) {
     if !self.trusted {
       self.check_property_key(&it.key, it.computed, it.span);
+      if let Some(name) = self.property_name(&it.key, it.computed) {
+        self.read_name(self.pattern_source, &name);
+      }
     }
     walk_js::walk_binding_property(self, it);
   }
@@ -1529,6 +1509,9 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
   ) {
     if !self.trusted {
       self.check_property_key(&it.name, it.computed, it.span);
+      if let Some(name) = self.property_name(&it.name, it.computed) {
+        self.read_name(None, &name);
+      }
     }
     walk_js::walk_assignment_target_property_property(self, it);
   }
@@ -1539,15 +1522,15 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
   ) {
     if !self.trusted {
       self.check_member_name(Some(it.binding.name.as_str()), it.span, false);
+      self.read_name(None, it.binding.name.as_str());
     }
     walk_js::walk_assignment_target_property_identifier(self, it);
   }
 
-  fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
-    if !self.trusted {
-      self.bail_reflection(it.span, "`for...in` enumerates properties");
-    }
-    walk_js::walk_for_in_statement(self, it);
+  fn visit_formal_parameters(&mut self, it: &FormalParameters<'a>) {
+    let previous = self.pattern_source.take();
+    walk_js::walk_formal_parameters(self, it);
+    self.pattern_source = previous;
   }
 
   fn visit_with_statement(&mut self, it: &WithStatement<'a>) {
@@ -1589,6 +1572,1308 @@ impl<'a> VisitJsMut<'a> for Pruner<'_> {
   }
 }
 
+// == provenance
+//
+// A value in user code is clean when it provably holds no Effect runtime
+// object: no Context, Fiber or service, and nothing that leads to one. Only
+// literals, user data built from them, Node and ECMAScript builtins applied to
+// clean values, and the success values of a few modelled Effect constructors
+// are clean. Every other value, including the result of any other trusted call
+// and every parameter the analysis cannot bind, may hold a runtime object.
+// Reflection, serialization and formatting only disable the pass when their
+// operand may hold one, and static reads on such a value demand their name on
+// every service.
+
+/// Where a local binding's value comes from.
+enum Source<'a> {
+  /// The value of an expression, or a part of it (destructuring, `for...of`).
+  Expr(&'a Expression<'a>),
+  /// A primitive: `for...in` keys, `++`, compound assignment, `undefined`.
+  Primitive {
+    numeric: bool,
+  },
+  /// A function declaration.
+  Function,
+  Unknown,
+}
+
+#[derive(Clone, Copy)]
+enum FnNode<'a> {
+  Arrow(&'a ArrowFunctionExpression<'a>),
+  Function(&'a Function<'a>),
+}
+
+impl<'a> FnNode<'a> {
+  fn is_generator(self) -> bool {
+    matches!(self, FnNode::Function(f) if f.generator)
+  }
+
+  /// Returned expressions, or `None` when not every return can be followed.
+  fn returns(self) -> Option<Vec<&'a Expression<'a>>> {
+    let body = match self {
+      FnNode::Arrow(f) => {
+        if let Some(expr) = f.get_expression() {
+          return Some(vec![expr]);
+        }
+        f.body.as_function_body()?
+      }
+      FnNode::Function(f) => f.body.as_ref()?,
+    };
+    let mut returns = Returns(vec![], true);
+    returns.statements(&body.statements);
+    returns.1.then_some(returns.0)
+  }
+
+  fn reads_arguments(self) -> bool {
+    match self {
+      FnNode::Arrow(_) => false,
+      FnNode::Function(f) => f.body.as_ref().is_none_or(|body| reads_arguments(body)),
+    }
+  }
+}
+
+#[derive(Default)]
+struct FnUses<'a> {
+  calls: Vec<&'a ArenaVec<'a, Argument<'a>>>,
+  escaped: bool,
+}
+
+/// Value flow of one untrusted module.
+#[derive(Default)]
+struct Flow<'a> {
+  sources: FxHashMap<SymbolId, Vec<Source<'a>>>,
+  /// Simple parameters: symbol -> (function start, index).
+  params: FxHashMap<SymbolId, (u32, usize)>,
+  /// First parameter of an inline callback of `Effect.map` / `flatMap` / `tap`
+  /// -> the effect whose success it receives.
+  callback_params: FxHashMap<SymbolId, &'a Expression<'a>>,
+  functions: FxHashMap<u32, FnNode<'a>>,
+  /// `const f = () => ...` and function declarations -> function start.
+  named: FxHashMap<SymbolId, u32>,
+  named_by_function: FxHashMap<u32, SymbolId>,
+  uses: FxHashMap<SymbolId, FnUses<'a>>,
+  /// `yield*` expressions directly inside an Effect generator.
+  effect_yields: FxHashSet<u32>,
+  /// Values stored into objects or collections.
+  heap_writes: Vec<&'a Expression<'a>>,
+  heap_unknown: bool,
+  /// Imports from Node modules that format their arguments.
+  formatting_imports: FxHashSet<SymbolId>,
+}
+
+// Methods that store their arguments in the receiver.
+const MUTATORS: &[&str] = &[
+  "push",
+  "unshift",
+  "splice",
+  "fill",
+  "copyWithin",
+  "set",
+  "add",
+  "assign",
+  "defineProperty",
+  "defineProperties",
+  "setPrototypeOf",
+  "__defineGetter__",
+  "__defineSetter__",
+  "call",
+  "apply",
+];
+// Methods whose result is clean when the receiver and arguments are.
+const CLEAN_METHODS: &[&str] = &[
+  "join",
+  "slice",
+  "concat",
+  "filter",
+  "find",
+  "findLast",
+  "at",
+  "flat",
+  "includes",
+  "indexOf",
+  "lastIndexOf",
+  "some",
+  "every",
+  "toString",
+  "toFixed",
+  "toLowerCase",
+  "toUpperCase",
+  "trim",
+  "trimStart",
+  "trimEnd",
+  "split",
+  "replace",
+  "replaceAll",
+  "padStart",
+  "padEnd",
+  "repeat",
+  "startsWith",
+  "endsWith",
+  "charAt",
+  "charCodeAt",
+  "substring",
+  "get",
+  "has",
+  "keys",
+  "values",
+  "entries",
+];
+// Builtins that read, serialize or format their arguments, by path. Calling
+// one with a value that may hold a runtime object disables the pass, and so
+// does any other use of them, which hides the call from the analysis.
+const READING_BUILTINS: &[&str] = &[
+  "Object.keys",
+  "Object.values",
+  "Object.entries",
+  "Object.getOwnPropertyNames",
+  "Object.getOwnPropertyDescriptor",
+  "Object.getOwnPropertyDescriptors",
+  "Object.getOwnPropertySymbols",
+  "Object.hasOwn",
+  "Reflect",
+  "JSON.stringify",
+  "structuredClone",
+  "String",
+  "console",
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "EvalError",
+  "URIError",
+  "AggregateError",
+];
+// Trusted APIs that format their arguments: logs and the pretty-printed Cause.
+const FORMATTING_API_PREFIXES: &[&str] =
+  &["Effect.fail", "Effect.die", "Effect.log", "Console.", "Inspectable.", "Cause.", "Logger."];
+// Node modules that format their arguments.
+const FORMATTING_MODULES: &[&str] = &["util", "console"];
+// Methods that format their receiver.
+const FORMATTING_METHODS: &[&str] = &["toString", "toLocaleString", "join"];
+// String methods that format their arguments.
+const COERCING_METHODS: &[&str] = &[
+  "concat",
+  "padStart",
+  "padEnd",
+  "replace",
+  "replaceAll",
+  "localeCompare",
+  "match",
+  "matchAll",
+  "search",
+  "split",
+  "startsWith",
+  "endsWith",
+  "includes",
+  "indexOf",
+  "lastIndexOf",
+];
+// Methods that observe whether a property exists.
+const PRESENCE_METHODS: &[&str] = &["hasOwnProperty", "propertyIsEnumerable"];
+
+fn path_matches(path: &str, prefix: &str) -> bool {
+  path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'))
+}
+
+impl Shared<'_> {
+  /// The path of a global builtin, `Object.values` for `Object.values` or
+  /// `globalThis.Object["values"]`; `globalThis` for the global object itself.
+  fn builtin_path(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<String> {
+    let join = |base: String, name: &str| {
+      if GLOBAL_OBJECTS.contains(&base.as_str()) {
+        name.to_string()
+      } else {
+        format!("{base}.{name}")
+      }
+    };
+    match strip(expr) {
+      Expression::Identifier(ident) => (ident.reference_id.get().is_some()
+        && self.resolve_ident(module, ident).is_none())
+      .then(|| ident.name.to_string()),
+      Expression::StaticMemberExpression(member) => {
+        Some(join(self.builtin_path(module, &member.object)?, member.property.name.as_str()))
+      }
+      Expression::ComputedMemberExpression(member) => {
+        let base = self.builtin_path(module, &member.object)?;
+        Some(join(base, &self.const_string(module, &member.expression)?))
+      }
+      _ => None,
+    }
+  }
+}
+
+fn collect_flow<'a>(shared: &Shared<'_>, module: ModuleIdx, program: &Program<'a>) -> Flow<'a> {
+  let mut collector = FlowCollector {
+    shared,
+    module,
+    flow: Flow::default(),
+    kind: VariableDeclarationKind::Var,
+    callee_spans: FxHashSet::default(),
+    effect_generators: FxHashSet::default(),
+    functions: vec![],
+    loop_head: None,
+  };
+  collector.visit_program(program);
+  collector.flow
+}
+
+/// Pass C: value flow of an untrusted module.
+struct FlowCollector<'s, 'l, 'a> {
+  shared: &'s Shared<'l>,
+  module: ModuleIdx,
+  flow: Flow<'a>,
+  kind: VariableDeclarationKind,
+  callee_spans: FxHashSet<u32>,
+  effect_generators: FxHashSet<u32>,
+  /// Whether each enclosing function is an Effect generator.
+  functions: Vec<bool>,
+  /// Bindings introduced by a `for...in` / `for...of` head: the iterated value.
+  loop_head: Option<(bool, &'a Expression<'a>)>,
+}
+
+impl<'a> FlowCollector<'_, '_, 'a> {
+  fn symbol(&self, ident: &IdentifierReference<'_>) -> Option<SymbolId> {
+    let reference = ident.reference_id.get()?;
+    self.shared.scoping(self.module).get_reference(reference).symbol_id()
+  }
+
+  fn add(&mut self, symbol: SymbolId, source: Source<'a>) {
+    self.flow.sources.entry(symbol).or_default().push(source);
+  }
+
+  /// Bindings of a pattern, all from `value`.
+  fn bind_pattern(&mut self, pattern: &BindingPattern<'a>, value: Option<&'a Expression<'a>>) {
+    let has_default =
+      matches!(pattern, BindingPattern::AssignmentPattern(_)) || pattern_has_default(pattern);
+    for ident in pattern.get_binding_identifiers() {
+      let source = match value {
+        Some(value) if !has_default => Source::Expr(value),
+        None if !has_default && matches!(pattern, BindingPattern::BindingIdentifier(_)) => {
+          Source::Primitive { numeric: true }
+        }
+        _ => Source::Unknown,
+      };
+      self.add(ident.symbol_id(), source);
+    }
+  }
+
+  fn function(&mut self, node: FnNode<'a>, start: u32, params: &'a FormalParameters<'a>) {
+    self.flow.functions.insert(start, node);
+    for (index, param) in params.items.iter().enumerate() {
+      match &param.pattern {
+        BindingPattern::BindingIdentifier(id) if param.initializer.is_none() => {
+          self.flow.params.insert(id.symbol_id(), (start, index));
+        }
+        pattern => {
+          for ident in pattern.get_binding_identifiers() {
+            self.add(ident.symbol_id(), Source::Unknown);
+          }
+        }
+      }
+    }
+    if let Some(rest) = &params.rest {
+      for ident in rest.rest.argument.get_binding_identifiers() {
+        self.add(ident.symbol_id(), Source::Unknown);
+      }
+    }
+  }
+
+  fn assignment_target(
+    &mut self,
+    target: &'a AssignmentTarget<'a>,
+    value: Option<&'a Expression<'a>>,
+  ) {
+    match target {
+      AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+        if let Some(symbol) = self.symbol(ident) {
+          self.add(symbol, value.map_or(Source::Unknown, Source::Expr));
+        }
+      }
+      AssignmentTarget::StaticMemberExpression(_)
+      | AssignmentTarget::ComputedMemberExpression(_)
+      | AssignmentTarget::PrivateFieldExpression(_) => match value {
+        Some(value) => self.flow.heap_writes.push(value),
+        None => self.flow.heap_unknown = true,
+      },
+      AssignmentTarget::ArrayAssignmentTarget(_) | AssignmentTarget::ObjectAssignmentTarget(_) => {
+        // Every identifier inside takes a part of the value; members are heap writes.
+        let mut finder = TargetFinder { identifiers: vec![], members: false, defaults: false };
+        finder.visit_assignment_target(target);
+        if finder.members {
+          self.flow.heap_unknown = true;
+        }
+        for ident in finder.identifiers {
+          if let Some(symbol) = self.symbol(ident) {
+            let source = match value {
+              Some(value) if !finder.defaults => Source::Expr(value),
+              _ => Source::Unknown,
+            };
+            self.add(symbol, source);
+          }
+        }
+      }
+      _ => self.flow.heap_unknown = true,
+    }
+  }
+}
+
+fn pattern_has_default(pattern: &BindingPattern<'_>) -> bool {
+  match pattern {
+    BindingPattern::BindingIdentifier(_) => false,
+    BindingPattern::AssignmentPattern(_) => true,
+    BindingPattern::ObjectPattern(object) => {
+      object.properties.iter().any(|property| pattern_has_default(&property.value))
+        || object.rest.as_ref().is_some_and(|rest| pattern_has_default(&rest.argument))
+    }
+    BindingPattern::ArrayPattern(array) => {
+      array.elements.iter().flatten().any(pattern_has_default)
+        || array.rest.as_ref().is_some_and(|rest| pattern_has_default(&rest.argument))
+    }
+  }
+}
+
+/// Identifiers and members written by a destructuring assignment target.
+struct TargetFinder<'a> {
+  identifiers: Vec<&'a IdentifierReference<'a>>,
+  members: bool,
+  defaults: bool,
+}
+
+impl<'a> VisitJs<'a> for TargetFinder<'a> {
+  fn visit_simple_assignment_target(&mut self, it: &SimpleAssignmentTarget<'a>) {
+    match it {
+      SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) => {
+        self.identifiers.push(self.alloc(ident.as_ref()));
+      }
+      _ => self.members = true,
+    }
+  }
+  fn visit_assignment_target_with_default(&mut self, it: &AssignmentTargetWithDefault<'a>) {
+    self.defaults = true;
+    walk_js::walk_assignment_target_with_default(self, it);
+  }
+  fn visit_assignment_target_property_identifier(
+    &mut self,
+    it: &AssignmentTargetPropertyIdentifier<'a>,
+  ) {
+    self.defaults |= it.init.is_some();
+    self.identifiers.push(self.alloc(&it.binding));
+  }
+  fn visit_expression(&mut self, _it: &Expression<'a>) {}
+}
+
+impl<'a> VisitJs<'a> for FlowCollector<'_, '_, 'a> {
+  fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+    let previous = self.kind;
+    self.kind = it.kind;
+    walk_js::walk_variable_declaration(self, it);
+    self.kind = previous;
+  }
+
+  fn visit_variable_declarator(&mut self, it: &VariableDeclarator<'a>) {
+    let it = self.alloc(it);
+    match self.loop_head.take() {
+      Some((true, iterated)) => self.bind_pattern(&it.id, Some(iterated)),
+      Some((false, _)) => {
+        for ident in it.id.get_binding_identifiers() {
+          self.add(ident.symbol_id(), Source::Primitive { numeric: false });
+        }
+      }
+      None => {
+        self.bind_pattern(&it.id, it.init.as_ref());
+        if let (BindingPattern::BindingIdentifier(id), Some(init), VariableDeclarationKind::Const) =
+          (&it.id, &it.init, self.kind)
+        {
+          if let Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) =
+            strip(init)
+          {
+            let start = strip(init).span().start;
+            self.flow.named.insert(id.symbol_id(), start);
+            self.flow.named_by_function.insert(start, id.symbol_id());
+          }
+        }
+      }
+    }
+    walk_js::walk_variable_declarator(self, it);
+  }
+
+  fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+    let it = self.alloc(it);
+    match &it.left {
+      ForStatementLeft::VariableDeclaration(_) => self.loop_head = Some((false, &it.right)),
+      left => {
+        if let Some(AssignmentTarget::AssignmentTargetIdentifier(ident)) =
+          left.as_assignment_target()
+        {
+          if let Some(symbol) = self.symbol(ident) {
+            self.add(symbol, Source::Primitive { numeric: false });
+          }
+        }
+      }
+    }
+    walk_js::walk_for_in_statement(self, it);
+    self.loop_head = None;
+  }
+
+  fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+    let it = self.alloc(it);
+    match &it.left {
+      ForStatementLeft::VariableDeclaration(_) => self.loop_head = Some((true, &it.right)),
+      left => {
+        if let Some(target) = left.as_assignment_target() {
+          self.assignment_target(target, Some(&it.right));
+        }
+      }
+    }
+    walk_js::walk_for_of_statement(self, it);
+    self.loop_head = None;
+  }
+
+  fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+    let it = self.alloc(it);
+    if it.operator == AssignmentOperator::Assign || it.operator.is_logical() {
+      self.assignment_target(&it.left, Some(&it.right));
+    } else if let AssignmentTarget::AssignmentTargetIdentifier(ident) = &it.left {
+      // `x += y` is a string or a number.
+      let numeric = it.operator != AssignmentOperator::Addition || is_numeric(&it.right);
+      if let Some(symbol) = self.symbol(ident) {
+        self.add(symbol, Source::Primitive { numeric });
+      }
+    }
+    walk_js::walk_assignment_expression(self, it);
+  }
+
+  fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
+    if let SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) = &it.argument {
+      if let Some(symbol) = self.symbol(ident) {
+        self.add(symbol, Source::Primitive { numeric: true });
+      }
+    }
+    walk_js::walk_update_expression(self, it);
+  }
+
+  fn visit_catch_clause(&mut self, it: &CatchClause<'a>) {
+    if let Some(param) = &it.param {
+      for ident in param.pattern.get_binding_identifiers() {
+        self.add(ident.symbol_id(), Source::Unknown);
+      }
+    }
+    walk_js::walk_catch_clause(self, it);
+  }
+
+  fn visit_class(&mut self, it: &Class<'a>) {
+    if let Some(id) = &it.id {
+      self.add(id.symbol_id(), Source::Unknown);
+    }
+    walk_js::walk_class(self, it);
+  }
+
+  fn visit_function(&mut self, it: &Function<'a>, flags: oxc::semantic::ScopeFlags) {
+    let it = self.alloc(it);
+    self.function(FnNode::Function(it), it.span.start, &it.params);
+    if let (Some(id), FunctionType::FunctionDeclaration) = (&it.id, it.r#type) {
+      self.add(id.symbol_id(), Source::Function);
+      if !self.shared.scoping(self.module).symbol_is_mutated(id.symbol_id()) {
+        self.flow.named.insert(id.symbol_id(), it.span.start);
+        self.flow.named_by_function.insert(it.span.start, id.symbol_id());
+      }
+    }
+    self.functions.push(it.generator && self.effect_generators.contains(&it.span.start));
+    walk_js::walk_function(self, it, flags);
+    self.functions.pop();
+  }
+
+  fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+    let it = self.alloc(it);
+    self.function(FnNode::Arrow(it), it.span.start, &it.params);
+    self.functions.push(false);
+    walk_js::walk_arrow_function_expression(self, it);
+    self.functions.pop();
+  }
+
+  fn visit_yield_expression(&mut self, it: &YieldExpression<'a>) {
+    if it.delegate && self.functions.last() == Some(&true) {
+      self.flow.effect_yields.insert(it.span.start);
+    }
+    walk_js::walk_yield_expression(self, it);
+  }
+
+  fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+    let it = self.alloc(it);
+    let callee = strip(&it.callee);
+    if let Expression::Identifier(ident) = callee {
+      self.callee_spans.insert(ident.span.start);
+      if let Some(symbol) = self.symbol(ident) {
+        self.flow.uses.entry(symbol).or_default().calls.push(&it.arguments);
+      }
+    }
+    if let Expression::StaticMemberExpression(member) = callee {
+      if MUTATORS.contains(&member.property.name.as_str()) {
+        for argument in &it.arguments {
+          match argument {
+            Argument::SpreadElement(spread) => self.flow.heap_writes.push(&spread.argument),
+            argument => {
+              if let Some(expr) = argument.as_expression() {
+                self.flow.heap_writes.push(expr);
+              }
+            }
+          }
+        }
+      }
+    }
+    match self.shared.api_of(self.module, callee) {
+      Some("Effect.gen" | "Effect.fn" | "Effect.fnUntraced") => {
+        for argument in &it.arguments {
+          if let Some(Expression::FunctionExpression(f)) = argument.as_expression().map(strip) {
+            self.effect_generators.insert(f.span.start);
+          }
+        }
+      }
+      Some("Effect.map" | "Effect.flatMap" | "Effect.tap") if it.arguments.len() == 2 => {
+        let first_param = match it.arguments[1].as_expression().map(strip) {
+          Some(Expression::ArrowFunctionExpression(f)) => f.params.items.first(),
+          Some(Expression::FunctionExpression(f)) => f.params.items.first(),
+          _ => None,
+        };
+        if let (Some(param), Some(effect)) = (first_param, it.arguments[0].as_expression()) {
+          if let (BindingPattern::BindingIdentifier(id), None) =
+            (&param.pattern, &param.initializer)
+          {
+            self.flow.callback_params.insert(id.symbol_id(), effect);
+          }
+        }
+      }
+      _ => {}
+    }
+    walk_js::walk_call_expression(self, it);
+  }
+
+  fn visit_import_declaration(&mut self, it: &ImportDeclaration<'a>) {
+    let source = it.source.value.as_str().unwrap_or_default();
+    let source = source.strip_prefix("node:").unwrap_or(source);
+    if FORMATTING_MODULES.contains(&source) {
+      for specifier in it.specifiers.iter().flatten() {
+        self.flow.formatting_imports.insert(specifier.local().symbol_id());
+      }
+    }
+  }
+
+  fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+    if !self.callee_spans.contains(&it.span.start) {
+      if let Some(symbol) = self.symbol(it) {
+        self.flow.uses.entry(symbol).or_default().escaped = true;
+      }
+    }
+  }
+}
+
+/// Whether values in an untrusted module may hold an Effect runtime object.
+struct Prov<'f, 's, 'l, 'a> {
+  shared: &'s Shared<'l>,
+  module: ModuleIdx,
+  flow: &'f Flow<'a>,
+  heap_tainted: bool,
+  /// Key -> method -> whether every provider's method returns a clean value.
+  facts: &'f FxHashMap<String, FxHashMap<String, bool>>,
+  /// Consumer bindings of this module -> key.
+  consumers: &'f FxHashMap<SymbolId, String>,
+  symbols: FxHashMap<SymbolId, Option<bool>>,
+  numeric_symbols: FxHashMap<SymbolId, Option<bool>>,
+  returns: FxHashMap<u32, Option<bool>>,
+  depth: usize,
+}
+
+impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
+  fn new(
+    shared: &'s Shared<'l>,
+    module: ModuleIdx,
+    flow: &'f Flow<'a>,
+    heap_tainted: bool,
+    facts: &'f FxHashMap<String, FxHashMap<String, bool>>,
+    consumers: &'f FxHashMap<SymbolId, String>,
+  ) -> Self {
+    Prov {
+      shared,
+      module,
+      flow,
+      heap_tainted,
+      facts,
+      consumers,
+      symbols: FxHashMap::default(),
+      numeric_symbols: FxHashMap::default(),
+      returns: FxHashMap::default(),
+      depth: 0,
+    }
+  }
+
+  fn symbol(&self, ident: &IdentifierReference<'_>) -> Option<SymbolId> {
+    let reference = ident.reference_id.get()?;
+    self.shared.scoping(self.module).get_reference(reference).symbol_id()
+  }
+
+  fn args_clean(&mut self, args: &[Argument<'a>]) -> bool {
+    args.iter().all(|argument| match argument {
+      Argument::SpreadElement(spread) => self.clean(&spread.argument),
+      argument => argument.as_expression().is_some_and(|expr| self.clean(expr)),
+    })
+  }
+
+  fn clean(&mut self, expr: &Expression<'a>) -> bool {
+    if self.depth > 64 {
+      return false;
+    }
+    self.depth += 1;
+    let result = self.clean_inner(expr);
+    self.depth -= 1;
+    result
+  }
+
+  fn clean_inner(&mut self, expr: &Expression<'a>) -> bool {
+    match strip(expr) {
+      Expression::StringLiteral(_)
+      | Expression::NumericLiteral(_)
+      | Expression::BooleanLiteral(_)
+      | Expression::NullLiteral(_)
+      | Expression::BigIntLiteral(_)
+      | Expression::RegExpLiteral(_)
+      | Expression::TemplateLiteral(_)
+      | Expression::UnaryExpression(_)
+      | Expression::BinaryExpression(_)
+      | Expression::UpdateExpression(_)
+      | Expression::ArrowFunctionExpression(_)
+      | Expression::FunctionExpression(_) => true,
+      Expression::Identifier(ident) => match self.symbol(ident) {
+        Some(symbol) => self.symbol_clean(symbol),
+        None => {
+          ident.reference_id.get().is_some()
+            && matches!(ident.name.as_str(), "undefined" | "NaN" | "Infinity")
+        }
+      },
+      Expression::ArrayExpression(array) => {
+        !self.heap_tainted
+          && array.elements.iter().all(|element| match element {
+            ArrayExpressionElement::Elision(_) => true,
+            ArrayExpressionElement::SpreadElement(spread) => self.clean(&spread.argument),
+            element => element.as_expression().is_some_and(|expr| self.clean(expr)),
+          })
+      }
+      Expression::ObjectExpression(object) => {
+        !self.heap_tainted
+          && object.properties.iter().all(|property| match property {
+            ObjectPropertyKind::SpreadProperty(spread) => self.clean(&spread.argument),
+            ObjectPropertyKind::ObjectProperty(property) => {
+              property.kind == PropertyKind::Init
+                && property
+                  .key
+                  .static_name()
+                  .and_then(|name| name.as_js_str().as_str().map(String::from))
+                  .as_deref()
+                  != Some("__proto__")
+                && (!property.computed
+                  || property.key.as_expression().is_some_and(|key| self.clean(key)))
+                && self.clean(&property.value)
+            }
+          })
+      }
+      Expression::LogicalExpression(logical) => {
+        self.clean(&logical.left) && self.clean(&logical.right)
+      }
+      Expression::ConditionalExpression(conditional) => {
+        self.clean(&conditional.consequent) && self.clean(&conditional.alternate)
+      }
+      Expression::SequenceExpression(sequence) => {
+        sequence.expressions.last().is_some_and(|last| self.clean(last))
+      }
+      Expression::AssignmentExpression(assign) => {
+        !(assign.operator == AssignmentOperator::Assign || assign.operator.is_logical())
+          || self.clean(&assign.right)
+      }
+      Expression::AwaitExpression(await_expr) => self.clean(&await_expr.argument),
+      Expression::YieldExpression(yield_expr) => {
+        yield_expr.delegate
+          && self.flow.effect_yields.contains(&yield_expr.span.start)
+          && yield_expr.argument.as_ref().is_some_and(|argument| self.success(argument))
+      }
+      Expression::StaticMemberExpression(member) => {
+        self.shared.resolve_expr(self.module, expr).is_none() && self.clean(&member.object)
+      }
+      Expression::ComputedMemberExpression(member) => self.clean(&member.object),
+      Expression::ChainExpression(chain) => match &chain.expression {
+        ChainElement::CallExpression(call) => self.call_clean(call),
+        ChainElement::StaticMemberExpression(member) => self.clean(&member.object),
+        ChainElement::ComputedMemberExpression(member) => self.clean(&member.object),
+        _ => false,
+      },
+      Expression::CallExpression(call) => self.call_clean(call),
+      Expression::NewExpression(new) => {
+        matches!(
+          self.shared.builtin_path(self.module, &new.callee).as_deref(),
+          Some("Map" | "Set" | "Date" | "Array" | "URL" | "URLSearchParams" | "RegExp")
+        ) && self.args_clean(&new.arguments)
+      }
+      _ => false,
+    }
+  }
+
+  fn symbol_clean(&mut self, symbol: SymbolId) -> bool {
+    match self.symbols.get(&symbol) {
+      Some(Some(clean)) => return *clean,
+      Some(None) => return false,
+      None => {}
+    }
+    self.symbols.insert(symbol, None);
+    let flow = self.flow;
+    let mut known = false;
+    let mut clean = true;
+    if let Some(effect) = flow.callback_params.get(&symbol) {
+      known = true;
+      clean &= self.success(effect);
+    } else if let Some(&(function, index)) = flow.params.get(&symbol) {
+      known = true;
+      clean &= self.param_clean(function, index);
+    }
+    if let Some(sources) = flow.sources.get(&symbol) {
+      known = true;
+      for source in sources {
+        if !clean {
+          break;
+        }
+        clean &= match source {
+          Source::Expr(expr) => self.clean(expr),
+          Source::Primitive { .. } | Source::Function => true,
+          Source::Unknown => false,
+        };
+      }
+    }
+    let clean = known && clean;
+    self.symbols.insert(symbol, Some(clean));
+    clean
+  }
+
+  /// A parameter of a function only called directly, by every call site.
+  fn param_clean(&mut self, function: u32, index: usize) -> bool {
+    let flow = self.flow;
+    let Some(symbol) = flow.named_by_function.get(&function) else { return false };
+    let Some(node) = flow.functions.get(&function) else { return false };
+    if node.reads_arguments() {
+      return false;
+    }
+    // Other modules may call an exported function with anything.
+    let this: SymbolRef = (self.module, *symbol).into();
+    let exported = self.shared.resolved_exports[self.module.index()]
+      .values()
+      .any(|export| self.shared.symbols.canonical_ref_for(*export) == this);
+    if exported {
+      return false;
+    }
+    let Some(uses) = flow.uses.get(symbol) else { return true };
+    if uses.escaped {
+      return false;
+    }
+    uses.calls.iter().all(|args| {
+      if args.iter().take(index + 1).any(|arg| matches!(arg, Argument::SpreadElement(_))) {
+        return false;
+      }
+      match args.get(index) {
+        None => true,
+        Some(arg) => arg.as_expression().is_some_and(|expr| self.clean(expr)),
+      }
+    })
+  }
+
+  fn returns_clean(&mut self, node: FnNode<'a>, success: bool) -> bool {
+    let Some(returns) = node.returns() else { return false };
+    returns.into_iter().all(|expr| if success { self.success(expr) } else { self.clean(expr) })
+  }
+
+  /// The result of calling a named function.
+  fn function_clean(&mut self, function: u32) -> bool {
+    match self.returns.get(&function) {
+      Some(Some(clean)) => return *clean,
+      Some(None) => return false,
+      None => {}
+    }
+    let Some(&node) = self.flow.functions.get(&function) else { return false };
+    self.returns.insert(function, None);
+    let clean = !node.is_generator() && self.returns_clean(node, false);
+    self.returns.insert(function, Some(clean));
+    clean
+  }
+
+  fn function_expr(&self, expr: &Expression<'a>) -> Option<FnNode<'a>> {
+    let start = match strip(expr) {
+      Expression::ArrowFunctionExpression(f) => f.span.start,
+      Expression::FunctionExpression(f) => f.span.start,
+      Expression::Identifier(ident) => *self.flow.named.get(&self.symbol(ident)?)?,
+      _ => return None,
+    };
+    self.flow.functions.get(&start).copied()
+  }
+
+  fn consumer_key(&self, expr: &Expression<'a>) -> Option<&String> {
+    match strip(expr) {
+      Expression::Identifier(ident) => self.consumers.get(&self.symbol(ident)?),
+      Expression::YieldExpression(yield_expr) if yield_expr.delegate => {
+        self.shared.key_of(self.module, yield_expr.argument.as_ref()?)
+      }
+      _ => None,
+    }
+  }
+
+  fn call_clean(&mut self, call: &CallExpression<'a>) -> bool {
+    let callee = strip(&call.callee);
+    if let Expression::Identifier(ident) = callee {
+      if let Some(&function) = self.symbol(ident).and_then(|symbol| self.flow.named.get(&symbol)) {
+        return self.function_clean(function);
+      }
+    }
+    if let Some(path) = self.shared.builtin_path(self.module, callee) {
+      return match path.as_str() {
+        "JSON.parse" => call.arguments.len() == 1,
+        "String" | "Number" | "Boolean" | "parseInt" | "parseFloat" | "isNaN" | "isFinite"
+        | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI"
+        | "Array.isArray" | "Object.is" | "Reflect.ownKeys" | "Reflect.has" | "Date.now" => true,
+        "structuredClone"
+        | "Object.keys"
+        | "Object.values"
+        | "Object.entries"
+        | "Object.getOwnPropertyNames"
+        | "Object.fromEntries"
+        | "Object.freeze"
+        | "Array.from"
+        | "Array.of" => self.args_clean(&call.arguments),
+        path => path.starts_with("Math.") || path.starts_with("Number."),
+      };
+    }
+    if let Expression::StaticMemberExpression(member) = callee {
+      let name = member.property.name.as_str();
+      if let Some(key) = self.consumer_key(&member.object) {
+        return self.facts.get(key).and_then(|methods| methods.get(name)).copied().unwrap_or(false);
+      }
+      if name == "of" && self.shared.key_of(self.module, &member.object).is_some() {
+        return call.arguments.len() == 1 && self.args_clean(&call.arguments);
+      }
+      if CLEAN_METHODS.contains(&name) {
+        return self.clean(&member.object) && self.args_clean(&call.arguments);
+      }
+    }
+    match self.shared.api_of(self.module, callee) {
+      Some("Effect.runPromise" | "Effect.runSync") => {
+        call.arguments.first().and_then(Argument::as_expression).is_some_and(|e| self.success(e))
+      }
+      _ => false,
+    }
+  }
+
+  /// Whether the success value of an Effect expression is clean.
+  fn success(&mut self, expr: &Expression<'a>) -> bool {
+    if self.depth > 64 {
+      return false;
+    }
+    self.depth += 1;
+    let result = self.success_inner(expr);
+    self.depth -= 1;
+    result
+  }
+
+  fn success_inner(&mut self, expr: &Expression<'a>) -> bool {
+    match strip(expr) {
+      Expression::Identifier(ident) => {
+        let flow = self.flow;
+        let Some(symbol) = self.symbol(ident) else { return false };
+        if flow.params.contains_key(&symbol) {
+          return false;
+        }
+        match flow.sources.get(&symbol).map(Vec::as_slice) {
+          Some([Source::Expr(init)]) => self.success(init),
+          _ => false,
+        }
+      }
+      Expression::CallExpression(call) => {
+        let args = &call.arguments;
+        let arg = |index: usize| args.get(index).and_then(Argument::as_expression);
+        match self.shared.api_of(self.module, &call.callee) {
+          Some("Effect.succeed") if args.len() == 1 => arg(0).is_some_and(|v| self.clean(v)),
+          Some("Effect.sync") if args.len() == 1 => arg(0)
+            .and_then(|f| self.function_expr(f))
+            .is_some_and(|f| !f.is_generator() && self.returns_clean(f, false)),
+          Some("Effect.gen") if !args.is_empty() => arg(args.len() - 1)
+            .and_then(|f| self.function_expr(f))
+            .is_some_and(|f| self.returns_clean(f, false)),
+          Some("Effect.map") if args.len() == 2 => arg(1)
+            .and_then(|f| self.function_expr(f))
+            .is_some_and(|f| !f.is_generator() && self.returns_clean(f, false)),
+          Some("Effect.flatMap") if args.len() == 2 => arg(1)
+            .and_then(|f| self.function_expr(f))
+            .is_some_and(|f| !f.is_generator() && self.returns_clean(f, true)),
+          Some("Effect.tap" | "Effect.provide") if args.len() == 2 => {
+            arg(0).is_some_and(|e| self.success(e))
+          }
+          Some("Effect.all") if !args.is_empty() => match arg(0).map(strip) {
+            Some(Expression::ArrayExpression(array)) => array
+              .elements
+              .iter()
+              .all(|element| element.as_expression().is_some_and(|e| self.success(e))),
+            _ => false,
+          },
+          _ => false,
+        }
+      }
+      _ => false,
+    }
+  }
+
+  /// Whether a computed key is a number, which never names a Context internal.
+  fn key_numeric(&mut self, expr: &Expression<'a>) -> bool {
+    if is_numeric(expr) {
+      return true;
+    }
+    let Expression::Identifier(ident) = strip(expr) else { return false };
+    let Some(symbol) = self.symbol(ident) else { return false };
+    if self.flow.params.contains_key(&symbol) || self.flow.callback_params.contains_key(&symbol) {
+      return false;
+    }
+    match self.numeric_symbols.get(&symbol) {
+      Some(Some(numeric)) => return *numeric,
+      Some(None) => return true,
+      None => {}
+    }
+    self.numeric_symbols.insert(symbol, None);
+    let flow = self.flow;
+    let numeric = flow.sources.get(&symbol).is_some_and(|sources| {
+      sources.iter().all(|source| match source {
+        Source::Expr(expr) => self.key_numeric(expr),
+        Source::Primitive { numeric } => *numeric,
+        Source::Function | Source::Unknown => false,
+      })
+    });
+    self.numeric_symbols.insert(symbol, Some(numeric));
+    numeric
+  }
+}
+
+/// Pass D: method results of user providers, for consumers that format them.
+struct FactCollector<'p, 'f, 's, 'l, 'a> {
+  prov: &'p mut Prov<'f, 's, 'l, 'a>,
+  /// Site object literal start -> site index.
+  sites: &'p FxHashMap<u32, usize>,
+  facts: Vec<(usize, String, bool)>,
+}
+
+impl<'a> VisitJs<'a> for FactCollector<'_, '_, '_, '_, 'a> {
+  fn visit_object_expression(&mut self, it: &ObjectExpression<'a>) {
+    if let Some(&site) = self.sites.get(&it.span.start) {
+      for property in &it.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = property else { continue };
+        if property.computed || property.kind != PropertyKind::Init {
+          continue;
+        }
+        let Some(name) =
+          property.key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
+        else {
+          continue;
+        };
+        let clean = self
+          .prov
+          .function_expr(&property.value)
+          .is_some_and(|f| !f.is_generator() && self.prov.returns_clean(f, false));
+        self.facts.push((site, name, clean));
+      }
+    }
+    walk_js::walk_object_expression(self, it);
+  }
+}
+
+/// Pass E: sinks whose operand may hold an Effect runtime object, and static
+/// reads on such values.
+struct SinkChecker<'p, 'f, 's, 'l, 'a> {
+  prov: &'p mut Prov<'f, 's, 'l, 'a>,
+  path: Vec<AstKind<'a>>,
+  /// Receivers of static reads recorded by pass B.
+  receivers: &'p FxHashSet<(u32, u32)>,
+  /// Consumer and release bindings, whose reads are tracked per key.
+  tracked: &'p FxHashSet<SymbolId>,
+  unclean_receivers: FxHashSet<(u32, u32)>,
+  /// Names whose presence is observed on a value that may hold a service.
+  names: Vec<String>,
+  global_bailouts: Vec<String>,
+}
+
+impl<'a> SinkChecker<'_, '_, '_, '_, 'a> {
+  fn bail(&mut self, span: Span, reason: &str) {
+    self
+      .global_bailouts
+      .push(format!("{reason} (module {:?} at {})", self.prov.module, span.start));
+  }
+
+  fn parent(&self, depth: usize) -> Option<&AstKind<'a>> {
+    self.path.iter().rev().nth(depth)
+  }
+
+  fn tracked_receiver(&self, expr: &Expression<'a>) -> bool {
+    match strip(expr) {
+      Expression::Identifier(ident) => {
+        self.prov.symbol(ident).is_some_and(|symbol| self.tracked.contains(&symbol))
+      }
+      Expression::YieldExpression(yield_expr) => {
+        yield_expr.delegate
+          && yield_expr
+            .argument
+            .as_ref()
+            .is_some_and(|argument| self.prov.shared.key_of(self.prov.module, argument).is_some())
+      }
+      _ => false,
+    }
+  }
+
+  /// A member path rooted at an import from a Node formatting module.
+  fn formatter_callee(&self, callee: &Expression<'a>) -> bool {
+    let mut expr = strip(callee);
+    while let Expression::StaticMemberExpression(member) = expr {
+      expr = strip(&member.object);
+    }
+    matches!(expr, Expression::Identifier(ident)
+      if self.prov.symbol(ident).is_some_and(|s| self.prov.flow.formatting_imports.contains(&s)))
+  }
+
+  fn unclean(&mut self, expr: &Expression<'a>) -> bool {
+    !self.tracked_receiver(expr) && !self.prov.clean(expr)
+  }
+
+  fn any_unclean(&mut self, args: &[Argument<'a>]) -> bool {
+    args.iter().any(|argument| match argument {
+      Argument::SpreadElement(spread) => self.unclean(&spread.argument),
+      argument => argument.as_expression().is_some_and(|expr| self.unclean(expr)),
+    })
+  }
+
+  /// Whether the expression at ancestor `depth` - 1, spanning `span`, is the callee of a call.
+  fn is_called(&self, span: Span, depth: usize) -> bool {
+    match self.parent(depth) {
+      Some(AstKind::CallExpression(call)) => call.callee.span() == span,
+      Some(AstKind::NewExpression(new)) => new.callee.span() == span,
+      _ => false,
+    }
+  }
+
+  fn check_call(&mut self, span: Span, callee: &Expression<'a>, args: &'a [Argument<'a>]) {
+    let module = self.prov.module;
+    let shared = self.prov.shared;
+    if let Some(path) = shared.builtin_path(module, callee) {
+      if READING_BUILTINS.iter().any(|sink| path_matches(&path, sink))
+        || path.contains(".prototype.")
+      {
+        if self.any_unclean(args) {
+          self.bail(span, &format!("`{path}` may read an Effect runtime object"));
+        }
+        return;
+      }
+    }
+    if let Some(name) = shared.api_of(module, callee) {
+      if FORMATTING_API_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        && self.any_unclean(args)
+      {
+        self.bail(span, &format!("`{name}` may format an Effect runtime object"));
+        return;
+      }
+    }
+    if self.formatter_callee(callee) && self.any_unclean(args) {
+      self.bail(span, "a Node formatter may format an Effect runtime object");
+      return;
+    }
+    let export = shared.resolve_expr(module, callee).is_some();
+    if let (Expression::StaticMemberExpression(member), false) = (strip(callee), export) {
+      let name = member.property.name.as_str();
+      if (FORMATTING_METHODS.contains(&name) || PRESENCE_METHODS.contains(&name))
+        && self.unclean(&member.object)
+      {
+        self.bail(span, &format!("`{name}` may read an Effect runtime object"));
+        return;
+      }
+      if COERCING_METHODS.contains(&name) && self.any_unclean(args) {
+        self.bail(span, &format!("`{name}` may format an Effect runtime object"));
+        return;
+      }
+    }
+    // `descriptor(proto, "mapUnsafe")`: a constant internal name next to a runtime value.
+    let internal = args.iter().any(|argument| {
+      argument
+        .as_expression()
+        .and_then(|expr| shared.const_string(module, expr))
+        .is_some_and(|name| CONTEXT_INTERNALS.contains(&name.as_str()))
+    });
+    if internal && (self.any_unclean(args) || self.unclean(callee)) {
+      self.bail(span, "Context internal named next to an Effect runtime object");
+    }
+  }
+}
+
+impl<'a> VisitJs<'a> for SinkChecker<'_, '_, '_, '_, 'a> {
+  fn enter_node(&mut self, kind: AstKind<'a>) {
+    self.path.push(kind);
+  }
+
+  fn leave_node(&mut self, _kind: AstKind<'a>) {
+    self.path.pop();
+  }
+
+  fn visit_expression(&mut self, it: &Expression<'a>) {
+    let span = it.span();
+    if self.receivers.contains(&(span.start, span.end)) && self.unclean(it) {
+      self.unclean_receivers.insert((span.start, span.end));
+    }
+    walk_js::walk_expression(self, it);
+  }
+
+  fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+    let shared = self.prov.shared;
+    let module = self.prov.module;
+    // A builtin that reads its argument, or the global object, must be called
+    // in place: any other use hides the call.
+    let mut span = it.span;
+    let mut depth = 0;
+    let mut path = it.name.to_string();
+    let global = it.reference_id.get().is_some() && shared.resolve_ident(module, it).is_none();
+    let formatter = !global
+      && self.prov.symbol(it).is_some_and(|s| self.prov.flow.formatting_imports.contains(&s));
+    if global || formatter {
+      loop {
+        match self.parent(depth) {
+          Some(AstKind::StaticMemberExpression(member)) if member.object.span() == span => {
+            path = if GLOBAL_OBJECTS.contains(&path.as_str()) {
+              member.property.name.to_string()
+            } else {
+              format!("{path}.{}", member.property.name)
+            };
+            span = member.span;
+            depth += 1;
+          }
+          Some(AstKind::ComputedMemberExpression(member)) if member.object.span() == span => {
+            let Some(name) = shared.const_string(module, &member.expression) else { break };
+            path =
+              if GLOBAL_OBJECTS.contains(&path.as_str()) { name } else { format!("{path}.{name}") };
+            span = member.span;
+            depth += 1;
+          }
+          _ => break,
+        }
+      }
+      // Error classes are fine as values: `extends Error`, `instanceof Error`.
+      let hidden = formatter
+        || GLOBAL_OBJECTS.contains(&path.as_str())
+        || matches!(path.as_str(), "Object" | "JSON")
+        || READING_BUILTINS
+          .iter()
+          .filter(|sink| !sink.ends_with("Error"))
+          .any(|sink| path_matches(&path, sink));
+      let typeof_operand = matches!(self.parent(depth), Some(AstKind::UnaryExpression(unary))
+        if unary.operator == UnaryOperator::Typeof);
+      if hidden && !typeof_operand && !self.is_called(span, depth) {
+        self.bail(span, &format!("`{path}` used other than by a direct call"));
+      }
+    }
+  }
+
+  fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+    let it = self.alloc(it);
+    // A subclass of `Error` formats what it passes to `super`.
+    if matches!(it.callee, Expression::Super(_)) && self.any_unclean(&it.arguments) {
+      self.bail(it.span, "`super` call may format an Effect runtime object");
+    }
+    self.check_call(it.span, &it.callee, &it.arguments);
+    walk_js::walk_call_expression(self, it);
+  }
+
+  fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
+    let it = self.alloc(it);
+    self.check_call(it.span, &it.callee, &it.arguments);
+    walk_js::walk_new_expression(self, it);
+  }
+
+  fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+    if self.unclean(&it.right) {
+      self.bail(it.span, "`for...in` may enumerate an Effect runtime object");
+    }
+    walk_js::walk_for_in_statement(self, it);
+  }
+
+  fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
+    let module = self.prov.module;
+    let constant = self.prov.shared.const_string(module, &it.expression).is_some();
+    if !constant && !self.prov.key_numeric(&it.expression) && self.unclean(&it.object) {
+      self.bail(it.span, "member of an Effect runtime object read by a non-constant name");
+    }
+    walk_js::walk_computed_member_expression(self, it);
+  }
+
+  fn visit_template_literal(&mut self, it: &TemplateLiteral<'a>) {
+    let it = self.alloc(it);
+    if it.expressions.iter().any(|expr| self.unclean(expr)) {
+      self.bail(it.span, "template may format an Effect runtime object");
+    }
+    walk_js::walk_template_literal(self, it);
+  }
+
+  fn visit_binary_expression(&mut self, it: &BinaryExpression<'a>) {
+    let it = self.alloc(it);
+    let formats = match it.operator {
+      BinaryOperator::Addition => self.unclean(&it.left) || self.unclean(&it.right),
+      BinaryOperator::LessThan
+      | BinaryOperator::LessEqualThan
+      | BinaryOperator::GreaterThan
+      | BinaryOperator::GreaterEqualThan
+      | BinaryOperator::Equality
+      | BinaryOperator::Inequality => {
+        let left_numeric = self.prov.key_numeric(&it.left);
+        let right_numeric = self.prov.key_numeric(&it.right);
+        (!right_numeric && self.unclean(&it.left)) || (!left_numeric && self.unclean(&it.right))
+      }
+      // `"name" in value` observes whether a service has that method.
+      BinaryOperator::In if self.unclean(&it.right) => {
+        match self.prov.shared.const_string(self.prov.module, &it.left) {
+          Some(name) => {
+            self.names.push(name);
+            false
+          }
+          None => true,
+        }
+      }
+      _ => false,
+    };
+    if formats {
+      self.bail(it.span, "operator may read an Effect runtime object");
+    }
+    walk_js::walk_binary_expression(self, it);
+  }
+
+  fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+    let it = self.alloc(it);
+    if it.operator == AssignmentOperator::Addition {
+      let target_unclean = match &it.left {
+        AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+          self.prov.symbol(ident).is_none_or(|symbol| !self.prov.symbol_clean(symbol))
+        }
+        AssignmentTarget::StaticMemberExpression(member) => self.unclean(&member.object),
+        AssignmentTarget::ComputedMemberExpression(member) => self.unclean(&member.object),
+        _ => true,
+      };
+      if target_unclean || self.unclean(&it.right) {
+        self.bail(it.span, "`+=` may format an Effect runtime object");
+      }
+    }
+    walk_js::walk_assignment_expression(self, it);
+  }
+
+  fn visit_throw_statement(&mut self, it: &ThrowStatement<'a>) {
+    let it = self.alloc(it);
+    if self.unclean(&it.argument) {
+      self.bail(it.span, "thrown value may hold an Effect runtime object");
+    }
+    walk_js::walk_throw_statement(self, it);
+  }
+}
+
 impl LinkStage<'_> {
   #[tracing::instrument(level = "debug", skip_all)]
   #[expect(clippy::too_many_lines, reason = "one pass: collection, fixpoint and edits")]
@@ -1617,9 +2902,8 @@ impl LinkStage<'_> {
         None => {
           if let Some(external) = module.as_external() {
             let name = external.name.as_str();
-            let builtin = name.starts_with("node:")
-              || NODE_BUILTINS.contains(&name)
-              || name.starts_with("bun:");
+            let bare = name.strip_prefix("node:").unwrap_or(name);
+            let builtin = NODE_BUILTINS.contains(&bare) || name.starts_with("bun:");
             if !builtin {
               report.global_bailouts.push(format!("external import `{name}`"));
             }
@@ -1656,10 +2940,6 @@ impl LinkStage<'_> {
       key_creations: FxHashSet::default(),
       this_free: FxHashSet::default(),
       const_strings: FxHashMap::default(),
-      assume_no_reflection: self
-        .options
-        .experimental
-        .is_effect_service_shaking_assume_no_reflection(),
     };
 
     // == pass A: keys
@@ -1735,6 +3015,8 @@ impl LinkStage<'_> {
     let mut refs: FxHashMap<ModuleIdx, FxHashMap<ReferenceId, RefInfo>> = FxHashMap::default();
     let mut namespace_refs: Vec<(SymbolRef, RefInfo)> = vec![];
     let mut key_bailouts = vec![];
+    let mut name_reads: Vec<(ModuleIdx, NameRead)> = vec![];
+    let mut incomplete_keys: FxHashSet<String> = FxHashSet::default();
     for module in &normal_modules {
       let Some(ast) = self.ast_table[*module].as_ref() else { continue };
       // Rolldown's own runtime module is trusted like the effect package.
@@ -1757,8 +3039,13 @@ impl LinkStage<'_> {
           guard_bindings: vec![],
           global_bailouts: vec![],
           key_bailouts: vec![],
+          name_reads: vec![],
+          pattern_source: None,
+          incomplete_keys: FxHashSet::default(),
         };
         collector.visit_program(&dep.program);
+        name_reads.extend(collector.name_reads.into_iter().map(|read| (*module, read)));
+        incomplete_keys.extend(collector.incomplete_keys);
         consumers.extend(collector.consumers.into_iter().map(|c| (*module, c)));
         providers.extend(collector.providers.into_iter().map(|p| (*module, p)));
         guard_bindings.extend(collector.guard_bindings);
@@ -1824,6 +3111,147 @@ impl LinkStage<'_> {
           }
         }
       }
+    }
+
+    // == provenance of values in untrusted code
+    let untrusted: Vec<ModuleIdx> = normal_modules
+      .iter()
+      .filter(|module| shared.prefixes[module.index()].is_none() && **module != self.runtime.id())
+      .copied()
+      .collect();
+    let mut module_consumers: FxHashMap<ModuleIdx, FxHashMap<SymbolId, String>> =
+      FxHashMap::default();
+    let mut tracked: FxHashMap<ModuleIdx, FxHashSet<SymbolId>> = FxHashMap::default();
+    for (_, consumer) in &consumers {
+      if let ConsumerKind::Binding(symbol) = consumer.kind {
+        module_consumers
+          .entry(symbol.owner)
+          .or_default()
+          .insert(symbol.symbol, consumer.key.clone());
+        tracked.entry(symbol.owner).or_default().insert(symbol.symbol);
+      }
+    }
+    for site in &sites {
+      for binding in &site.bindings {
+        tracked.entry(binding.owner).or_default().insert(binding.symbol);
+      }
+    }
+    let user_keys: FxHashSet<&String> = shared
+      .keys
+      .iter()
+      .filter(|(symbol, _)| untrusted.contains(&symbol.owner))
+      .map(|(_, key)| key)
+      .collect();
+    let empty_consumers = FxHashMap::default();
+    let empty_facts: FxHashMap<String, FxHashMap<String, bool>> = FxHashMap::default();
+    // Method results of user providers, for consumers that format them.
+    let compute_facts = |heap_tainted: bool| {
+      let mut site_facts: FxHashMap<(usize, String), bool> = FxHashMap::default();
+      for module in &untrusted {
+        let starts: FxHashMap<u32, usize> = sites
+          .iter()
+          .enumerate()
+          .filter(|(_, site)| site.module == *module)
+          .map(|(index, site)| (site.start, index))
+          .collect();
+        if starts.is_empty() {
+          continue;
+        }
+        let Some(ast) = self.ast_table[*module].as_ref() else { continue };
+        ast.program.with_dependent(|_owner, dep| {
+          let flow = collect_flow(&shared, *module, &dep.program);
+          let mut prov =
+            Prov::new(&shared, *module, &flow, heap_tainted, &empty_facts, &empty_consumers);
+          let mut collector = FactCollector { prov: &mut prov, sites: &starts, facts: vec![] };
+          collector.visit_program(&dep.program);
+          for (site, name, clean) in collector.facts {
+            site_facts.insert((site, name), clean);
+          }
+        });
+      }
+      let mut facts: FxHashMap<String, FxHashMap<String, bool>> = FxHashMap::default();
+      for key in &user_keys {
+        if incomplete_keys.contains(*key) {
+          continue;
+        }
+        let key_sites: Vec<usize> =
+          (0..sites.len()).filter(|index| sites[*index].keys.contains(*key)).collect();
+        if key_sites.is_empty() {
+          continue;
+        }
+        let names: FxHashSet<&String> = site_facts
+          .keys()
+          .filter(|(site, _)| key_sites.contains(site))
+          .map(|(_, name)| name)
+          .collect();
+        let methods = names
+          .into_iter()
+          .map(|name| {
+            let clean = key_sites
+              .iter()
+              .all(|site| site_facts.get(&(*site, name.clone())).copied().unwrap_or(false));
+            (name.clone(), clean)
+          })
+          .collect();
+        facts.insert((*key).clone(), methods);
+      }
+      facts
+    };
+    // Whether any object or collection in user code may hold a runtime value,
+    // assuming none does: every write must keep that true.
+    let mut facts = compute_facts(false);
+    let mut heap_tainted = false;
+    for module in &untrusted {
+      let Some(ast) = self.ast_table[*module].as_ref() else { continue };
+      ast.program.with_dependent(|_owner, dep| {
+        let flow = collect_flow(&shared, *module, &dep.program);
+        let consumers = module_consumers.get(module).unwrap_or(&empty_consumers);
+        let mut prov = Prov::new(&shared, *module, &flow, false, &facts, consumers);
+        heap_tainted |=
+          flow.heap_unknown || flow.heap_writes.iter().any(|value| !prov.clean(value));
+      });
+      if heap_tainted {
+        break;
+      }
+    }
+    if heap_tainted {
+      facts = compute_facts(true);
+    }
+    let mut unknown_reads: Vec<(String, Vec<Guard>)> = vec![];
+    for module in &untrusted {
+      let Some(ast) = self.ast_table[*module].as_ref() else { continue };
+      let receivers: FxHashSet<(u32, u32)> = name_reads
+        .iter()
+        .filter(|(owner, _)| owner == module)
+        .filter_map(|(_, (receiver, _, _))| *receiver)
+        .collect();
+      let empty_tracked = FxHashSet::default();
+      let module_tracked = tracked.get(module).unwrap_or(&empty_tracked);
+      ast.program.with_dependent(|_owner, dep| {
+        let flow = collect_flow(&shared, *module, &dep.program);
+        let consumers = module_consumers.get(module).unwrap_or(&empty_consumers);
+        let mut prov = Prov::new(&shared, *module, &flow, heap_tainted, &facts, consumers);
+        let mut checker = SinkChecker {
+          prov: &mut prov,
+          path: vec![],
+          receivers: &receivers,
+          tracked: module_tracked,
+          unclean_receivers: FxHashSet::default(),
+          names: vec![],
+          global_bailouts: vec![],
+        };
+        checker.visit_program(&dep.program);
+        report.global_bailouts.extend(checker.global_bailouts);
+        unknown_reads.extend(checker.names.into_iter().map(|name| (name, vec![])));
+        for (owner, (receiver, name, chain)) in &name_reads {
+          if owner != module {
+            continue;
+          }
+          if receiver.is_none_or(|span| checker.unclean_receivers.contains(&span)) {
+            unknown_reads.push((name.clone(), chain.clone()));
+          }
+        }
+      });
     }
 
     // == liveness and demand fixpoint
@@ -1926,6 +3354,14 @@ impl LinkStage<'_> {
         for (name, chain) in reads {
           if live(&site_demand, &live_bindings, chain) {
             changed |= site_demand[*index].add(name);
+          }
+        }
+      }
+      // A read on a value that may hold a service demands the name on every service.
+      for (name, chain) in &unknown_reads {
+        if live(&site_demand, &live_bindings, chain) {
+          for demand in &mut site_demand {
+            changed |= demand.add(name);
           }
         }
       }
