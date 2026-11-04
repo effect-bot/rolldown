@@ -1354,7 +1354,11 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
           let prunable = pure
             && property.kind == PropertyKind::Init
             && name.as_deref().is_some_and(|name| name != "__proto__");
-          if this_risk || property.kind != PropertyKind::Init {
+          // `__proto__: x` (non-computed, identifier or string key) sets the
+          // prototype, whose inherited methods may read any own property
+          // through `this`. Prototypes are not modelled, so keep the object.
+          let sets_prototype = name.as_deref() == Some("__proto__");
+          if this_risk || sets_prototype || property.kind != PropertyKind::Init {
             self.sites[site].top = true;
           }
           self.sites[site].props.push(Prop { name, span: property.span, prunable });
