@@ -1,0 +1,120 @@
+name: Effect Service Shaking
+
+# Fork-owned CI for `experimental.effectServiceShaking`. Runs on standard
+# GitHub runners, independent of the upstream workflows and of the Effect repo.
+
+on:
+  push:
+    branches:
+      - effect-service-demand-tests
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rust:
+    name: Native pass and regression suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # Fixtures resolve npm packages from the root, including `effect` for the
+      # real-Effect gates.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: effect-service-shaking
+
+      - name: Effect service shaking fixtures (stub and real Effect)
+        run: cargo test -p rolldown --test integration -- effect_service
+
+      - name: Full integration suite
+        run: cargo test -p rolldown --test integration
+
+      - name: Snapshots are up to date
+        run: git diff --exit-code -- crates/rolldown/tests
+
+      - name: Clippy
+        run: cargo clippy -p rolldown --example effect_service_shaking -- -D warnings
+
+  napi:
+    name: NAPI build and real-Effect gates through the JS API
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: effect-service-shaking-napi
+
+      # Builds the binding, the JS glue and type-checks the option types.
+      - name: Build the native package
+        run: pnpm --filter rolldown build-native:debug
+
+      # Bundles each real-Effect gate through the JS API with the option on,
+      # then runs the gate's own `_test.mjs` (behaviour and removal checks).
+      - name: Real-Effect gates through the JS API
+        run: |
+          cat > run-gates.mjs <<'SCRIPT'
+          import { rolldown } from './packages/rolldown/dist/index.mjs'
+          import { execFileSync } from 'node:child_process'
+          import fs from 'node:fs'
+          import path from 'node:path'
+
+          const root = 'crates/rolldown/tests/rolldown/tree_shaking/effect_service_real'
+          for (const name of fs.readdirSync(root)) {
+            const dir = path.resolve(root, name)
+            const bundle = await rolldown({
+              input: path.join(dir, 'main.js'),
+              cwd: dir,
+              platform: 'node',
+              experimental: { effectServiceShaking: true },
+            })
+            await bundle.write({ dir: path.join(dir, 'dist'), format: 'esm' })
+            await bundle.close()
+            fs.writeFileSync(path.join(dir, 'dist', 'package.json'), '{ "type": "module" }')
+            execFileSync(process.execPath, ['_test.mjs'], { cwd: dir, stdio: 'inherit' })
+            console.log(`${name}: ok`)
+          }
+          SCRIPT
+          node run-gates.mjs
