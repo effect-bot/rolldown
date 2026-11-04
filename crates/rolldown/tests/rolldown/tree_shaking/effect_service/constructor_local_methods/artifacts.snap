@@ -59,14 +59,9 @@ function effect(service, effect_) {
 // main.js
 const Store = Service("test/Store");
 const readHelper = () => "read";
-const writeHelper = () => "write";
 const StoreLayer = effect(Store, gen(function* () {
 	const readOne = () => readHelper();
-	const writeOne = () => writeHelper();
-	return Store.of({
-		readOne,
-		writeOne
-	});
+	return Store.of({ readOne });
 }));
 const program = gen(function* () {
 	return (yield* Store).readOne();

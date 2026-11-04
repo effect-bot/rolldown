@@ -2316,6 +2316,7 @@ export interface BindingExperimentalOptions {
   nativeMagicString?: boolean
   chunkOptimization?: boolean | BindingChunkOptimizationOptions
   lazyBarrel?: boolean
+  effectServiceShaking?: boolean
 }
 
 export interface BindingFilterToken {

@@ -83,9 +83,6 @@ const dependencyPrepare = () => {
 	return "prepared";
 };
 const dependencyDescribe = () => "described";
-const dependencyWrite = () => "write";
-const auditRecord = () => "audited";
-const writeHelper = (value) => `wrote ${value}`;
 const makeCache = () => {
 	log.push("cache made");
 	return /* @__PURE__ */ new Map();
@@ -93,30 +90,22 @@ const makeCache = () => {
 const DependencyLayer = succeed(Dependency, {
 	read: dependencyRead,
 	prepare: dependencyPrepare,
-	describe: dependencyDescribe,
-	write: dependencyWrite
+	describe: dependencyDescribe
 });
 const AuditLayer = effect(Audit, acquireRelease(sync(() => {
 	log.push("audit acquired");
-	return { record: auditRecord };
+	return {};
 }), () => sync(() => log.push("audit released"))));
 const StoreLayer = effect(Store, gen(function* () {
 	const dependency = yield* Dependency;
-	const audit = yield* Audit;
+	yield* Audit;
 	yield* sync(() => log.push("constructed"));
-	const prepared = dependency.prepare();
-	const cache = makeCache();
+	dependency.prepare();
+	makeCache();
 	const describe = (label) => `${label}:${dependency.describe()}`;
 	log.push(describe("init"));
 	const readOne = () => dependency.read();
-	const writeOne = () => {
-		cache.set(prepared, dependency.write());
-		return writeHelper(`${describe("write")}:${audit.record()}`);
-	};
-	return Store.of({
-		readOne,
-		writeOne
-	});
+	return Store.of({ readOne });
 }));
 const program = gen(function* () {
 	return (yield* Store).readOne();

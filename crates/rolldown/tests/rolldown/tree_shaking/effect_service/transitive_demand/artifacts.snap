@@ -65,19 +65,11 @@ const provide = (self, that) => ({ build: async (context, scope) => self.build(a
 const Store = Service("test/Store");
 const Dependency = Service("test/Dependency");
 const dependencyRead = () => "read";
-const dependencyWrite = () => "write";
-const DependencyLayer = succeed(Dependency, {
-	read: dependencyRead,
-	write: dependencyWrite
-});
+const DependencyLayer = succeed(Dependency, { read: dependencyRead });
 const StoreLayer = effect(Store, gen(function* () {
 	const dependency = yield* Dependency;
 	const readOne = () => dependency.read();
-	const writeOne = () => dependency.write();
-	return Store.of({
-		readOne,
-		writeOne
-	});
+	return Store.of({ readOne });
 }));
 const program = gen(function* () {
 	return (yield* Store).readOne();

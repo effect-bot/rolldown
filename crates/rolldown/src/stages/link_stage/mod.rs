@@ -37,6 +37,7 @@ mod compute_tla;
 mod create_exports_for_ecma_modules;
 mod cross_module_optimization;
 mod determine_module_exports_kind;
+mod effect_service_shaking;
 mod generate_lazy_export;
 mod patch_module_dependencies;
 mod reference_needed_symbols;
@@ -275,6 +276,7 @@ impl<'a> LinkStage<'a> {
     // The passes above only relax statement flags. Module verdicts must follow before
     // `reference_needed_symbols` derives import flags from them.
     self.recompute_analyzed_side_effects();
+    self.effect_service_shaking();
     self.reference_needed_symbols();
     self.include_statements(&unreachable_import_expression_node_ids);
     self.patch_module_dependencies();

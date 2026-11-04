@@ -80,6 +80,8 @@ pub struct ExperimentalOptions {
   pub native_magic_string: Option<bool>,
   pub chunk_optimization: Option<ChunkOptimizationOption>,
   pub lazy_barrel: Option<bool>,
+  /// Remove methods of Effect services that no consumer reads (experimental, off by default).
+  pub effect_service_shaking: Option<bool>,
 }
 
 impl ExperimentalOptions {
@@ -98,6 +100,10 @@ impl ExperimentalOptions {
 
   pub fn is_attach_debug_info_full(&self) -> bool {
     self.attach_debug_info.is_some_and(|info| info.is_full())
+  }
+
+  pub fn is_effect_service_shaking_enabled(&self) -> bool {
+    self.effect_service_shaking.unwrap_or(false)
   }
 
   pub fn is_native_magic_string_enabled(&self) -> bool {

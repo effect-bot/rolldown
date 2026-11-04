@@ -731,6 +731,15 @@ export interface InputOptions {
      * @default false
      */
     lazyBarrel?: boolean;
+    /**
+     * Remove methods of Effect services that no consumer in the bundle reads.
+     *
+     * Experimental and limited to providers built with `Layer.effect` / `Layer.succeed`
+     * and consumers using `yield*`. Anything else keeps every method.
+     *
+     * @default false
+     */
+    effectServiceShaking?: boolean;
   };
   /**
    * Configure how the code is transformed. This process happens after the `transform` hook.

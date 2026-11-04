@@ -1067,6 +1067,13 @@
             "boolean",
             "null"
           ]
+        },
+        "effectServiceShaking": {
+          "description": "Remove methods of Effect services that no consumer reads (experimental, off by default).",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
