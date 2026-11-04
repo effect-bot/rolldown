@@ -310,6 +310,17 @@ enum Resolved {
   Namespace(ModuleIdx),
 }
 
+/// Where a chain of namespace members starting at an identifier ends.
+enum NamespaceChain {
+  /// At an exported binding; `span` is the whole member chain, which is the
+  /// expression at ancestor `depth`.
+  Export { symbol: SymbolRef, span: Span, depth: usize },
+  /// A namespace object used as a value.
+  Value(Span),
+  /// A member that is not exported.
+  Unresolved,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Guard {
   /// A property of a provider object literal: (site, property index).
@@ -520,8 +531,9 @@ impl Shared<'_> {
   }
 }
 
-/// Whether a function reads its receiver anywhere: parameters (defaults
-/// included) and body, but not nested non-arrow functions or classes.
+/// Whether a function may read its receiver: anywhere in its parameters
+/// (defaults included) or body, except nested non-arrow functions. Any nested
+/// class counts as a read.
 fn reads_this(function: &Function<'_>) -> bool {
   struct Finder(bool);
   impl<'a> VisitJs<'a> for Finder {
@@ -529,7 +541,11 @@ fn reads_this(function: &Function<'_>) -> bool {
       self.0 = true;
     }
     fn visit_function(&mut self, _it: &Function<'a>, _flags: oxc::semantic::ScopeFlags) {}
-    fn visit_class(&mut self, _it: &oxc::ast::ast::Class<'a>) {}
+    // Heritage expressions and computed member names run with the enclosing
+    // receiver. Classes are not modelled, so any class counts as a read.
+    fn visit_class(&mut self, _it: &oxc::ast::ast::Class<'a>) {
+      self.0 = true;
+    }
   }
   let mut finder = Finder(false);
   finder.visit_formal_parameters(&function.params);
@@ -781,9 +797,10 @@ impl<'a> UseCollector<'_, '_, 'a> {
       Some("Effect.acquireRelease") if args.len() == 2 => {
         let mut acquired = vec![];
         let complete = args[0].as_expression().is_some_and(|e| self.effect_sites(e, &mut acquired));
-        // The release callback receives the acquired object. Only a first
-        // parameter that is a plain binding is followed; a rest parameter,
-        // a pattern or `arguments` keeps the whole object.
+        // The release callback receives the acquired object. Only a single
+        // plain parameter without a default is followed; anything else (more
+        // parameters, defaults, a rest parameter, a pattern or `arguments`)
+        // keeps the whole object.
         let (params, reads_args) = match args[1].as_expression().map(strip) {
           Some(Expression::ArrowFunctionExpression(f)) => (Some(&f.params), false),
           Some(Expression::FunctionExpression(f)) => {
@@ -791,8 +808,13 @@ impl<'a> UseCollector<'_, '_, 'a> {
           }
           _ => (None, false),
         };
+        let simple = |params: &oxc::ast::ast::FormalParameters<'a>| {
+          params.rest.is_none()
+            && params.items.len() <= 1
+            && params.items.iter().all(|param| param.initializer.is_none())
+        };
         let (binding, top): (Option<SymbolRef>, bool) = match params {
-          Some(params) if params.rest.is_none() && !reads_args => match params.items.first() {
+          Some(params) if simple(params) && !reads_args => match params.items.first() {
             None => (None, false),
             Some(param) => match &param.pattern {
               BindingPattern::BindingIdentifier(id) => {
@@ -946,25 +968,24 @@ impl<'a> UseCollector<'_, '_, 'a> {
     if let Some(symbol) = symbol {
       let canonical = self.shared.symbols.canonical_ref_for((self.module, symbol).into());
       if let Resolved::Namespace(target) = self.shared.as_resolved(canonical) {
-        if let Some(AstKind::StaticMemberExpression(member)) = self.parent(0) {
-          if member.object.span() == ident.span {
-            if let Some(Resolved::Symbol(export)) =
-              self.shared.resolve_export(target, member.property.name.as_str())
-            {
-              let container = self.container_from(member.span, self.path.len().saturating_sub(2));
-              self.namespace_refs.push((
-                export,
-                RefInfo {
-                  span: member.span,
-                  top_stmt: self.top_stmt,
-                  chain: self.guards.clone(),
-                  member: None,
-                  container,
-                  root_symbol: None,
-                },
-              ));
-            }
-          }
+        if let NamespaceChain::Export { symbol: export, span, depth } =
+          self.namespace_chain(ident.span, target)
+        {
+          let container = match self.path.len().checked_sub(2 + depth) {
+            Some(index) => self.container_from(span, index),
+            None => Container::Escape,
+          };
+          self.namespace_refs.push((
+            export,
+            RefInfo {
+              span,
+              top_stmt: self.top_stmt,
+              chain: self.guards.clone(),
+              member: None,
+              container,
+              root_symbol: None,
+            },
+          ));
         }
       }
     }
@@ -979,6 +1000,31 @@ impl<'a> UseCollector<'_, '_, 'a> {
         root_symbol,
       },
     );
+  }
+
+  /// Follows `ns.a.b...` from an identifier resolving to a namespace through
+  /// every namespace hop.
+  fn namespace_chain(&self, ident: Span, mut target: ModuleIdx) -> NamespaceChain {
+    let mut current = ident;
+    let mut depth = 0;
+    loop {
+      match self.parent(depth) {
+        Some(AstKind::StaticMemberExpression(member)) if member.object.span() == current => {
+          match self.shared.resolve_export(target, member.property.name.as_str()) {
+            Some(Resolved::Symbol(symbol)) => {
+              return NamespaceChain::Export { symbol, span: member.span, depth };
+            }
+            Some(Resolved::Namespace(next)) => {
+              target = next;
+              current = member.span;
+              depth += 1;
+            }
+            None => return NamespaceChain::Unresolved,
+          }
+        }
+        _ => return NamespaceChain::Value(current),
+      }
+    }
   }
 
   /// Whether the member expression at ancestor `depth - 1` is written.
@@ -1041,16 +1087,14 @@ impl<'a> UseCollector<'_, '_, 'a> {
           self.bail_global(ident.span, "`Object` member may reveal protocol symbols");
         }
       }
-      Some(Resolved::Namespace(target)) => {
-        let Some(member_name) = member else {
-          // Every export of the module, Layers included, may escape through it.
-          self.bail_global(ident.span, "module namespace used as a value");
-          return;
-        };
-        let resolved = self.shared.resolve_export(target, member_name);
-        let member_span = self.parent(0).map(GetSpan::span).unwrap_or(ident.span);
-        self.check_api(resolved, member_span, 1);
-      }
+      Some(Resolved::Namespace(target)) => match self.namespace_chain(ident.span, target) {
+        NamespaceChain::Export { symbol, span, depth } => {
+          self.check_api(Some(Resolved::Symbol(symbol)), span, depth + 1);
+        }
+        // Every export of the module, Layers included, may escape through it.
+        NamespaceChain::Value(span) => self.bail_global(span, "module namespace used as a value"),
+        NamespaceChain::Unresolved => {}
+      },
       Some(Resolved::Symbol(_)) => self.check_api(resolved, ident.span, 0),
       None => {}
     }
@@ -1063,6 +1107,14 @@ impl<'a> UseCollector<'_, '_, 'a> {
       return;
     }
     let Some(name) = self.shared.api_name(resolved).map(str::to_string) else { return };
+    // Any other use, such as an alias, creates keys the pass cannot see, and
+    // keys with the same string alias at runtime.
+    if matches!(name.as_str(), "Context.Service" | "Context.Reference")
+      && !self.shared.key_creations.contains(&(self.module, span.start))
+    {
+      self.bail_global(span, &format!("`{name}` used other than to declare a service key"));
+      return;
+    }
     let prefix = self.shared.prefixes[symbol.owner.index()].as_deref().unwrap_or_default();
     let call = match self.parent(depth) {
       Some(AstKind::CallExpression(call)) if call.callee.span() == span => Some(call),
@@ -1083,9 +1135,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
     self.bail_global(span, &format!("`{name}` is not an audited API"));
   }
 
-  fn classify_key_reference(&mut self, key: &str, span: Span, use_span: Span) {
+  fn classify_key_reference(&mut self, key: &str, use_span: Span, use_depth: usize) {
     if !self.classified.contains(&use_span.start) {
-      let parent = match self.parent(usize::from(use_span != span)) {
+      let parent = match self.parent(use_depth) {
         Some(kind) => format!("{kind:?}").split('(').next().unwrap_or_default().to_string(),
         None => "program".to_string(),
       };
@@ -1359,32 +1411,28 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     if !self.trusted {
       self.check_untrusted_reference(it, resolved);
     }
-    // The use expression of a key: the identifier, or `ns.Key`.
-    let (key_symbol, use_span) = match resolved {
-      Some(Resolved::Symbol(symbol)) => (Some(symbol), it.span),
-      Some(Resolved::Namespace(target)) => match self.parent(0) {
-        Some(AstKind::StaticMemberExpression(member)) if member.object.span() == it.span => {
-          match self.shared.resolve_export(target, member.property.name.as_str()) {
-            Some(Resolved::Symbol(symbol)) => (Some(symbol), member.span),
-            _ => (None, it.span),
-          }
-        }
-        _ => (None, it.span),
+    // The use expression of a key: the identifier, or `ns.Key` through any
+    // number of namespace hops. `use_depth` is the ancestor index of its parent.
+    let (key_symbol, use_span, use_depth) = match resolved {
+      Some(Resolved::Symbol(symbol)) => (Some(symbol), it.span, 0),
+      Some(Resolved::Namespace(target)) => match self.namespace_chain(it.span, target) {
+        NamespaceChain::Export { symbol, span, depth } => (Some(symbol), span, depth + 1),
+        NamespaceChain::Value(_) | NamespaceChain::Unresolved => (None, it.span, 0),
       },
-      None => (None, it.span),
+      None => (None, it.span, 0),
     };
     if let Some(key) = key_symbol.and_then(|symbol| self.shared.keys.get(&symbol)).cloned() {
       // Writes to a key's members can change what other keys resolve to.
-      let member_written = match self.parent(usize::from(use_span != it.span)) {
+      let member_written = match self.parent(use_depth) {
         Some(AstKind::StaticMemberExpression(member)) if member.object.span() == use_span => {
-          self.is_write_target(1 + usize::from(use_span != it.span))
+          self.is_write_target(use_depth + 1)
         }
         _ => false,
       };
       if member_written {
         self.bail_global(use_span, "service key member written");
       }
-      self.classify_key_reference(&key, it.span, use_span);
+      self.classify_key_reference(&key, use_span, use_depth);
     }
   }
 
