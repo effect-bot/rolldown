@@ -1,0 +1,135 @@
+---
+source: crates/rolldown_testing/src/integration_test.rs
+---
+# Assets
+
+## main.js
+
+```js
+import assert from "node:assert";
+// ../node_modules/effect/Effect.js
+const EffectProto = { *[Symbol.iterator]() {
+	return yield this;
+} };
+const make = (run) => Object.assign(Object.create(EffectProto), { run });
+const sync = (evaluate) => make(async () => evaluate());
+const gen = (body) => make(async (context, scope) => {
+	const iterator = body();
+	let input;
+	for (;;) {
+		const { value, done } = iterator.next(input);
+		if (done) return value;
+		input = await value.run(context, scope);
+	}
+});
+const acquireRelease = (acquire, release) => make(async (context, scope) => {
+	const value = await acquire.run(context, scope);
+	scope.push(() => release(value).run(context, scope));
+	return value;
+});
+const closeScope = async (scope) => {
+	for (const finalizer of scope.reverse()) await finalizer();
+};
+const provide$1 = (self, layer) => make(async (context) => {
+	const scope = [];
+	try {
+		return await self.run(await layer.build(context, scope), scope);
+	} finally {
+		await closeScope(scope);
+	}
+});
+const runPromise = async (self) => {
+	const scope = [];
+	try {
+		return await self.run(/* @__PURE__ */ new Map(), scope);
+	} finally {
+		await closeScope(scope);
+	}
+};
+// ../node_modules/effect/Context.js
+const Service = (key) => {
+	const self = make(async (context) => {
+		if (!context.has(key)) throw new Error(`Service not found: ${key}`);
+		return context.get(key);
+	});
+	self.key = key;
+	self.of = (service) => service;
+	self.use = (f) => make(async (context, scope) => f(await self.run(context, scope)).run(context, scope));
+	return self;
+};
+// ../node_modules/effect/Layer.js
+function effect(service, effect_) {
+	if (arguments.length === 1) return (effect_) => effect(service, effect_);
+	return { build: async (context, scope) => new Map(context).set(service.key, await effect_.run(context, scope)) };
+}
+function succeed(service, value) {
+	if (arguments.length === 1) return (value) => succeed(service, value);
+	return { build: async (context) => new Map(context).set(service.key, value) };
+}
+const provide = (self, that) => ({ build: async (context, scope) => self.build(await that.build(context, scope), scope) });
+const mergeAll = (...layers) => ({ build: async (context, scope) => {
+	let merged = new Map(context);
+	for (const layer of layers) merged = new Map([...merged, ...await layer.build(context, scope)]);
+	return merged;
+} });
+// main.js
+const Store = Service("test/Store");
+const Dependency = Service("test/Dependency");
+const Audit = Service("test/Audit");
+const log = [];
+const dependencyRead = () => "read";
+const dependencyPrepare = () => {
+	log.push("prepared");
+	return "prepared";
+};
+const dependencyDescribe = () => "described";
+const dependencyWrite = () => "write";
+const auditRecord = () => "audited";
+const writeHelper = (value) => `wrote ${value}`;
+const makeCache = () => {
+	log.push("cache made");
+	return /* @__PURE__ */ new Map();
+};
+const DependencyLayer = succeed(Dependency, {
+	read: dependencyRead,
+	prepare: dependencyPrepare,
+	describe: dependencyDescribe,
+	write: dependencyWrite
+});
+const AuditLayer = effect(Audit, acquireRelease(sync(() => {
+	log.push("audit acquired");
+	return { record: auditRecord };
+}), () => sync(() => log.push("audit released"))));
+const StoreLayer = effect(Store, gen(function* () {
+	const dependency = yield* Dependency;
+	const audit = yield* Audit;
+	yield* sync(() => log.push("constructed"));
+	const prepared = dependency.prepare();
+	const cache = makeCache();
+	const describe = (label) => `${label}:${dependency.describe()}`;
+	log.push(describe("init"));
+	const readOne = () => dependency.read();
+	const writeOne = () => {
+		cache.set(prepared, dependency.write());
+		return writeHelper(`${describe("write")}:${audit.record()}`);
+	};
+	return Store.of({
+		readOne,
+		writeOne
+	});
+}));
+const program = gen(function* () {
+	return (yield* Store).readOne();
+});
+const layer = provide(StoreLayer, mergeAll(DependencyLayer, AuditLayer));
+assert.strictEqual(await runPromise(provide$1(program, layer)), "read");
+assert.deepStrictEqual(log, [
+	"audit acquired",
+	"constructed",
+	"prepared",
+	"cache made",
+	"init:described",
+	"audit released"
+]);
+
+```

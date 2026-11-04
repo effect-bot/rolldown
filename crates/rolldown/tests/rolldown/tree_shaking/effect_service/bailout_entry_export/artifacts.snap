@@ -1,0 +1,79 @@
+---
+source: crates/rolldown_testing/src/integration_test.rs
+---
+# Assets
+
+## main.js
+
+```js
+import assert from "node:assert";
+// ../node_modules/effect/Effect.js
+const EffectProto = { *[Symbol.iterator]() {
+	return yield this;
+} };
+const make = (run) => Object.assign(Object.create(EffectProto), { run });
+const map = (self, f) => make(async (context, scope) => f(await self.run(context, scope)));
+const gen = (body) => make(async (context, scope) => {
+	const iterator = body();
+	let input;
+	for (;;) {
+		const { value, done } = iterator.next(input);
+		if (done) return value;
+		input = await value.run(context, scope);
+	}
+});
+const closeScope = async (scope) => {
+	for (const finalizer of scope.reverse()) await finalizer();
+};
+const provide = (self, layer) => make(async (context) => {
+	const scope = [];
+	try {
+		return await self.run(await layer.build(context, scope), scope);
+	} finally {
+		await closeScope(scope);
+	}
+});
+const runPromise = async (self) => {
+	const scope = [];
+	try {
+		return await self.run(/* @__PURE__ */ new Map(), scope);
+	} finally {
+		await closeScope(scope);
+	}
+};
+// ../node_modules/effect/Context.js
+const Service = (key) => {
+	const self = make(async (context) => {
+		if (!context.has(key)) throw new Error(`Service not found: ${key}`);
+		return context.get(key);
+	});
+	self.key = key;
+	self.of = (service) => service;
+	self.use = (f) => make(async (context, scope) => f(await self.run(context, scope)).run(context, scope));
+	return self;
+};
+// ../node_modules/effect/Layer.js
+function effect(service, effect_) {
+	if (arguments.length === 1) return (effect_) => effect(service, effect_);
+	return { build: async (context, scope) => new Map(context).set(service.key, await effect_.run(context, scope)) };
+}
+// main.js
+const Store = Service("test/Store");
+const readHelper = () => "read";
+const writeHelper = () => "write";
+const StoreLayer = effect(Store, gen(function* () {
+	const readOne = () => readHelper();
+	const writeOne = () => writeHelper();
+	return Store.of({
+		readOne,
+		writeOne
+	});
+}));
+const program = gen(function* () {
+	return (yield* Store).readOne();
+});
+assert.strictEqual(await runPromise(provide(program, StoreLayer)), "read");
+const run = (input) => runPromise(provide(map(program, (value) => `${value}${input}`), StoreLayer));
+export { run };
+
+```
