@@ -2317,6 +2317,7 @@ export interface BindingExperimentalOptions {
   chunkOptimization?: boolean | BindingChunkOptimizationOptions
   lazyBarrel?: boolean
   effectServiceShaking?: boolean
+  effectServiceShakingAssumeNoReflection?: boolean
 }
 
 export interface BindingFilterToken {

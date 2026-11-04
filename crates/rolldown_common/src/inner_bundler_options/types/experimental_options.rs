@@ -82,6 +82,9 @@ pub struct ExperimentalOptions {
   pub lazy_barrel: Option<bool>,
   /// Remove methods of Effect services that no consumer reads (experimental, off by default).
   pub effect_service_shaking: Option<bool>,
+  /// Assume user code never enumerates, dynamically indexes or serializes Effect
+  /// runtime objects, so `effectServiceShaking` ignores those operations.
+  pub effect_service_shaking_assume_no_reflection: Option<bool>,
 }
 
 impl ExperimentalOptions {
@@ -104,6 +107,10 @@ impl ExperimentalOptions {
 
   pub fn is_effect_service_shaking_enabled(&self) -> bool {
     self.effect_service_shaking.unwrap_or(false)
+  }
+
+  pub fn is_effect_service_shaking_assume_no_reflection(&self) -> bool {
+    self.effect_service_shaking_assume_no_reflection.unwrap_or(false)
   }
 
   pub fn is_native_magic_string_enabled(&self) -> bool {

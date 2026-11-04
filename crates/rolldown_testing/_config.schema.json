@@ -1074,6 +1074,13 @@
             "boolean",
             "null"
           ]
+        },
+        "effectServiceShakingAssumeNoReflection": {
+          "description": "Assume user code never enumerates, dynamically indexes or serializes Effect\nruntime objects, so `effectServiceShaking` ignores those operations.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

@@ -21,20 +21,26 @@
 //! statements other than unused local `const` functions, so acquisition,
 //! release and construction-time calls keep running.
 //!
-//! Anything outside the base case keeps every method of the key involved, and
-//! anything that could reach a Context or Fiber from outside the analysis
-//! (entry exports, external modules, reflection, unaudited Effect APIs)
-//! disables the pass for the whole build.
+//! Anything outside the base case keeps every method of the key involved.
+//! Holding a Context or Fiber is fine: services leave a Context only through a
+//! keyed lookup, which is tracked, or through a sink, which disables the pass
+//! for the whole build:
+//! - Context internals read by name (`mapUnsafe`, `base`, `toJSON`, ...), and
+//!   code outside the module graph (entry exports, external modules, `eval`);
+//! - enumeration, member reads by a non-constant name and serialization, unless
+//!   `effectServiceShakingAssumeNoReflection` rules them out.
 
 use oxc::{
   allocator::Vec as ArenaVec,
   ast::{
     AstKind,
     ast::{
-      Argument, BindingPattern, CallExpression, Expression, Function, FunctionType,
-      IdentifierReference, ImportExpression, ObjectExpression, ObjectPropertyKind, PropertyKind,
-      Statement, StaticMemberExpression, VariableDeclarationKind, VariableDeclarator,
-      YieldExpression,
+      Argument, ArrayExpressionElement, AssignmentTargetPropertyIdentifier,
+      AssignmentTargetPropertyProperty, BinaryOperator, BindingPattern, BindingProperty,
+      CallExpression, ComputedMemberExpression, Expression, ForInStatement, Function, FunctionType,
+      IdentifierReference, ImportExpression, ObjectExpression, ObjectPropertyKind, PropertyKey,
+      PropertyKind, Statement, StaticMemberExpression, UnaryOperator, VariableDeclarationKind,
+      VariableDeclarator, WithStatement, YieldExpression,
     },
   },
   ast_visit::{VisitJs, VisitJsMut, walk_js, walk_js_mut},
@@ -48,147 +54,32 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::LinkStage;
 
-// Trusted APIs that code outside the trusted packages may reference. Any other
-// export of a trusted package may hand a Fiber or Context to user code, through
-// which every service can be retrieved by its key string, so it disables the
-// pass. Mirrors the audited list of the `@effect/bundle` prototype.
-const ALLOWED_APIS: &[&str] = &[
-  "Effect.gen",
-  "Effect.fn",
-  "Effect.fnUntraced",
-  "Effect.succeed",
-  "Effect.sync",
-  "Effect.fail",
-  "Effect.die",
-  "Effect.promise",
-  "Effect.tryPromise",
-  "Effect.suspend",
-  "Effect.map",
-  "Effect.flatMap",
-  "Effect.andThen",
-  "Effect.tap",
-  "Effect.as",
-  "Effect.asVoid",
-  "Effect.all",
-  "Effect.forEach",
-  "Effect.catchTag",
-  "Effect.catchTags",
-  "Effect.orDie",
-  "Effect.matchEffect",
-  "Effect.match",
-  "Effect.provide",
-  "Effect.provideService",
-  "Effect.provideServiceEffect",
-  "Effect.updateService",
-  "Effect.service",
-  "Effect.serviceOption",
-  "Effect.scoped",
-  "Effect.acquireRelease",
-  "Effect.acquireUseRelease",
-  "Effect.addFinalizer",
-  "Effect.ensuring",
-  "Effect.onExit",
-  "Effect.log",
-  "Effect.logInfo",
-  "Effect.logDebug",
-  "Effect.logWarning",
-  "Effect.logError",
-  "Effect.annotateLogs",
-  "Effect.withLogSpan",
-  "Effect.sleep",
-  "Effect.yieldNow",
-  "Effect.callback",
-  "Effect.exit",
-  "Effect.when",
-  "Effect.zip",
-  "Effect.zipWith",
-  "Effect.flatten",
-  "Effect.isEffect",
-  "Effect.ignore",
-  "Effect.option",
-  "Effect.result",
-  "Effect.timeout",
-  "Effect.delay",
-  "Layer.succeed",
-  "Layer.effect",
-  "Layer.sync",
-  "Layer.merge",
-  "Layer.mergeAll",
-  "Layer.provide",
-  "Layer.provideMerge",
-  "Layer.launch",
-  "Layer.empty",
-  "Layer.effectDiscard",
-  "Context.Service",
-  "Context.Reference",
-  "Context.get",
-  "Context.getUnsafe",
-  "Context.getOrElse",
-  "Context.getOrUndefined",
-  "Context.getOption",
-  "Context.isContext",
-  "FileSystem.FileSystem",
-  "FileSystem.make",
-  "FileSystem.makeNoop",
-  "FileSystem.layerNoop",
-  "@effect/platform-node/NodeFileSystem.layer",
-  "@effect/platform-node/NodeServices.layer",
-  "@effect/platform-node/NodeRuntime.runMain",
+// The only ways for user code to reach a provider object are keyed lookups,
+// which the pass tracks, and the operations below, which it treats as sinks.
+//
+// Context internals hold every service of a Context by key string. Reading
+// one by name reaches every service without a key, so it disables the pass in
+// any mode. `toJSON` returns the services of a Context.
+const CONTEXT_INTERNALS: &[&str] =
+  &["mapUnsafe", "_flat", "base", "overlay", "cacheRoot", "toJSON"];
+// Context functions that read or build a service map by key string.
+const CONTEXT_INTERNAL_APIS: &[&str] = &["Context.getOrUndefinedUnsafe", "Context.makeUnsafe"];
+// Ways to run code that is not part of the module graph, by global name or
+// member name (`globalThis.eval`, `fn.constructor`), in any mode.
+const CODE_LOADERS: &[&str] = &["eval", "Function", "require", "constructor"];
+const GLOBAL_OBJECTS: &[&str] =
+  &["globalThis", "global", "self", "window", "frames", "parent", "top"];
+// `Object` members that enumerate the properties of an object, so they reach
+// Context internals without naming them. Disabled by
+// `effectServiceShakingAssumeNoReflection`, like every other enumeration.
+const ENUMERATING_OBJECT_MEMBERS: &[&str] = &[
+  "keys",
+  "values",
+  "entries",
+  "getOwnPropertyNames",
+  "getOwnPropertyDescriptors",
+  "getOwnPropertySymbols",
 ];
-
-// `RunOptions` can install `onFiberStart`, so these are only allowed with the
-// effect as the single argument, and `runFork` only when its Fiber is discarded.
-const RUN_APIS: &[&str] =
-  &["Effect.runPromise", "Effect.runPromiseExit", "Effect.runSync", "Effect.runSyncExit"];
-
-// Data modules whose declarations mention no Fiber, Context or runtime type.
-const ALLOWED_MODULES: &[&str] = &[
-  "Option",
-  "Array",
-  "Order",
-  "Equivalence",
-  "Equal",
-  "Hash",
-  "Data",
-  "Predicate",
-  "String",
-  "Number",
-  "BigInt",
-  "Boolean",
-  "Struct",
-  "Record",
-  "Tuple",
-  "Duration",
-  "Chunk",
-  "HashMap",
-  "HashSet",
-  "Result",
-  "Redacted",
-  "Brand",
-  "Function",
-  "Iterable",
-  "Match",
-];
-
-// Globals that reach the global object, where the running Fiber is published,
-// or that run code that can.
-const REFLECTIVE_GLOBALS: &[&str] = &[
-  "globalThis",
-  "global",
-  "self",
-  "window",
-  "frames",
-  "parent",
-  "top",
-  "eval",
-  "Function",
-  "Reflect",
-  "Proxy",
-  "require",
-];
-const ALLOWED_SYMBOL_MEMBERS: &[&str] = &["iterator", "asyncIterator"];
-const ALLOWED_OBJECT_MEMBERS: &[&str] =
-  &["keys", "values", "entries", "fromEntries", "assign", "freeze", "is"];
 // Reading one of these on a service observes the whole object.
 const INHERITED_MEMBERS: &[&str] = &[
   "constructor",
@@ -204,6 +95,8 @@ const INHERITED_MEMBERS: &[&str] = &[
   "__lookupGetter__",
   "__lookupSetter__",
 ];
+// Node builtins other than those that run code in this realm (`vm`, `module`,
+// `inspector`, `repl`).
 const NODE_BUILTINS: &[&str] = &[
   "assert",
   "assert/strict",
@@ -225,8 +118,6 @@ const NODE_BUILTINS: &[&str] = &[
   "http",
   "http2",
   "https",
-  "inspector",
-  "module",
   "net",
   "os",
   "path",
@@ -238,7 +129,6 @@ const NODE_BUILTINS: &[&str] = &[
   "querystring",
   "readline",
   "readline/promises",
-  "repl",
   "stream",
   "stream/promises",
   "stream/web",
@@ -252,14 +142,13 @@ const NODE_BUILTINS: &[&str] = &[
   "util",
   "util/types",
   "v8",
-  "vm",
   "wasi",
   "worker_threads",
   "zlib",
 ];
 
-/// How a trusted module's exports are named in `ALLOWED_APIS`: `Effect.map` for
-/// the effect package, `@effect/platform-node/NodeRuntime.runMain` otherwise.
+/// How a trusted module's exports are named: `Effect.map` for the effect
+/// package, `@effect/platform-node/NodeRuntime.runMain` otherwise.
 fn trusted_prefix(id: &str) -> Option<String> {
   let id = id.replace('\\', "/");
   let markers: &[(&str, &str)] = &[
@@ -454,6 +343,11 @@ struct Shared<'l> {
   keys: FxHashMap<SymbolRef, String>,
   key_creations: FxHashSet<(ModuleIdx, u32)>,
   this_free: FxHashSet<SymbolRef>,
+  /// `const` bindings holding a constant string.
+  const_strings: FxHashMap<SymbolRef, String>,
+  /// `effectServiceShakingAssumeNoReflection`: enumeration, non-constant
+  /// computed reads and serialization are not sinks.
+  assume_no_reflection: bool,
 }
 
 impl Shared<'_> {
@@ -501,6 +395,64 @@ impl Shared<'_> {
     self.api_name(self.resolve_expr(module, expr))
   }
 
+  /// The string a constant expression evaluates to: literals, templates and
+  /// `+` over them and over `const` bindings holding one.
+  fn const_string(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<String> {
+    let mut out = String::new();
+    for part in self.string_parts(module, expr)? {
+      match part {
+        StringPart::Literal(literal) => out.push_str(&literal),
+        StringPart::Binding(symbol) => out.push_str(self.const_strings.get(&symbol)?),
+      }
+    }
+    Some(out)
+  }
+
+  fn string_parts(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<Vec<StringPart>> {
+    Some(match strip(expr) {
+      Expression::StringLiteral(literal) => {
+        vec![StringPart::Literal(literal.value.as_str()?.to_string())]
+      }
+      Expression::TemplateLiteral(template) => {
+        let mut parts = vec![];
+        for (index, quasi) in template.quasis.iter().enumerate() {
+          parts.push(StringPart::Literal(quasi.value.cooked.as_ref()?.as_str()?.to_string()));
+          if let Some(expression) = template.expressions.get(index) {
+            parts.extend(self.string_parts(module, expression)?);
+          }
+        }
+        parts
+      }
+      Expression::BinaryExpression(binary) if binary.operator == BinaryOperator::Addition => {
+        let mut parts = self.string_parts(module, &binary.left)?;
+        parts.extend(self.string_parts(module, &binary.right)?);
+        parts
+      }
+      Expression::Identifier(ident) => {
+        let reference_id = ident.reference_id.get()?;
+        let symbol = self.scoping(module).get_reference(reference_id).symbol_id()?;
+        vec![StringPart::Binding(self.symbols.canonical_ref_for((module, symbol).into()))]
+      }
+      _ => return None,
+    })
+  }
+
+  /// The property name a computed key evaluates to, if it is constant. Numbers
+  /// and well-known symbols never name a Context internal.
+  fn member_key(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<String> {
+    if is_numeric(expr) {
+      return Some(String::new());
+    }
+    if let Expression::StaticMemberExpression(member) = strip(expr) {
+      if matches!(&member.object, Expression::Identifier(ident) if ident.name == "Symbol" && self.resolve_ident(module, ident).is_none())
+        && matches!(member.property.name.as_str(), "iterator" | "asyncIterator")
+      {
+        return Some(String::new());
+      }
+    }
+    self.const_string(module, expr)
+  }
+
   fn key_of(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<&String> {
     match self.resolve_expr(module, expr)? {
       Resolved::Symbol(symbol) => self.keys.get(&symbol),
@@ -526,6 +478,66 @@ impl Shared<'_> {
       None => KeyCreation::Dynamic,
     };
     Some((key, call.callee.span().start))
+  }
+}
+
+enum StringPart {
+  Literal(String),
+  Binding(SymbolRef),
+}
+
+/// Whether an expression always evaluates to a number.
+fn is_numeric(expr: &Expression<'_>) -> bool {
+  match strip(expr) {
+    Expression::NumericLiteral(_) | Expression::UpdateExpression(_) => true,
+    Expression::UnaryExpression(unary) => {
+      matches!(
+        unary.operator,
+        UnaryOperator::UnaryNegation | UnaryOperator::UnaryPlus | UnaryOperator::BitwiseNot
+      ) && is_numeric(&unary.argument)
+    }
+    // Every arithmetic and bitwise operator but `+` yields a number or BigInt.
+    Expression::BinaryExpression(binary) => matches!(
+      binary.operator,
+      BinaryOperator::Subtraction
+        | BinaryOperator::Multiplication
+        | BinaryOperator::Division
+        | BinaryOperator::Remainder
+        | BinaryOperator::Exponential
+        | BinaryOperator::ShiftLeft
+        | BinaryOperator::ShiftRight
+        | BinaryOperator::ShiftRightZeroFill
+        | BinaryOperator::BitwiseOR
+        | BinaryOperator::BitwiseXOR
+        | BinaryOperator::BitwiseAnd
+    ),
+    _ => false,
+  }
+}
+
+/// Whether a value has no part that could hold an Effect runtime object.
+fn is_constant_value(expr: &Expression<'_>) -> bool {
+  match strip(expr) {
+    Expression::StringLiteral(_)
+    | Expression::NumericLiteral(_)
+    | Expression::BooleanLiteral(_)
+    | Expression::NullLiteral(_)
+    | Expression::BigIntLiteral(_) => true,
+    Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+    Expression::UnaryExpression(unary) => is_constant_value(&unary.argument),
+    Expression::ArrayExpression(array) => array.elements.iter().all(|element| match element {
+      ArrayExpressionElement::Elision(_) => true,
+      ArrayExpressionElement::SpreadElement(_) => false,
+      element => element.as_expression().is_some_and(is_constant_value),
+    }),
+    Expression::ObjectExpression(object) => object.properties.iter().all(|property| {
+      matches!(property, ObjectPropertyKind::ObjectProperty(property)
+        if property.kind == PropertyKind::Init
+          && !property.computed
+          && !property.method
+          && is_constant_value(&property.value))
+    }),
+    _ => false,
   }
 }
 
@@ -628,6 +640,7 @@ struct KeyCollector<'s, 'l> {
   module: ModuleIdx,
   keys: Vec<(SymbolRef, KeyCreation, u32)>,
   this_free: Vec<SymbolRef>,
+  const_strings: Vec<(SymbolRef, Vec<StringPart>)>,
   depth: usize,
   kind: VariableDeclarationKind,
 }
@@ -666,6 +679,9 @@ impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
       if let Some(symbol) = id.symbol_id.get() {
         let symbol_ref: SymbolRef = (self.module, symbol).into();
         if self.kind == VariableDeclarationKind::Const {
+          if let Some(parts) = self.shared.string_parts(self.module, init) {
+            self.const_strings.push((symbol_ref, parts));
+          }
           match strip(init) {
             Expression::ArrowFunctionExpression(_) => self.this_free.push(symbol_ref),
             Expression::FunctionExpression(function) if !reads_this(function) => {
@@ -711,6 +727,46 @@ struct UseCollector<'s, 'l, 'a> {
 impl<'a> UseCollector<'_, '_, 'a> {
   fn bail_global(&mut self, span: Span, reason: &str) {
     self.global_bailouts.push(format!("{reason} (module {:?} at {})", self.module, span.start));
+  }
+
+  /// A sink that `effectServiceShakingAssumeNoReflection` rules out.
+  fn bail_reflection(&mut self, span: Span, reason: &str) {
+    if !self.shared.assume_no_reflection {
+      self.bail_global(span, reason);
+    }
+  }
+
+  /// A property read or written by `name`, `None` when the name is not constant.
+  fn check_member_name(&mut self, name: Option<&str>, span: Span, on_global_object: bool) {
+    match name {
+      Some(name) if CONTEXT_INTERNALS.contains(&name) => {
+        self.bail_global(span, &format!("`{name}` may read Context internals"));
+      }
+      Some(name) if CODE_LOADERS.contains(&name) => {
+        self.bail_global(span, &format!("`{name}` may run code outside the bundle"));
+      }
+      Some(_) => {}
+      // The global object holds `eval` and `Function`.
+      None if on_global_object => {
+        self.bail_global(span, "global object read by a non-constant name");
+      }
+      None => self.bail_reflection(span, "member read by a non-constant name"),
+    }
+  }
+
+  /// A destructured property key.
+  fn check_property_key(&mut self, key: &PropertyKey<'a>, computed: bool, span: Span) {
+    let name = if computed {
+      key.as_expression().and_then(|expr| self.shared.member_key(self.module, expr))
+    } else {
+      key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
+    };
+    self.check_member_name(name.as_deref(), span, false);
+  }
+
+  fn is_global(&self, expr: &Expression<'_>, names: &[&str]) -> bool {
+    matches!(strip(expr), Expression::Identifier(ident)
+      if names.contains(&ident.name.as_str()) && self.shared.resolve_ident(self.module, ident).is_none())
   }
 
   fn bail_key(&mut self, key: &str, span: Span, reason: &str) {
@@ -1068,39 +1124,57 @@ impl<'a> UseCollector<'_, '_, 'a> {
     let name = ident.name.as_str();
     let member = match self.parent(0) {
       Some(AstKind::StaticMemberExpression(member)) if member.object.span() == ident.span => {
-        Some(member.property.name.as_str())
+        Some(member)
       }
       _ => None,
     };
-    let called = matches!(self.parent(0), Some(AstKind::CallExpression(call)) if call.callee.span() == ident.span);
+    let member_name = member.map(|member| member.property.name.as_str());
     match resolved {
-      None if ident.reference_id.get().is_some() => {
-        if REFLECTIVE_GLOBALS.contains(&name) {
-          self.bail_global(ident.span, &format!("`{name}` may reach the global object"));
-        } else if name == "Symbol"
-          && !called
-          && !member.is_some_and(|m| ALLOWED_SYMBOL_MEMBERS.contains(&m))
-        {
-          self.bail_global(ident.span, "`Symbol` may reveal protocol symbols");
-        } else if name == "Object" && !member.is_some_and(|m| ALLOWED_OBJECT_MEMBERS.contains(&m)) {
-          self.bail_global(ident.span, "`Object` member may reveal protocol symbols");
+      None if ident.reference_id.get().is_some() => match name {
+        "eval" | "Function" | "require" => {
+          self.bail_global(ident.span, &format!("`{name}` may run code outside the bundle"));
         }
-      }
+        "Object" => match member_name {
+          Some(member) if ENUMERATING_OBJECT_MEMBERS.contains(&member) => {
+            self.bail_reflection(ident.span, &format!("`Object.{member}` enumerates properties"));
+          }
+          Some(_) => {}
+          None => self.bail_reflection(ident.span, "`Object` used as a value"),
+        },
+        "Reflect" => self.bail_reflection(ident.span, "`Reflect` reads properties by name"),
+        "structuredClone" => {
+          self.bail_reflection(ident.span, "`structuredClone` enumerates properties");
+        }
+        "JSON" => {
+          let constant_stringify = member.is_some_and(|member| {
+            member.property.name == "stringify"
+              && matches!(self.parent(1), Some(AstKind::CallExpression(call))
+              if call.callee.span() == member.span
+                && call.arguments.iter().all(|argument| {
+                  argument.as_expression().is_some_and(is_constant_value)
+                }))
+          });
+          if member_name != Some("parse") && !constant_stringify {
+            self.bail_reflection(ident.span, "`JSON` may serialize an Effect runtime object");
+          }
+        }
+        _ => {}
+      },
       Some(Resolved::Namespace(target)) => match self.namespace_chain(ident.span, target) {
-        NamespaceChain::Export { symbol, span, depth } => {
-          self.check_api(Some(Resolved::Symbol(symbol)), span, depth + 1);
+        NamespaceChain::Export { symbol, span, .. } => {
+          self.check_api(Some(Resolved::Symbol(symbol)), span);
         }
         // Every export of the module, Layers included, may escape through it.
         NamespaceChain::Value(span) => self.bail_global(span, "module namespace used as a value"),
         NamespaceChain::Unresolved => {}
       },
-      Some(Resolved::Symbol(_)) => self.check_api(resolved, ident.span, 0),
+      Some(Resolved::Symbol(_)) => self.check_api(resolved, ident.span),
       None => {}
     }
   }
 
-  /// Untrusted reference to a trusted export, whose use expression has parent `depth`.
-  fn check_api(&mut self, resolved: Option<Resolved>, span: Span, depth: usize) {
+  /// Untrusted reference to a trusted export.
+  fn check_api(&mut self, resolved: Option<Resolved>, span: Span) {
     let Some(Resolved::Symbol(symbol)) = resolved else { return };
     if self.shared.keys.contains_key(&symbol) {
       return;
@@ -1112,26 +1186,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
       && !self.shared.key_creations.contains(&(self.module, span.start))
     {
       self.bail_global(span, &format!("`{name}` used other than to declare a service key"));
-      return;
+    } else if CONTEXT_INTERNAL_APIS.contains(&name.as_str()) {
+      self.bail_global(span, &format!("`{name}` reads Context internals"));
     }
-    let prefix = self.shared.prefixes[symbol.owner.index()].as_deref().unwrap_or_default();
-    let call = match self.parent(depth) {
-      Some(AstKind::CallExpression(call)) if call.callee.span() == span => Some(call),
-      _ => None,
-    };
-    if name == "Effect.runFork"
-      && call.is_some_and(|call| call.arguments.len() == 1)
-      && matches!(self.parent(depth + 1), Some(AstKind::ExpressionStatement(_)))
-    {
-      return;
-    }
-    if RUN_APIS.contains(&name.as_str()) && call.is_some_and(|call| call.arguments.len() == 1) {
-      return;
-    }
-    if ALLOWED_APIS.contains(&name.as_str()) || ALLOWED_MODULES.contains(&prefix) {
-      return;
-    }
-    self.bail_global(span, &format!("`{name}` is not an audited API"));
   }
 
   fn classify_key_reference(&mut self, key: &str, use_span: Span, use_depth: usize) {
@@ -1247,6 +1304,22 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
 
   fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
     let callee = strip(&it.callee);
+    // `Reflect.get(context, "mapUnsafe")`, `Object.getOwnPropertyDescriptor(proto, "mapUnsafe")`.
+    if !self.trusted {
+      if let Expression::StaticMemberExpression(member) = callee {
+        if self.is_global(&member.object, &["Object", "Reflect"]) {
+          for argument in &it.arguments {
+            let name =
+              argument.as_expression().and_then(|expr| self.shared.const_string(self.module, expr));
+            if let Some(name) = name.filter(|name| {
+              CONTEXT_INTERNALS.contains(&name.as_str()) || CODE_LOADERS.contains(&name.as_str())
+            }) {
+              self.check_member_name(Some(&name), it.span, false);
+            }
+          }
+        }
+      }
+    }
     // `Key.of(value)`.
     if let Expression::StaticMemberExpression(member) = callee {
       if member.property.name == "of" && self.shared.key_of(self.module, &member.object).is_some() {
@@ -1426,14 +1499,62 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
   }
 
   fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
-    if !self.trusted && matches!(it.property.name.as_str(), "context" | "mapUnsafe") {
-      let on_namespace =
-        matches!(self.shared.resolve_expr(self.module, &it.object), Some(Resolved::Namespace(_)));
-      if !on_namespace {
-        self.bail_global(it.span, "member may read a whole Context");
-      }
+    if !self.trusted
+      && !matches!(self.shared.resolve_expr(self.module, &it.object), Some(Resolved::Namespace(_)))
+    {
+      self.check_member_name(Some(it.property.name.as_str()), it.span, false);
     }
     walk_js::walk_static_member_expression(self, it);
+  }
+
+  fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
+    if !self.trusted {
+      let name = self.shared.member_key(self.module, &it.expression);
+      let on_global_object = self.is_global(&it.object, GLOBAL_OBJECTS);
+      self.check_member_name(name.as_deref(), it.span, on_global_object);
+    }
+    walk_js::walk_computed_member_expression(self, it);
+  }
+
+  fn visit_binding_property(&mut self, it: &BindingProperty<'a>) {
+    if !self.trusted {
+      self.check_property_key(&it.key, it.computed, it.span);
+    }
+    walk_js::walk_binding_property(self, it);
+  }
+
+  fn visit_assignment_target_property_property(
+    &mut self,
+    it: &AssignmentTargetPropertyProperty<'a>,
+  ) {
+    if !self.trusted {
+      self.check_property_key(&it.name, it.computed, it.span);
+    }
+    walk_js::walk_assignment_target_property_property(self, it);
+  }
+
+  fn visit_assignment_target_property_identifier(
+    &mut self,
+    it: &AssignmentTargetPropertyIdentifier<'a>,
+  ) {
+    if !self.trusted {
+      self.check_member_name(Some(it.binding.name.as_str()), it.span, false);
+    }
+    walk_js::walk_assignment_target_property_identifier(self, it);
+  }
+
+  fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+    if !self.trusted {
+      self.bail_reflection(it.span, "`for...in` enumerates properties");
+    }
+    walk_js::walk_for_in_statement(self, it);
+  }
+
+  fn visit_with_statement(&mut self, it: &WithStatement<'a>) {
+    if !self.trusted {
+      self.bail_global(it.span, "`with` reads properties by name");
+    }
+    walk_js::walk_with_statement(self, it);
   }
 
   fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
@@ -1534,6 +1655,11 @@ impl LinkStage<'_> {
       keys: FxHashMap::default(),
       key_creations: FxHashSet::default(),
       this_free: FxHashSet::default(),
+      const_strings: FxHashMap::default(),
+      assume_no_reflection: self
+        .options
+        .experimental
+        .is_effect_service_shaking_assume_no_reflection(),
     };
 
     // == pass A: keys
@@ -1541,6 +1667,7 @@ impl LinkStage<'_> {
       self.module_table.modules.iter().filter_map(|m| m.as_normal().map(|n| n.idx)).collect();
     let mut key_creations = vec![];
     let mut this_free = vec![];
+    let mut const_strings: Vec<(SymbolRef, Vec<StringPart>)> = vec![];
     for module in &normal_modules {
       let Some(ast) = self.ast_table[*module].as_ref() else { continue };
       ast.program.with_dependent(|_owner, dep| {
@@ -1549,16 +1676,40 @@ impl LinkStage<'_> {
           module: *module,
           keys: vec![],
           this_free: vec![],
+          const_strings: vec![],
           depth: 0,
           kind: VariableDeclarationKind::Var,
         };
         collector.visit_program(&dep.program);
         key_creations.extend(collector.keys.into_iter().map(|key| (*module, key)));
         this_free.extend(collector.this_free);
+        const_strings.extend(collector.const_strings);
       });
     }
     for symbol in this_free {
       shared.this_free.insert(shared.symbols.canonical_ref_for(symbol));
+    }
+    // `const` strings may be built from other `const` strings, in any module order.
+    let mut changed = true;
+    while changed {
+      changed = false;
+      for (symbol, parts) in &const_strings {
+        let symbol = shared.symbols.canonical_ref_for(*symbol);
+        if shared.const_strings.contains_key(&symbol) {
+          continue;
+        }
+        let value = parts.iter().try_fold(String::new(), |mut out, part| {
+          match part {
+            StringPart::Literal(literal) => out.push_str(literal),
+            StringPart::Binding(binding) => out.push_str(shared.const_strings.get(binding)?),
+          }
+          Some(out)
+        });
+        if let Some(value) = value {
+          shared.const_strings.insert(symbol, value);
+          changed = true;
+        }
+      }
     }
     let mut dynamic_keys = vec![];
     for (module, (symbol, key, callee_start)) in key_creations {

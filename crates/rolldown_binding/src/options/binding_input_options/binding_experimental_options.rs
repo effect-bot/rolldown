@@ -15,6 +15,7 @@ pub struct BindingExperimentalOptions {
   pub chunk_optimization: Option<Either<bool, BindingChunkOptimizationOptions>>,
   pub lazy_barrel: Option<bool>,
   pub effect_service_shaking: Option<bool>,
+  pub effect_service_shaking_assume_no_reflection: Option<bool>,
 }
 
 impl TryFrom<BindingExperimentalOptions> for rolldown_common::ExperimentalOptions {
@@ -40,6 +41,8 @@ impl TryFrom<BindingExperimentalOptions> for rolldown_common::ExperimentalOption
       }),
       lazy_barrel: value.lazy_barrel,
       effect_service_shaking: value.effect_service_shaking,
+      effect_service_shaking_assume_no_reflection: value
+        .effect_service_shaking_assume_no_reflection,
     })
   }
 }
