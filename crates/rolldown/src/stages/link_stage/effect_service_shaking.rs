@@ -508,9 +508,9 @@ impl Shared<'_> {
     }
   }
 
-  /// A key creation `Context.Service("key")` or `Context.Service<..>()("key")`:
-  /// `None` when the expression does not create a key.
-  fn key_creation(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<KeyCreation> {
+  /// A key creation `Context.Service("key")` or `Context.Service<..>()("key")`,
+  /// with the start of its callee: `None` when the expression does not create a key.
+  fn key_creation(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<(KeyCreation, u32)> {
     let Expression::CallExpression(call) = strip(expr) else { return None };
     let callee = strip(&call.callee);
     let api = self.api_of(module, callee);
@@ -521,13 +521,19 @@ impl Shared<'_> {
     if !direct && !curried {
       return None;
     }
-    Some(match call.arguments.first() {
-      Some(Argument::StringLiteral(literal)) => literal
-        .value
-        .as_str()
-        .map_or(KeyCreation::Dynamic, |key| KeyCreation::Literal(key.to_string())),
-      _ => KeyCreation::Dynamic,
-    })
+    let key = match key_string(call) {
+      Some(key) => KeyCreation::Literal(key),
+      None => KeyCreation::Dynamic,
+    };
+    Some((key, call.callee.span().start))
+  }
+}
+
+/// The literal key string of a key creation call, if it has one.
+fn key_string(call: &CallExpression<'_>) -> Option<String> {
+  match call.arguments.first() {
+    Some(Argument::StringLiteral(literal)) => literal.value.as_str().map(String::from),
+    _ => None,
   }
 }
 
@@ -668,9 +674,8 @@ impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
             _ => {}
           }
           if self.depth == 0 {
-            if let Some(key) = self.shared.key_creation(self.module, init) {
-              let Expression::CallExpression(call) = strip(init) else { unreachable!() };
-              self.keys.push((symbol_ref, key, call.callee.span().start));
+            if let Some((key, callee_start)) = self.shared.key_creation(self.module, init) {
+              self.keys.push((symbol_ref, key, callee_start));
             }
           }
         }
@@ -887,20 +892,15 @@ impl<'a> UseCollector<'_, '_, 'a> {
   }
 
   /// Registers the provider objects of `Layer.succeed(K, value)` / `Layer.effect(K, effect)`.
-  fn provider(
-    &mut self,
-    key: &str,
-    kind: &str,
-    value: &Expression<'a>,
-    container: Container,
-    span: Span,
-  ) {
+  /// Sources that are not recognised object literals are simply not sites, so
+  /// whether every source was followed does not matter here.
+  fn provider(&mut self, key: &str, kind: &str, value: &Expression<'a>, container: Container) {
     let mut found = vec![];
-    let _complete = if kind == "Layer.succeed" {
-      self.value_sites(value, &mut found)
+    if kind == "Layer.succeed" {
+      self.value_sites(value, &mut found);
     } else {
-      self.effect_sites(value, &mut found)
-    };
+      self.effect_sites(value, &mut found);
+    }
     for (start, bindings, top) in found {
       let index = *self.site_spans.entry(start).or_insert_with(|| {
         self.sites.push(Site {
@@ -918,7 +918,6 @@ impl<'a> UseCollector<'_, '_, 'a> {
       site.bindings.extend(bindings);
     }
     self.providers.push((key.to_string(), container));
-    let _ = span;
   }
 
   fn is_effect_generator(&self, yield_depth: usize) -> bool {
@@ -1264,13 +1263,13 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
         if it.arguments.len() == 2 {
           let container = self.container_from(it.span, self.path.len() - 1);
           if let Some(value) = it.arguments[1].as_expression() {
-            self.provider(&key, kind, value, container, it.span);
+            self.provider(&key, kind, value, container);
           }
         } else if let Some(AstKind::CallExpression(outer)) = self.parent(0) {
           if outer.callee.span() == it.span && outer.arguments.len() == 1 {
             let container = self.container_from(outer.span, self.path.len() - 2);
             if let Some(value) = outer.arguments[0].as_expression() {
-              self.provider(&key, kind, value, container, outer.span);
+              self.provider(&key, kind, value, container);
             }
           } else {
             self.bail_key(&key, it.span, "curried provider not applied");
@@ -1282,23 +1281,13 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     }
     if let Some("Context.Service" | "Context.Reference") = api {
       if !self.shared.key_creations.contains(&(self.module, it.callee.span().start)) {
-        let is_curried_inner = matches!(self.parent(0), Some(AstKind::CallExpression(outer)) if outer.callee.span() == it.span);
-        let creation = if is_curried_inner {
-          match self.parent(0) {
-            Some(AstKind::CallExpression(outer)) => match outer.arguments.first() {
-              Some(Argument::StringLiteral(literal)) => literal.value.as_str().map(String::from),
-              _ => None,
-            },
-            _ => None,
-          }
-        } else {
-          match it.arguments.first() {
-            Some(Argument::StringLiteral(literal)) => literal.value.as_str().map(String::from),
-            _ => None,
-          }
+        // The key string is on the outer call of the curried form `Context.Service<..>()("key")`.
+        let creation_call = match self.parent(0) {
+          Some(AstKind::CallExpression(outer)) if outer.callee.span() == it.span => outer,
+          _ => it,
         };
         let trusted = self.trusted;
-        match creation {
+        match key_string(creation_call) {
           Some(key) => self.bail_key(&key, it.span, "service key created outside a declaration"),
           // Effect's own modules create keys from constants or arguments.
           None if trusted => {}
@@ -1340,14 +1329,10 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
             Expression::TemplateLiteral(template) => (template.expressions.is_empty(), false),
             Expression::FunctionExpression(function) => (true, reads_this(function)),
             Expression::Identifier(_) => {
+              // A binding known to hold a function that never reads `this`.
               let resolved = self.shared.resolve_expr(self.module, value);
               let this_free = matches!(resolved, Some(Resolved::Symbol(symbol)) if self.shared.this_free.contains(&symbol));
-              // A local bound to a resolvable function or value.
-              (
-                true,
-                !this_free
-                  && !matches!(resolved, Some(Resolved::Symbol(s)) if self.is_const_value(s)),
-              )
+              (true, !this_free)
             }
             _ => (false, true),
           };
@@ -1456,14 +1441,6 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       self.bail_global(it.span, "dynamic import");
     }
     walk_js::walk_import_expression(self, it);
-  }
-}
-
-impl UseCollector<'_, '_, '_> {
-  fn is_const_value(&self, symbol: SymbolRef) -> bool {
-    let scoping = self.shared.scoping(symbol.owner);
-    scoping.symbol_flags(symbol.symbol).is_const_variable()
-      && self.shared.this_free.contains(&symbol)
   }
 }
 
@@ -1607,7 +1584,6 @@ impl LinkStage<'_> {
     let mut refs: FxHashMap<ModuleIdx, FxHashMap<ReferenceId, RefInfo>> = FxHashMap::default();
     let mut namespace_refs: Vec<(SymbolRef, RefInfo)> = vec![];
     let mut key_bailouts = vec![];
-    let mut site_spans: FxHashMap<usize, (ModuleIdx, u32)> = FxHashMap::default();
     for module in &normal_modules {
       let Some(ast) = self.ast_table[*module].as_ref() else { continue };
       // Rolldown's own runtime module is trusted like the effect package.
@@ -1632,9 +1608,6 @@ impl LinkStage<'_> {
           key_bailouts: vec![],
         };
         collector.visit_program(&dep.program);
-        for (start, index) in &collector.site_spans {
-          site_spans.insert(*index, (*module, *start));
-        }
         consumers.extend(collector.consumers.into_iter().map(|c| (*module, c)));
         providers.extend(collector.providers.into_iter().map(|p| (*module, p)));
         guard_bindings.extend(collector.guard_bindings);
@@ -1851,7 +1824,6 @@ impl LinkStage<'_> {
         ));
       }
     }
-    let _ = site_spans;
 
     // Statement references that only occurred inside removed code.
     let mut stmt_updates: Vec<(ModuleIdx, usize, FxHashSet<SymbolId>, Vec<Span>)> = vec![];
@@ -1890,19 +1862,15 @@ impl LinkStage<'_> {
     }
     drop(shared);
 
-    for (module, properties) in &removed_properties {
-      let declarators = removed_declarators.remove(module).unwrap_or_default();
-      if let Some(ast) = self.ast_table[*module].as_mut() {
+    let edited: FxHashSet<ModuleIdx> =
+      removed_properties.keys().chain(removed_declarators.keys()).copied().collect();
+    let empty = FxHashSet::default();
+    for module in edited {
+      let properties = removed_properties.get(&module).unwrap_or(&empty);
+      let declarators = removed_declarators.get(&module).unwrap_or(&empty);
+      if let Some(ast) = self.ast_table[module].as_mut() {
         ast.program.with_mut(|fields| {
-          Pruner { properties, declarators: &declarators }.visit_program(fields.program);
-        });
-      }
-    }
-    for (module, declarators) in &removed_declarators {
-      if let Some(ast) = self.ast_table[*module].as_mut() {
-        let properties = FxHashSet::default();
-        ast.program.with_mut(|fields| {
-          Pruner { properties: &properties, declarators }.visit_program(fields.program);
+          Pruner { properties, declarators }.visit_program(fields.program);
         });
       }
     }
