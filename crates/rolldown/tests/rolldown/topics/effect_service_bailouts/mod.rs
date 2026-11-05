@@ -122,3 +122,18 @@ async fn constant_function_constructor_name_loads_code() {
 async fn reflect_get_with_a_loader_name_loads_code() {
   assert_bailout("loader_reflect_get", "Reflect.get(").await;
 }
+
+/// `Reflect.get` with a literal loader name, through `globalThis.Reflect`, an
+/// alias of it, or a spread before the key.
+#[tokio::test(flavor = "multi_thread")]
+async fn qualified_or_spread_reflect_get_loads_code() {
+  let mut errors = Vec::new();
+  for (dir, needle) in [
+    ("loader_reflect_get_global", "globalThis.Reflect.get("),
+    ("loader_reflect_get_global", "globalThis.Reflect\n"),
+    ("loader_reflect_get_spread", "Reflect.get(...[]"),
+  ] {
+    errors.extend(missing_bailout(dir, needle).await);
+  }
+  assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
