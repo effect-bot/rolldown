@@ -1109,7 +1109,8 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// and `var` always are; a `const`, `let` or class must be declared earlier in
   /// the source with no hoisted function declaration between, which could run
   /// the site first, and not in another case of a switch the site is in, since
-  /// jumping to a case skips the cases before it. An import may be
+  /// jumping to a case skips the cases before it, and not around the site: inside
+  /// its own declaration a binding is uninitialised. An import may be
   /// uninitialised through a module cycle, even one back to its own module.
   fn initialized_at(&self, value: &Expression<'a>, site: u32) -> bool {
     let Expression::Identifier(ident) = value else { return false };
@@ -1129,6 +1130,15 @@ impl<'a> UseCollector<'_, '_, 'a> {
         AstKind::Function(function) => {
           function.r#type != FunctionType::FunctionDeclaration
             || function.span.contains_inclusive(declared)
+        }
+        // Inside the binding's own declaration, directly or in code it runs
+        // (an immediately invoked function, a class heritage), the binding is
+        // still in its temporal dead zone.
+        AstKind::VariableDeclarator(declarator) => {
+          !declarator.id.span().contains_inclusive(declared)
+        }
+        AstKind::Class(class) => {
+          class.id.as_ref().is_none_or(|id| id.symbol_id.get() != Some(symbol))
         }
         _ => true,
       })
