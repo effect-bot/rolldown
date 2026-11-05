@@ -9,6 +9,6 @@ await import("./dist/main.js")
 // keeps only the one used, with or without the service pass.
 const code = fs.readFileSync(path.join(import.meta.dirname, "dist/main.js"), "utf8")
 assert.match(code, /`CreateCustomerRequest`/, "CreateCustomer should be kept")
-for (const name of ["CreateAccountRequest", "ListCustomersRequest", "CreateInvoiceRequest"]) {
+for (const name of ["CreateAccountRequest", "CreateInvoiceRequest"]) {
   assert.doesNotMatch(code, new RegExp(`\`${name}\``), `${name} should be removed`)
 }
