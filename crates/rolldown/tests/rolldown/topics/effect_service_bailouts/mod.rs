@@ -104,8 +104,10 @@ async fn computed_host_access_may_load_code() {
   assert_bailout("loader_computed_access", "process[").await;
 }
 
+/// A constant computed name for the Function constructor is a code loader.
+/// Names known only at run time are outside the contract (A2) and not checked.
 #[tokio::test(flavor = "multi_thread")]
-async fn computed_function_constructor_access_may_load_code() {
+async fn constant_function_constructor_name_loads_code() {
   let mut errors = Vec::new();
   for (dir, needle) in [
     ("loader_function_constructor_global", "globalThis.Object["),
