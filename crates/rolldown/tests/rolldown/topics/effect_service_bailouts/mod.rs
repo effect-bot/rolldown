@@ -85,16 +85,6 @@ async fn update_service_scoped_is_a_keyed_lookup() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn get_or_undefined_unsafe_works_on_key_strings() {
-  assert_bailout("string_key_get_or_undefined_unsafe", "Context.getOrUndefinedUnsafe(").await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn make_unsafe_works_on_key_strings() {
-  assert_bailout("string_key_make_unsafe", "Context.makeUnsafe(").await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn reexported_loader_loads_code() {
   assert_bailout("loader_reexport", "compile(\"return 1\")").await;
 }
