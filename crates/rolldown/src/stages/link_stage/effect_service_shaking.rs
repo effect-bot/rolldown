@@ -1110,7 +1110,8 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// the source with no hoisted function declaration between, which could run
   /// the site first, and not in another case of a switch the site is in, since
   /// jumping to a case skips the cases before it, and not around the site: inside
-  /// its own declaration a binding is uninitialised. An import may be
+  /// its own declaration, parameter list or loop head (while the loop's
+  /// right-hand side runs) a binding is uninitialised. An import may be
   /// uninitialised through a module cycle, even one back to its own module.
   fn initialized_at(&self, value: &Expression<'a>, site: u32) -> bool {
     let Expression::Identifier(ident) = value else { return false };
@@ -1121,10 +1122,17 @@ impl<'a> UseCollector<'_, '_, 'a> {
     if flags.contains(SymbolFlags::Import) {
       return false;
     }
+    let declared = scoping.symbol_span(symbol);
+    // Parameters share the `var` flag, but a default runs before its own
+    // parameter and the later ones are initialised.
+    if self.path.iter().any(|kind| {
+      matches!(kind, AstKind::FormalParameters(params) if params.span.contains_inclusive(declared))
+    }) {
+      return false;
+    }
     if flags.intersects(SymbolFlags::Function | SymbolFlags::FunctionScopedVariable) {
       return true;
     }
-    let declared = scoping.symbol_span(symbol);
     declared.end <= site
       && self.path.iter().all(|kind| match kind {
         AstKind::Function(function) => {
@@ -1139,6 +1147,16 @@ impl<'a> UseCollector<'_, '_, 'a> {
         }
         AstKind::Class(class) => {
           class.id.as_ref().is_none_or(|id| id.symbol_id.get() != Some(symbol))
+        }
+        // A lexical loop-head binding is uninitialised while the loop's
+        // right-hand side runs.
+        AstKind::ForOfStatement(stmt) => {
+          !(stmt.left.span().contains_inclusive(declared)
+            && (stmt.right.span().start..stmt.right.span().end).contains(&site))
+        }
+        AstKind::ForInStatement(stmt) => {
+          !(stmt.left.span().contains_inclusive(declared)
+            && (stmt.right.span().start..stmt.right.span().end).contains(&site))
         }
         _ => true,
       })
