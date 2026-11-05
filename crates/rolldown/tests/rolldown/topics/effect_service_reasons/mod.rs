@@ -122,3 +122,62 @@ async fn version_mismatch_is_reported() {
     .any(|(_, message)| message.contains("[version-mismatch]") && message.contains("4.0.0"));
   assert!(found, "expected a `[version-mismatch]` reason naming 4.0.0, got: {reasons:#?}");
 }
+
+/// No reason at all at the site of `needle`: the call there matched its row.
+fn assert_no_reason_at(reasons: &[Reason], dir: &str, needle: &str) {
+  let site = position(dir, needle);
+  let found: Vec<&Reason> = reasons
+    .iter()
+    .filter(|(id, message)| {
+      id.as_deref().is_some_and(|id| id.ends_with(&format!("{dir}/main.js")))
+        && reports_site(message, &site)
+    })
+    .collect();
+  assert!(
+    found.is_empty(),
+    "expected no reason at {dir}/main.js:{site} (`{needle}`), got: {found:#?}"
+  );
+}
+
+/// No reason seeds the heap bit, so nothing unrelated keeps the methods.
+fn assert_heap_clear(reasons: &[Reason], dir: &str) {
+  let found: Vec<&Reason> =
+    reasons.iter().filter(|(_, message)| message.contains("[heap:")).collect();
+  assert!(found.is_empty(), "expected no heap reason in {dir}, got: {found:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn map_success_binding_reaches_the_sink() {
+  let dir = "effect_service_real/map_success_binding";
+  let reasons = reasons(dir).await;
+  assert_heap_clear(&reasons, dir);
+  assert_no_reason_at(&reasons, dir, "Effect.map(");
+  assert_no_reason_at(&reasons, dir, "Effect.forkChild(");
+  assert_no_reason_at(&reasons, dir, "Effect.sync(() => 0)");
+  assert_reason(&reasons, dir, "bailout", "JSON.stringify(value, replacer)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn curried_map_is_an_unsummarised_call() {
+  let dir = "effect_service_real/map_curried_fallback";
+  let reasons = reasons(dir).await;
+  assert_reason(&reasons, dir, "heap:unsummarised-call", "Effect.map((value) => value)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn record_all_is_an_unsummarised_call() {
+  let dir = "effect_service_real/all_record_fallback";
+  let reasons = reasons(dir).await;
+  assert_reason(&reasons, dir, "heap:unsummarised-call", "Effect.all(");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_origin_join_reaches_the_sink() {
+  let dir = "effect_service_real/all_mixed_origin_join";
+  let reasons = reasons(dir).await;
+  assert_heap_clear(&reasons, dir);
+  assert_no_reason_at(&reasons, dir, "Effect.all(");
+  assert_no_reason_at(&reasons, dir, "Fiber.join(");
+  assert_no_reason_at(&reasons, dir, "Effect.forkChild(leak)");
+  assert_reason(&reasons, dir, "bailout", "JSON.stringify(value, replacer)");
+}
