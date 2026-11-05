@@ -53,8 +53,8 @@ use oxc::{
   span::{GetSpan, Span},
 };
 use rolldown_common::{
-  GetLocalDb, Module, ModuleIdx, Specifier, StmtInfoIdx, SymbolOrMemberExprRef, SymbolRef,
-  SymbolRefDb,
+  GetLocalDb, ImportKind, Module, ModuleIdx, Specifier, StmtInfoIdx, SymbolOrMemberExprRef,
+  SymbolRef, SymbolRefDb, WrapKind,
 };
 use rolldown_error::BuildDiagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -65,7 +65,7 @@ use super::LinkStage;
 // lookups. These cheap syntactic cases turn the pass off instead of relying on it.
 //
 // Context functions that read or build a service map by key string.
-const CONTEXT_INTERNAL_APIS: &[&str] = &["Context.getOrUndefinedUnsafe", "Context.makeUnsafe"];
+const CONTEXT_INTERNAL_APIS: &[&str] = &["Context.getOrUndefinedUnsafe"];
 // Keyed lookups other than `yield*`: their key argument may be a key the pass
 // does not track, such as `{ key: "app/Store" }`.
 const KEYED_LOOKUPS: &[&str] = &[
@@ -277,8 +277,31 @@ fn strip<'b, 'a>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
   }
 }
 
+/// How a function creates a service key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KeyConstructor {
+  /// `Context.Service`, `Context.Reference` or an alias: the key string first.
+  Service,
+  /// A wrapper taking the key string as the parameter at this index.
+  Wrapper(usize),
+}
+
+impl KeyConstructor {
+  fn key_index(self) -> usize {
+    match self {
+      KeyConstructor::Service => 0,
+      KeyConstructor::Wrapper(index) => index,
+    }
+  }
+}
+
+/// Key constructors and key-reading functions found in one module.
+type ModuleConstructors = (Vec<(SymbolRef, KeyConstructor, u32)>, Vec<(SymbolRef, Vec<bool>)>);
+
 enum KeyCreation {
   Literal(String),
+  /// A constant built from `const` bindings, resolved once they are known.
+  Parts(Vec<StringPart>),
   Dynamic,
 }
 
@@ -443,6 +466,8 @@ impl Demand {
 #[derive(Default, Debug)]
 struct Report {
   global_bailouts: Vec<Bailout>,
+  /// Bailouts in statements Rolldown cannot include, which never run.
+  dead_bailouts: Vec<Bailout>,
   key_bailouts: Vec<(String, String)>,
   removed: Vec<String>,
 }
@@ -493,6 +518,12 @@ struct Shared<'l> {
   /// Module-level functions that return only object literals: their module
   /// and the literals' span starts.
   builders: FxHashMap<SymbolRef, (ModuleIdx, Vec<u32>)>,
+  /// Module-level aliases of `Context.Service` and functions that return a key
+  /// created from one of their parameters.
+  key_constructors: FxHashMap<SymbolRef, KeyConstructor>,
+  /// Module-level functions, with each parameter that is only read as
+  /// `param.key`: passing a key there cannot change or leak it.
+  key_readers: FxHashMap<SymbolRef, Vec<bool>>,
 }
 
 impl Shared<'_> {
@@ -589,38 +620,67 @@ impl Shared<'_> {
     }
   }
 
-  /// A key creation `Context.Service("key")` or `Context.Service<..>()("key")`,
-  /// with the start of its callee: `None` when the expression does not create a key.
+  /// How `callee` creates a key, if it is `Context.Service`,
+  /// `Context.Reference`, an alias of them or a wrapper.
+  fn constructor_of(&self, module: ModuleIdx, callee: &Expression<'_>) -> Option<KeyConstructor> {
+    if matches!(self.api_of(module, callee), Some("Context.Service" | "Context.Reference")) {
+      return Some(KeyConstructor::Service);
+    }
+    match self.resolve_expr(module, callee)? {
+      Resolved::Symbol(symbol) => self.key_constructors.get(&symbol).copied(),
+      Resolved::Namespace(_) => None,
+    }
+  }
+
+  /// A key creation `Context.Service("key")`, `Context.Service<..>()("key")`,
+  /// an alias or wrapper call with a key string, with the start of its callee:
+  /// `None` when the expression does not create a key.
   fn key_creation(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<(KeyCreation, u32)> {
     let Expression::CallExpression(call) = strip(expr) else { return None };
     let callee = strip(&call.callee);
-    let api = self.api_of(module, callee);
-    let direct = matches!(api, Some("Context.Service" | "Context.Reference"));
-    let curried = matches!(callee, Expression::CallExpression(inner)
-      if inner.arguments.is_empty()
-        && self.api_of(module, &inner.callee) == Some("Context.Service"));
-    if !direct && !curried {
-      return None;
-    }
-    let key = match key_string(call) {
-      Some(key) => KeyCreation::Literal(key),
+    let index = match self.constructor_of(module, callee) {
+      Some(constructor) => constructor.key_index(),
+      None => match callee {
+        Expression::CallExpression(inner)
+          if inner.arguments.is_empty()
+            && self.constructor_of(module, &inner.callee) == Some(KeyConstructor::Service) =>
+        {
+          0
+        }
+        _ => return None,
+      },
+    };
+    let key = match call.arguments.get(index).and_then(Argument::as_expression) {
+      Some(argument) => self.key_parts(module, argument),
       None => KeyCreation::Dynamic,
     };
     Some((key, call.callee.span().start))
+  }
+
+  /// The key string of a creation argument: a constant, possibly built from
+  /// `const` bindings, or dynamic.
+  fn key_parts(&self, module: ModuleIdx, argument: &Expression<'_>) -> KeyCreation {
+    match self.string_parts(module, argument) {
+      Some(parts) if parts.iter().all(|part| matches!(part, StringPart::Literal(_))) => {
+        KeyCreation::Literal(
+          parts
+            .into_iter()
+            .filter_map(|part| match part {
+              StringPart::Literal(literal) => Some(literal),
+              StringPart::Binding(_) => None,
+            })
+            .collect(),
+        )
+      }
+      Some(parts) => KeyCreation::Parts(parts),
+      None => KeyCreation::Dynamic,
+    }
   }
 }
 
 enum StringPart {
   Literal(String),
   Binding(SymbolRef),
-}
-
-/// The literal key string of a key creation call, if it has one.
-fn key_string(call: &CallExpression<'_>) -> Option<String> {
-  match call.arguments.first() {
-    Some(Argument::StringLiteral(literal)) => literal.value.as_str().map(String::from),
-    _ => None,
-  }
 }
 
 /// Whether a function may read its receiver: anywhere in its parameters
@@ -825,6 +885,233 @@ impl<'b, 'a> Returns<'b, 'a> {
       _ => {}
     }
   }
+}
+
+/// Top-level functions of a module: `const f = (..) => ..`, `const f = function
+/// (..) {..}` and function declarations, with their binding.
+fn module_functions<'b, 'a>(program: &'b Program<'a>) -> Vec<(SymbolId, ModuleFunction<'b, 'a>)> {
+  let mut out = vec![];
+  for statement in &program.body {
+    let declaration = match statement {
+      Statement::FunctionDeclaration(function) => {
+        if let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get()) {
+          out.push((symbol, ModuleFunction::Function(function)));
+        }
+        continue;
+      }
+      Statement::VariableDeclaration(declaration) => declaration,
+      Statement::ExportDeclaration(export) => match &export.declaration {
+        Declaration::VariableDeclaration(declaration) => declaration,
+        Declaration::FunctionDeclaration(function) => {
+          if let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get()) {
+            out.push((symbol, ModuleFunction::Function(function)));
+          }
+          continue;
+        }
+        _ => continue,
+      },
+      _ => continue,
+    };
+    if declaration.kind != VariableDeclarationKind::Const {
+      continue;
+    }
+    for declarator in &declaration.declarations {
+      let (BindingPattern::BindingIdentifier(id), Some(init)) = (&declarator.id, &declarator.init)
+      else {
+        continue;
+      };
+      let Some(symbol) = id.symbol_id.get() else { continue };
+      match strip(init) {
+        Expression::ArrowFunctionExpression(arrow) => {
+          out.push((symbol, ModuleFunction::Arrow(arrow)));
+        }
+        Expression::FunctionExpression(function) => {
+          out.push((symbol, ModuleFunction::Function(function)));
+        }
+        _ => {}
+      }
+    }
+  }
+  out
+}
+
+#[derive(Clone, Copy)]
+enum ModuleFunction<'b, 'a> {
+  Arrow(&'b oxc::ast::ast::ArrowFunctionExpression<'a>),
+  Function(&'b Function<'a>),
+}
+
+impl<'b, 'a> ModuleFunction<'b, 'a> {
+  /// The parameter bindings, when every parameter is a plain identifier
+  /// without a default and there is no rest parameter.
+  fn plain_params(self) -> Option<Vec<SymbolId>> {
+    let params = match self {
+      ModuleFunction::Arrow(arrow) if !arrow.r#async => &arrow.params,
+      ModuleFunction::Function(function) if !function.r#async && !function.generator => {
+        &function.params
+      }
+      _ => return None,
+    };
+    if params.rest.is_some() {
+      return None;
+    }
+    params
+      .items
+      .iter()
+      .map(|param| match &param.pattern {
+        BindingPattern::BindingIdentifier(id) if param.initializer.is_none() => id.symbol_id.get(),
+        _ => None,
+      })
+      .collect()
+  }
+
+  /// The single returned expression: an arrow's expression body, or a body
+  /// that is exactly `return value`.
+  fn returned(self) -> Option<&'b Expression<'a>> {
+    match self {
+      ModuleFunction::Arrow(arrow) => arrow.get_expression().or_else(|| {
+        match arrow.body.as_function_body()?.statements.as_slice() {
+          [Statement::ReturnStatement(ret)] => ret.argument.as_ref(),
+          _ => None,
+        }
+      }),
+      ModuleFunction::Function(function) => match function.body.as_ref()?.statements.as_slice() {
+        [Statement::ReturnStatement(ret)] => ret.argument.as_ref(),
+        _ => None,
+      },
+    }
+  }
+
+  fn walk_body<V: VisitJs<'a>>(self, visitor: &mut V) -> bool {
+    match self {
+      ModuleFunction::Arrow(arrow) => {
+        match arrow.get_expression() {
+          Some(value) => visitor.visit_expression(value),
+          None => {
+            if let Some(body) = arrow.body.as_function_body() {
+              visitor.visit_function_body(body);
+            }
+          }
+        }
+        true
+      }
+      ModuleFunction::Function(function) => match &function.body {
+        Some(body) if !reads_arguments(body) => {
+          visitor.visit_function_body(body);
+          true
+        }
+        _ => false,
+      },
+    }
+  }
+}
+
+/// Which parameters a function body only reads as `param.key`, never writing,
+/// passing or returning them.
+struct KeyReads<'s, 'a> {
+  scoping: &'s Scoping,
+  params: Vec<SymbolId>,
+  ok: Vec<bool>,
+  path: Vec<AstKind<'a>>,
+}
+
+impl<'a> VisitJs<'a> for KeyReads<'_, 'a> {
+  fn enter_node(&mut self, kind: AstKind<'a>) {
+    self.path.push(kind);
+  }
+
+  fn leave_node(&mut self, _kind: AstKind<'a>) {
+    self.path.pop();
+  }
+
+  fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+    let symbol =
+      it.reference_id.get().and_then(|reference| self.scoping.get_reference(reference).symbol_id());
+    let Some(index) = symbol.and_then(|symbol| self.params.iter().position(|p| *p == symbol))
+    else {
+      return;
+    };
+    let key_read = match self.path.last() {
+      Some(AstKind::StaticMemberExpression(member)) => {
+        member.object.span() == it.span
+          && member.property.name == "key"
+          && !matches!(
+            self.path.iter().rev().nth(1),
+            Some(
+              AstKind::AssignmentExpression(_)
+                | AstKind::UpdateExpression(_)
+                | AstKind::AssignmentTargetWithDefault(_)
+                | AstKind::ArrayAssignmentTarget(_)
+                | AstKind::ObjectAssignmentTarget(_)
+                | AstKind::ForInStatement(_)
+                | AstKind::ForOfStatement(_)
+            )
+          )
+          && !matches!(self.path.iter().rev().nth(1),
+            Some(AstKind::UnaryExpression(unary)) if unary.operator.is_delete())
+      }
+      _ => false,
+    };
+    if !key_read {
+      self.ok[index] = false;
+    }
+  }
+}
+
+/// Key constructors and key-reading functions of one module, given the
+/// constructors already known: (constructor, parameter index, the creation or
+/// reference site it whitelists) and (function, per-parameter `.key`-only).
+fn collect_constructors(
+  shared: &Shared<'_>,
+  module: ModuleIdx,
+  program: &Program<'_>,
+) -> ModuleConstructors {
+  let scoping = shared.scoping(module);
+  let mut constructors = vec![];
+  // `const S = Context.Service` (or another constructor).
+  for (symbol, init) in module_consts(program) {
+    let init = strip(init);
+    if matches!(init, Expression::Identifier(_) | Expression::StaticMemberExpression(_)) {
+      if let Some(index) = shared.constructor_of(module, init) {
+        constructors.push(((module, symbol).into(), index, init.span().start));
+      }
+    }
+  }
+  let mut readers = vec![];
+  for (symbol, function) in module_functions(program) {
+    if scoping.symbol_is_mutated(symbol) {
+      continue;
+    }
+    let Some(params) = function.plain_params() else { continue };
+    // `(id) => Context.Service(id)` and `(id) => Context.Service<..>()(id)`.
+    if let Some(Expression::CallExpression(call)) = function.returned().map(strip) {
+      let creates = match strip(&call.callee) {
+        Expression::CallExpression(inner) if inner.arguments.is_empty() => {
+          shared.constructor_of(module, &inner.callee) == Some(KeyConstructor::Service)
+        }
+        callee => shared.constructor_of(module, callee) == Some(KeyConstructor::Service),
+      };
+      let param = call.arguments.first().and_then(Argument::as_expression).and_then(|argument| {
+        let Expression::Identifier(ident) = strip(argument) else { return None };
+        let reference = ident.reference_id.get()?;
+        let bound = scoping.get_reference(reference).symbol_id()?;
+        params.iter().position(|p| *p == bound)
+      });
+      if let (true, Some(index)) = (creates, param) {
+        constructors.push((
+          (module, symbol).into(),
+          KeyConstructor::Wrapper(index),
+          call.callee.span().start,
+        ));
+      }
+    }
+    let mut reads =
+      KeyReads { scoping, params: params.clone(), ok: vec![true; params.len()], path: vec![] };
+    if function.walk_body(&mut reads) {
+      readers.push(((module, symbol).into(), reads.ok));
+    }
+  }
+  (constructors, readers)
 }
 
 /// Pass A: service keys and functions that never read `this`.
@@ -1074,7 +1361,16 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// in untrusted code: code-loader names, reflective reads and the global
   /// `Reflect` used as a value.
   fn check_member(&mut self, object: &Expression<'a>, name: Option<&str>, span: Span) {
-    self.check_member_name(name, span);
+    // `process.getBuiltinModule("node:async_hooks")` and similar load no code;
+    // a loader-named property of a local object literal is that literal's own.
+    let loader_exempt = match name {
+      Some("getBuiltinModule" | "require") => self.safe_builtin_call(span),
+      Some(name) => name != "constructor" && self.literal_object(object),
+      None => false,
+    };
+    if !loader_exempt {
+      self.check_member_name(name, span);
+    }
     if let Some(name) = name {
       self.check_reflective_read(object, name, span);
       if name == "Reflect" && self.on_global_object(object) {
@@ -1815,6 +2111,10 @@ impl<'a> UseCollector<'_, '_, 'a> {
     let name = ident.name.as_str();
     match resolved {
       None if ident.reference_id.get().is_some() => match name {
+        // `Function.prototype` read in place is the prototype object, not a call.
+        "Function" if self.prototype_read(ident.span) => {}
+        // `require("node:events")`: a builtin that loads no code.
+        "require" if self.safe_builtin_call(ident.span) => {}
         "eval" | "Function" | "require" => {
           self.bail_global(ident.span, &format!("`{name}` may run code outside the bundle"));
         }
@@ -1833,6 +2133,46 @@ impl<'a> UseCollector<'_, '_, 'a> {
     }
   }
 
+  /// Whether the expression at `span` is the object of a `.prototype` read that
+  /// is not written.
+  fn prototype_read(&self, span: Span) -> bool {
+    matches!(self.parent(0), Some(AstKind::StaticMemberExpression(member))
+      if member.object.span() == span && member.property.name == "prototype")
+      && !self.is_write_target(1)
+  }
+
+  /// Whether the expression at `span` is called with one constant specifier
+  /// naming a Node builtin that cannot load code.
+  fn safe_builtin_call(&self, span: Span) -> bool {
+    let Some(AstKind::CallExpression(call)) = self.parent(0) else { return false };
+    if call.callee.span() != span || call.arguments.len() != 1 {
+      return false;
+    }
+    let Some(specifier) = call.arguments[0]
+      .as_expression()
+      .and_then(|argument| self.shared.const_string(self.module, argument))
+    else {
+      return false;
+    };
+    let name = bare_module_name(&specifier);
+    NODE_BUILTINS.contains(&name)
+      && !CODE_LOADING_MODULES.contains(&name)
+      && !matches!(name, "process" | "worker_threads")
+  }
+
+  /// Whether `object` is a module-level `const` bound to an object literal,
+  /// whose members are its own properties rather than a host object's.
+  fn literal_object(&self, object: &Expression<'a>) -> bool {
+    let Expression::Identifier(ident) = strip(object) else { return false };
+    let symbol = ident
+      .reference_id
+      .get()
+      .and_then(|reference| self.shared.scoping(self.module).get_reference(reference).symbol_id());
+    symbol
+      .and_then(|symbol| self.module_consts.get(&symbol))
+      .is_some_and(|init| matches!(strip(init), Expression::ObjectExpression(_)))
+  }
+
   /// Untrusted reference to a trusted export.
   fn check_api(&mut self, resolved: Option<Resolved>, span: Span) {
     let Some(Resolved::Symbol(symbol)) = resolved else { return };
@@ -1846,7 +2186,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
       && !self.shared.key_creations.contains(&(self.module, span.start))
     {
       self.bail_global(span, &format!("`{name}` used other than to declare a service key"));
-    } else if CONTEXT_INTERNAL_APIS.contains(&name.as_str()) {
+    } else if CONTEXT_INTERNAL_APIS.contains(&name.as_str())
+      && !self.handled_lookups.contains(&span.start)
+    {
       self.bail_global(span, &format!("`{name}` reads Context internals"));
     } else if KEYED_LOOKUPS.contains(&name.as_str()) && !self.handled_lookups.contains(&span.start)
     {
@@ -1855,7 +2197,68 @@ impl<'a> UseCollector<'_, '_, 'a> {
     }
   }
 
+  /// A use of a key constructor alias or wrapper other than the declarations
+  /// and wrapper bodies pass A recognised.
+  fn check_constructor_use(
+    &mut self,
+    constructor: KeyConstructor,
+    use_span: Span,
+    use_depth: usize,
+  ) {
+    if self.shared.key_creations.contains(&(self.module, use_span.start)) {
+      return;
+    }
+    let call = match self.parent(use_depth) {
+      Some(AstKind::CallExpression(call)) if call.callee.span() == use_span => {
+        // The curried alias form `S<..>()("key")` has the key on the outer call.
+        let creation = match (constructor, call.arguments.is_empty(), self.parent(use_depth + 1)) {
+          (KeyConstructor::Service, true, Some(AstKind::CallExpression(outer)))
+            if outer.callee.span() == call.span =>
+          {
+            outer
+          }
+          _ => call,
+        };
+        Some(
+          creation
+            .arguments
+            .get(constructor.key_index())
+            .and_then(Argument::as_expression)
+            .and_then(|argument| self.shared.const_string(self.module, argument)),
+        )
+      }
+      _ => None,
+    };
+    match call {
+      Some(Some(key)) => self.bail_key(&key, use_span, "service key created outside a declaration"),
+      _ if self.trusted => {}
+      Some(None) => self.bail_global(use_span, "service key with a dynamic key string"),
+      None => self.bail_global(use_span, "service key constructor used as a value"),
+    }
+  }
+
+  /// A key passed to a module-level function whose parameter is only read as
+  /// `param.key`: the code cannot change or leak the key.
+  fn passed_to_key_reader(&self, use_span: Span, use_depth: usize) -> bool {
+    let Some(AstKind::CallExpression(call)) = self.parent(use_depth) else { return false };
+    let Some(position) = call.arguments.iter().position(|argument| argument.span() == use_span)
+    else {
+      return false;
+    };
+    if call.arguments[..position]
+      .iter()
+      .any(|argument| matches!(argument, Argument::SpreadElement(_)))
+    {
+      return false;
+    }
+    matches!(self.shared.resolve_expr(self.module, &call.callee), Some(Resolved::Symbol(f))
+      if self.shared.key_readers.get(&f).is_some_and(|ok| ok.get(position) == Some(&true)))
+  }
+
   fn classify_key_reference(&mut self, key: &str, use_span: Span, use_depth: usize) {
+    if self.passed_to_key_reader(use_span, use_depth) {
+      return;
+    }
     if !self.classified.contains(&use_span.start) {
       let parent = match self.parent(use_depth) {
         Some(kind) => format!("{kind:?}").split('(').next().unwrap_or_default().to_string(),
@@ -1999,6 +2402,17 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
         self.handled_lookups.insert(it.callee.span().start);
       }
     }
+    // `Context.getOrUndefinedUnsafe(context, "key")` reads only the service with
+    // that key string, which keeps every method.
+    if api == Some("Context.getOrUndefinedUnsafe") && !spread && it.arguments.len() == 2 {
+      let key = it.arguments[1]
+        .as_expression()
+        .and_then(|argument| self.shared.const_string(self.module, argument));
+      if let Some(key) = key {
+        self.bail_key(&key, it.span, "service read by its key string");
+        self.handled_lookups.insert(it.callee.span().start);
+      }
+    }
     if let Some(kind @ ("Layer.succeed" | "Layer.effect")) = api {
       let key = it.arguments.first().and_then(Argument::as_expression).and_then(|first| {
         self.shared.key_of(self.module, first).cloned().map(|key| (key, strip(first).span()))
@@ -2032,7 +2446,12 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
           _ => it,
         };
         let trusted = self.trusted;
-        match key_string(creation_call) {
+        let key = creation_call
+          .arguments
+          .first()
+          .and_then(Argument::as_expression)
+          .and_then(|argument| self.shared.const_string(self.module, argument));
+        match key {
           Some(key) => self.bail_key(&key, it.span, "service key created outside a declaration"),
           // Effect's own modules create keys from constants or arguments.
           None if trusted => {}
@@ -2167,6 +2586,11 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       },
       None => (None, it.span, 0),
     };
+    if let Some(index) =
+      key_symbol.and_then(|symbol| self.shared.key_constructors.get(&symbol).copied())
+    {
+      self.check_constructor_use(index, use_span, use_depth);
+    }
     if let Some(key) = key_symbol.and_then(|symbol| self.shared.keys.get(&symbol)).cloned() {
       // Writes to a key's members can change what other keys resolve to.
       let (member_written, static_read) = match self.parent(use_depth) {
@@ -2392,11 +2816,45 @@ impl LinkStage<'_> {
       const_strings: FxHashMap::default(),
       key_statics: FxHashMap::default(),
       builders: FxHashMap::default(),
+      key_constructors: FxHashMap::default(),
+      key_readers: FxHashMap::default(),
     };
 
-    // == pass A: keys
     let normal_modules: Vec<ModuleIdx> =
       self.module_table.modules.iter().filter_map(|m| m.as_normal().map(|n| n.idx)).collect();
+
+    // == key constructors: aliases of `Context.Service` and wrappers creating a
+    // key from a parameter, through aliases of aliases, to a fixpoint.
+    let mut constructor_sites: FxHashSet<(ModuleIdx, u32)> = FxHashSet::default();
+    loop {
+      let mut found = vec![];
+      let mut readers = vec![];
+      for module in &normal_modules {
+        let Some(ast) = self.ast_table[*module].as_ref() else { continue };
+        ast.program.with_dependent(|_owner, dep| {
+          let (constructors, module_readers) = collect_constructors(&shared, *module, &dep.program);
+          found.extend(constructors.into_iter().map(|c| (*module, c)));
+          readers.extend(module_readers);
+        });
+      }
+      let mut changed = false;
+      for (module, (symbol, index, site)) in found {
+        let symbol = shared.symbols.canonical_ref_for(symbol);
+        constructor_sites.insert((module, site));
+        changed |= shared.key_constructors.insert(symbol, index).is_none();
+      }
+      for (symbol, ok) in readers {
+        shared.key_readers.insert(shared.symbols.canonical_ref_for(symbol), ok);
+      }
+      if !changed {
+        break;
+      }
+    }
+    shared.key_creations.extend(constructor_sites);
+    // Top-level statement spans, to place a bailout in its statement.
+    let mut statement_spans: FxHashMap<ModuleIdx, Vec<Span>> = FxHashMap::default();
+
+    // == pass A: keys
     let mut key_creations = vec![];
     let mut key_statics = vec![];
     let mut builders = vec![];
@@ -2417,6 +2875,7 @@ impl LinkStage<'_> {
           kind: VariableDeclarationKind::Var,
         };
         collector.visit_program(&dep.program);
+        statement_spans.insert(*module, dep.program.body.iter().map(GetSpan::span).collect());
         key_creations.extend(collector.keys.into_iter().map(|key| (*module, key)));
         key_statics.extend(collector.key_statics);
         builders.extend(collector.builders.into_iter().map(|builder| (*module, builder)));
@@ -2462,18 +2921,31 @@ impl LinkStage<'_> {
     let mut dynamic_keys = vec![];
     for (module, (symbol, key, callee_start)) in key_creations {
       shared.key_creations.insert((module, callee_start));
+      let key = match key {
+        KeyCreation::Parts(parts) => parts
+          .iter()
+          .try_fold(String::new(), |mut out, part| {
+            match part {
+              StringPart::Literal(literal) => out.push_str(literal),
+              StringPart::Binding(binding) => out.push_str(shared.const_strings.get(binding)?),
+            }
+            Some(out)
+          })
+          .map_or(KeyCreation::Dynamic, KeyCreation::Literal),
+        key => key,
+      };
       match key {
         KeyCreation::Literal(key) => {
           shared.keys.insert(shared.symbols.canonical_ref_for(symbol), key);
         }
-        KeyCreation::Dynamic => dynamic_keys.push(module),
+        KeyCreation::Parts(_) | KeyCreation::Dynamic => dynamic_keys.push((module, callee_start)),
       }
     }
-    for module in dynamic_keys {
+    for (module, callee_start) in dynamic_keys {
       if shared.prefixes[module.index()].is_none() {
         report.global_bailouts.push(Bailout::at(
           module,
-          0,
+          callee_start,
           "service key with a dynamic key string".to_string(),
         ));
       }
@@ -2542,6 +3014,25 @@ impl LinkStage<'_> {
         refs.insert(*module, collector.refs);
         namespace_refs.extend(collector.namespace_refs);
       });
+    }
+
+    // A bailout only matters in code that can run: drop those in top-level
+    // statements outside a superset of what Rolldown includes.
+    if let Some(live) = self.effect_service_live_statements(&shared.namespaces) {
+      let is_live = |bailout: &Bailout| {
+        let Some((module, offset)) = bailout.site else { return true };
+        let statement = statement_spans.get(&module).and_then(|spans| {
+          spans.iter().position(|span| span.start <= offset && offset < span.end)
+        });
+        match (statement, live.get(&module)) {
+          (Some(index), Some(flags)) => flags.get(index + 1).copied().unwrap_or(true),
+          _ => true,
+        }
+      };
+      let (kept, dead): (Vec<_>, Vec<_>) =
+        std::mem::take(&mut report.global_bailouts).into_iter().partition(is_live);
+      report.global_bailouts = kept;
+      report.dead_bailouts = dead;
     }
 
     let mut demand: FxHashMap<String, Demand> = FxHashMap::default();
@@ -2852,6 +3343,7 @@ impl LinkStage<'_> {
     #[expect(clippy::print_stderr, reason = "opt-in report for measuring the experimental pass")]
     if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some() {
       eprintln!("[effect-service-shaking] global bailouts: {:#?}", report.global_bailouts);
+      eprintln!("[effect-service-shaking] bailouts in dead code: {:#?}", report.dead_bailouts);
       eprintln!("[effect-service-shaking] key bailouts: {:#?}", report.key_bailouts);
       eprintln!("[effect-service-shaking] removed: {:#?}", report.removed);
       let mut demand: Vec<_> = demand
@@ -2865,6 +3357,90 @@ impl LinkStage<'_> {
       demand.sort();
       eprintln!("[effect-service-shaking] demand: {demand:#?}");
     }
+  }
+
+  /// A superset of the top-level statements Rolldown can include, per module and
+  /// indexed like `stmt_infos`: statements with side effects, and every
+  /// statement declaring a symbol that a live statement references, followed to
+  /// its canonical declaration. Wrapped modules, the runtime, namespace objects
+  /// and `import()` or `require` targets count as wholly live. `None` without
+  /// tree shaking, where every statement is kept.
+  fn effect_service_live_statements(
+    &self,
+    namespaces: &FxHashMap<SymbolRef, ModuleIdx>,
+  ) -> Option<FxHashMap<ModuleIdx, Vec<bool>>> {
+    fn mark(
+      live: &mut FxHashMap<ModuleIdx, Vec<bool>>,
+      pending: &mut Vec<(ModuleIdx, usize)>,
+      module: ModuleIdx,
+      statement: usize,
+    ) {
+      if let Some(flag) = live.get_mut(&module).and_then(|flags| flags.get_mut(statement)) {
+        if !*flag {
+          *flag = true;
+          pending.push((module, statement));
+        }
+      }
+    }
+    fn mark_module(
+      live: &mut FxHashMap<ModuleIdx, Vec<bool>>,
+      pending: &mut Vec<(ModuleIdx, usize)>,
+      module: ModuleIdx,
+    ) {
+      let count = live.get(&module).map_or(0, Vec::len);
+      for statement in 0..count {
+        mark(live, pending, module, statement);
+      }
+    }
+    self.options.treeshake.as_ref()?;
+    let mut live: FxHashMap<ModuleIdx, Vec<bool>> = FxHashMap::default();
+    for module in &self.module_table.modules {
+      if let Some(normal) = module.as_normal() {
+        live.insert(normal.idx, vec![false; self.stmt_infos[normal.idx].len()]);
+      }
+    }
+    let mut pending = vec![];
+    for module in &self.module_table.modules {
+      let Some(normal) = module.as_normal() else { continue };
+      if self.metas[normal.idx].wrap_kind() != WrapKind::None || normal.idx == self.runtime.id() {
+        mark_module(&mut live, &mut pending, normal.idx);
+        continue;
+      }
+      for (index, info) in self.stmt_infos[normal.idx].iter().enumerate() {
+        if info.eval_flags.has_side_effect_for_tree_shaking() {
+          mark(&mut live, &mut pending, normal.idx, index);
+        }
+      }
+    }
+    while let Some((module, statement)) = pending.pop() {
+      let Some(normal) = self.module_table[module].as_normal() else { continue };
+      let info = self.stmt_infos[module].get(StmtInfoIdx::new(statement));
+      for record in &info.import_records {
+        let record = &normal.import_records[*record];
+        if record.kind != ImportKind::Import {
+          if let Some(target) = record.resolved_module {
+            mark_module(&mut live, &mut pending, target);
+          }
+        }
+      }
+      for reference in &info.referenced_symbols {
+        let symbol = match reference {
+          SymbolOrMemberExprRef::Symbol(symbol) => *symbol,
+          SymbolOrMemberExprRef::MemberExpr(member) => member.object_ref,
+        };
+        for symbol in [symbol, self.symbols.canonical_ref_for(symbol)] {
+          if let Some(target) = namespaces.get(&symbol) {
+            mark_module(&mut live, &mut pending, *target);
+          }
+          if self.module_table[symbol.owner].as_normal().is_some() {
+            for declaring in self.stmt_infos[symbol.owner].declared_stmts_by_symbol(&symbol) {
+              mark(&mut live, &mut pending, symbol.owner, declaring.index());
+            }
+          }
+        }
+      }
+    }
+    Some(live)
   }
 
   /// Every reason the pass was turned off, one `EFFECT_SERVICE_SHAKING` warning
