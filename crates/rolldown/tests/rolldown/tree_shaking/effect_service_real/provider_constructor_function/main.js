@@ -7,7 +7,8 @@ import { build } from "./client.js"
 // The shape of a generated client: a class-form key, provided by
 // `Layer.effect(Key, make(options))`, where `make` is an `Effect.fnUntraced`
 // generator returning the object built by a function in another module. The
-// piped argument runs while the service is constructed.
+// piped `Effect.updateService` only changes the constructor's context, and its
+// callback runs before the constructor body.
 class Client extends Context.Service()("test/RealProviderConstructorClient") {}
 class Http extends Context.Service()("test/RealProviderConstructorHttp") {}
 
@@ -19,7 +20,10 @@ const make = Effect.fnUntraced(
     log.push(`make ${options.base}`)
     return build({ request: (path) => http.request(`${options.base}${path}`) })
   },
-  (effect) => Effect.tap(effect, () => Effect.sync(() => log.push("piped")))
+  Effect.updateService(Http, (http) => {
+    log.push("piped")
+    return http
+  })
 )
 
 const HttpLayer = Layer.succeed(Http, { request: (url) => `GET ${url}` })
@@ -31,4 +35,4 @@ const program = Effect.gen(function* () {
 })
 
 assert.deepStrictEqual(await Effect.runPromise(Effect.provide(program, ClientLayer)), "GET mock:/models")
-assert.deepStrictEqual(log, ["make mock:", "piped"])
+assert.deepStrictEqual(log, ["piped", "make mock:"])
