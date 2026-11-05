@@ -836,17 +836,16 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// the source with no hoisted function declaration between, which could run
   /// the site first, and not in another case of a switch the site is in, since
   /// jumping to a case skips the cases before it. An import may be
-  /// uninitialised through a module cycle.
+  /// uninitialised through a module cycle, even one back to its own module.
   fn initialized_at(&self, value: &Expression<'a>, site: u32) -> bool {
     let Expression::Identifier(ident) = value else { return false };
     let Some(reference) = ident.reference_id.get() else { return false };
     let scoping = self.shared.scoping(self.module);
     let Some(symbol) = scoping.get_reference(reference).symbol_id() else { return false };
-    let canonical = self.shared.symbols.canonical_ref_for((self.module, symbol).into());
-    if canonical.owner != self.module {
+    let flags = scoping.symbol_flags(symbol);
+    if flags.contains(SymbolFlags::Import) {
       return false;
     }
-    let flags = scoping.symbol_flags(symbol);
     if flags.intersects(SymbolFlags::Function | SymbolFlags::FunctionScopedVariable) {
       return true;
     }

@@ -49,7 +49,7 @@ With only `readOne` read anywhere, the pass removes `writeOne` from the provider
 
 ## What it never removes
 
-Demand is computed over code that can still run. Reads inside a removed method don't count. Anything that runs while a provider is constructed always counts. The pass deletes only object properties and unused constructor-local `const` functions. So service acquisition (`yield* Dep`), `acquireRelease` and its release, and construction-time calls keep running, in the same order. A property whose value is a binding is only removed when reading it cannot throw: the binding is a function declaration or a `var`, or a `const`, `let` or class declared earlier with no hoisted function declaration in between and not in a different case of the same `switch`. An imported binding is always kept, because a module cycle can leave it uninitialised.
+Demand is computed over code that can still run. Reads inside a removed method don't count. Anything that runs while a provider is constructed always counts. The pass deletes only object properties and unused constructor-local `const` functions. So service acquisition (`yield* Dep`), `acquireRelease` and its release, and construction-time calls keep running, in the same order. A property whose value is a binding is only removed when reading it cannot throw: the binding is a function declaration or a `var`, or a `const`, `let` or class declared earlier with no hoisted function declaration in between and not in a different case of the same `switch`. An imported binding is always kept, because a module cycle can leave it uninitialised. This includes an import that resolves back to its own module, for example through a barrel that re-exports it.
 
 ## When it keeps everything
 
