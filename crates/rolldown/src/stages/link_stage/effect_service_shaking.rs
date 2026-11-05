@@ -43,9 +43,9 @@ use oxc::{
       Argument, AssignmentTargetPropertyIdentifier, AssignmentTargetPropertyProperty,
       BinaryOperator, BindingPattern, BindingProperty, CallExpression, Class, ClassElement,
       ComputedMemberExpression, Declaration, Expression, Function, FunctionBody, FunctionType,
-      IdentifierReference, ImportExpression, ObjectExpression, ObjectPropertyKind, PropertyKey,
-      PropertyKind, Statement, StaticMemberExpression, UnaryOperator, VariableDeclarationKind,
-      VariableDeclarator, YieldExpression,
+      IdentifierReference, ImportExpression, ObjectExpression, ObjectPropertyKind, Program,
+      PropertyKey, PropertyKind, Statement, StaticMemberExpression, UnaryOperator,
+      VariableDeclarationKind, VariableDeclarator, YieldExpression,
     },
   },
   ast_visit::{VisitJs, VisitJsMut, walk_js, walk_js_mut},
@@ -359,10 +359,24 @@ struct Site {
   via: Vec<SymbolRef>,
 }
 
-/// A provider object literal found in an Effect expression: (module, span
-/// start, locals bound to it before it reaches a Context, keep every property,
-/// functions it is returned through).
-type FoundSite = (ModuleIdx, u32, Vec<SymbolRef>, bool, Vec<SymbolRef>);
+/// A provider object literal found in an Effect expression.
+struct FoundSite {
+  module: ModuleIdx,
+  /// Span start of the literal.
+  start: u32,
+  /// Locals bound to the object before it reaches a Context.
+  bindings: Vec<SymbolRef>,
+  /// Keep every property.
+  top: bool,
+  /// Constructor and builder functions the object is returned through.
+  via: Vec<SymbolRef>,
+}
+
+impl FoundSite {
+  fn literal(module: ModuleIdx, start: u32, via: Vec<SymbolRef>) -> Self {
+    FoundSite { module, start, bindings: vec![], top: false, via }
+  }
+}
 
 /// Reads of a provider object through locals bound before it reaches a
 /// Context: (site, (name, guards) list, escaped).
@@ -699,6 +713,34 @@ fn class_key_statics(class: &Class<'_>) -> Option<FxHashSet<String>> {
     .collect()
 }
 
+/// Initialisers of a module's module-level `const` bindings, exported or not.
+fn module_consts<'a>(program: &'a Program<'a>) -> FxHashMap<SymbolId, &'a Expression<'a>> {
+  let mut consts = FxHashMap::default();
+  for statement in &program.body {
+    let declaration = match statement {
+      Statement::VariableDeclaration(declaration) => declaration,
+      Statement::ExportDeclaration(export) => match &export.declaration {
+        Declaration::VariableDeclaration(declaration) => declaration,
+        _ => continue,
+      },
+      _ => continue,
+    };
+    if declaration.kind != VariableDeclarationKind::Const {
+      continue;
+    }
+    for declarator in &declaration.declarations {
+      if let (BindingPattern::BindingIdentifier(id), Some(init)) =
+        (&declarator.id, &declarator.init)
+      {
+        if let Some(symbol) = id.symbol_id.get() {
+          consts.insert(symbol, init);
+        }
+      }
+    }
+  }
+  consts
+}
+
 /// Span starts of the object literals a function body returns, when every
 /// return is an object literal.
 fn object_returns(body: &FunctionBody<'_>) -> Option<Vec<u32>> {
@@ -995,14 +1037,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
   fn is_global_reflect(&self, expr: &Expression<'a>) -> bool {
     match strip(expr) {
       Expression::Identifier(ident) => ident.name == "Reflect" && self.is_global_value(expr),
-      Expression::StaticMemberExpression(member) => {
-        member.property.name == "Reflect" && self.on_global_object(&member.object)
-      }
-      Expression::ComputedMemberExpression(member) => {
-        self.shared.const_string(self.module, &member.expression).as_deref() == Some("Reflect")
-          && self.on_global_object(&member.object)
-      }
-      _ => false,
+      _ => self
+        .constant_member(expr)
+        .is_some_and(|(object, name)| name == "Reflect" && self.on_global_object(object)),
     }
   }
 
@@ -1013,18 +1050,36 @@ impl<'a> UseCollector<'_, '_, 'a> {
       Expression::Identifier(ident) => {
         GLOBAL_OBJECTS.contains(&ident.name.as_str()) && self.is_global_value(expr)
       }
+      _ => self.constant_member(expr).is_some_and(|(object, name)| {
+        GLOBAL_OBJECTS.contains(&name.as_str()) && self.on_global_object(object)
+      }),
+    }
+  }
+
+  /// A static member read, or a computed one with a constant name: the object
+  /// and the name.
+  fn constant_member<'b>(&self, expr: &'b Expression<'a>) -> Option<(&'b Expression<'a>, String)> {
+    match strip(expr) {
       Expression::StaticMemberExpression(member) => {
-        GLOBAL_OBJECTS.contains(&member.property.name.as_str())
-          && self.on_global_object(&member.object)
+        Some((&member.object, member.property.name.to_string()))
       }
       Expression::ComputedMemberExpression(member) => {
-        self
-          .shared
-          .const_string(self.module, &member.expression)
-          .is_some_and(|name| GLOBAL_OBJECTS.contains(&name.as_str()))
-          && self.on_global_object(&member.object)
+        Some((&member.object, self.shared.const_string(self.module, &member.expression)?))
       }
-      _ => false,
+      _ => None,
+    }
+  }
+
+  /// A static member, or a computed one with a constant name, read or written
+  /// in untrusted code: code-loader names, reflective reads and the global
+  /// `Reflect` used as a value.
+  fn check_member(&mut self, object: &Expression<'a>, name: Option<&str>, span: Span) {
+    self.check_member_name(name, span);
+    if let Some(name) = name {
+      self.check_reflective_read(object, name, span);
+      if name == "Reflect" && self.on_global_object(object) {
+        self.check_reflect_value(span);
+      }
     }
   }
 
@@ -1123,6 +1178,10 @@ impl<'a> UseCollector<'_, '_, 'a> {
       return false;
     }
     let declared = scoping.symbol_span(symbol);
+    // The site runs the right-hand side of a loop whose head declares the binding.
+    let in_loop_head = |left: Span, right: Span| {
+      left.contains_inclusive(declared) && (right.start..right.end).contains(&site)
+    };
     // Parameters share the `var` flag, but a default runs before its own
     // parameter and the later ones are initialised.
     if self.path.iter().any(|kind| {
@@ -1153,14 +1212,8 @@ impl<'a> UseCollector<'_, '_, 'a> {
         AstKind::CatchParameter(param) => !param.pattern.span().contains_inclusive(declared),
         // A lexical loop-head binding is uninitialised while the loop's
         // right-hand side runs.
-        AstKind::ForOfStatement(stmt) => {
-          !(stmt.left.span().contains_inclusive(declared)
-            && (stmt.right.span().start..stmt.right.span().end).contains(&site))
-        }
-        AstKind::ForInStatement(stmt) => {
-          !(stmt.left.span().contains_inclusive(declared)
-            && (stmt.right.span().start..stmt.right.span().end).contains(&site))
-        }
+        AstKind::ForOfStatement(stmt) => !in_loop_head(stmt.left.span(), stmt.right.span()),
+        AstKind::ForInStatement(stmt) => !in_loop_head(stmt.left.span(), stmt.right.span()),
         _ => true,
       })
       && self.path.windows(2).all(|pair| match pair {
@@ -1417,9 +1470,10 @@ impl<'a> UseCollector<'_, '_, 'a> {
           _ => (None, true),
         };
         // Nested acquisitions keep the readers of every level.
-        for (module, span, mut bindings, existing_top, via) in acquired {
-          bindings.extend(binding);
-          found.push((module, span, bindings, existing_top || top, via));
+        for mut site in acquired {
+          site.bindings.extend(binding);
+          site.top |= top;
+          found.push(site);
         }
         complete
       }
@@ -1445,9 +1499,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
         let complete = self.return_sites(generator, true, &mut returned);
         self.constructors_in_progress.pop();
         self.accounted.push((self.module, call.callee.span().start));
-        for (module, span, bindings, top, mut via) in returned {
-          via.push(symbol);
-          found.push((module, span, bindings, top, via));
+        for mut site in returned {
+          site.via.push(symbol);
+          found.push(site);
         }
         complete
       }
@@ -1540,7 +1594,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
   fn value_sites(&mut self, value: &Expression<'a>, found: &mut Vec<FoundSite>) -> bool {
     match strip(value) {
       Expression::ObjectExpression(object) => {
-        found.push((self.module, object.span.start, vec![], false, vec![]));
+        found.push(FoundSite::literal(self.module, object.span.start, vec![]));
         true
       }
       Expression::CallExpression(call) => {
@@ -1551,7 +1605,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
           if let Some((module, starts)) = self.shared.builders.get(&symbol) {
             self.accounted.push((self.module, call.callee.span().start));
             for start in starts {
-              found.push((*module, *start, vec![], false, vec![symbol]));
+              found.push(FoundSite::literal(*module, *start, vec![symbol]));
             }
             return true;
           }
@@ -1583,11 +1637,10 @@ impl<'a> UseCollector<'_, '_, 'a> {
       self.effect_sites(value, &mut found);
     }
     let cycle = std::mem::take(&mut self.constructor_cycle);
-    for (module, start, bindings, top, via) in found {
-      let top = top || cycle;
-      let index = *self.site_spans.entry((module, start)).or_insert_with(|| {
+    for found in found {
+      let index = *self.site_spans.entry((found.module, found.start)).or_insert_with(|| {
         self.sites.push(Site {
-          module,
+          module: found.module,
           keys: FxHashSet::default(),
           props: vec![],
           top: false,
@@ -1598,9 +1651,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
       });
       let site = &mut self.sites[index];
       site.keys.insert(key.to_string());
-      site.top |= top;
-      site.bindings.extend(bindings);
-      for symbol in via {
+      site.top |= found.top || cycle;
+      site.bindings.extend(found.bindings);
+      for symbol in found.via {
         if !site.via.contains(&symbol) {
           site.via.push(symbol);
         }
@@ -2142,11 +2195,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     if !self.trusted
       && !matches!(self.shared.resolve_expr(self.module, &it.object), Some(Resolved::Namespace(_)))
     {
-      self.check_member_name(Some(it.property.name.as_str()), it.span);
-      self.check_reflective_read(&it.object, it.property.name.as_str(), it.span);
-      if it.property.name == "Reflect" && self.on_global_object(&it.object) {
-        self.check_reflect_value(it.span);
-      }
+      self.check_member(&it.object, Some(it.property.name.as_str()), it.span);
       // A1 assumes builtins are not modified; writes to their prototypes are
       // cheap to see, so they turn the pass off instead.
       if it.property.name == "prototype"
@@ -2162,13 +2211,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
   fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
     if !self.trusted {
       let name = self.shared.const_string(self.module, &it.expression);
-      self.check_member_name(name.as_deref(), it.span);
-      if let Some(name) = name {
-        self.check_reflective_read(&it.object, &name, it.span);
-        if name == "Reflect" && self.on_global_object(&it.object) {
-          self.check_reflect_value(it.span);
-        }
-      }
+      self.check_member(&it.object, name.as_deref(), it.span);
     }
     walk_js::walk_computed_member_expression(self, it);
   }
@@ -2466,29 +2509,6 @@ impl LinkStage<'_> {
       // Rolldown's own runtime module is trusted like the effect package.
       let trusted = shared.prefixes[module.index()].is_some() || *module == self.runtime.id();
       ast.program.with_dependent(|_owner, dep| {
-        let mut module_consts = FxHashMap::default();
-        for statement in &dep.program.body {
-          let declaration = match statement {
-            Statement::VariableDeclaration(declaration) => declaration,
-            Statement::ExportDeclaration(export) => match &export.declaration {
-              Declaration::VariableDeclaration(declaration) => declaration,
-              _ => continue,
-            },
-            _ => continue,
-          };
-          if declaration.kind != VariableDeclarationKind::Const {
-            continue;
-          }
-          for declarator in &declaration.declarations {
-            if let (BindingPattern::BindingIdentifier(id), Some(init)) =
-              (&declarator.id, &declarator.init)
-            {
-              if let Some(symbol) = id.symbol_id.get() {
-                module_consts.insert(symbol, init);
-              }
-            }
-          }
-        }
         let mut collector = UseCollector {
           shared: &shared,
           module: *module,
@@ -2501,7 +2521,7 @@ impl LinkStage<'_> {
           classified: FxHashSet::default(),
           site_spans: &mut site_spans,
           sites: &mut sites,
-          module_consts,
+          module_consts: module_consts(&dep.program),
           accounted: vec![],
           handled_lookups: FxHashSet::default(),
           constructors_in_progress: vec![],
