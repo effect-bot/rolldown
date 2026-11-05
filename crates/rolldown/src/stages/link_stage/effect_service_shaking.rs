@@ -1477,7 +1477,16 @@ impl<'a> UseCollector<'_, '_, 'a> {
         }
       }
       Expression::FunctionExpression(f) if f.generator == generator && !f.r#async => {
-        let Some(body) = &f.body else { return false };
+        // A named function expression can hand itself out through its own
+        // name, and each call builds another object from the same literal.
+        // A name nothing references, kept for stack traces, is harmless.
+        let scoping = self.shared.scoping(self.module);
+        let referenced = f.id.as_ref().is_some_and(|id| {
+          id.symbol_id
+            .get()
+            .is_none_or(|symbol| !scoping.get_resolved_reference_ids(symbol).is_empty())
+        });
+        let Some(body) = f.body.as_ref().filter(|_| !referenced) else { return false };
         body
       }
       _ => return false,
