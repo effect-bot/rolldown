@@ -1,9 +1,0 @@
-{
-  "_comment": "Uses the real effect package from the repository devDependencies.",
-  "config": {
-    "experimental": {
-      "effectServiceShaking": true
-    }
-  },
-  "extendedTests": false
-}
