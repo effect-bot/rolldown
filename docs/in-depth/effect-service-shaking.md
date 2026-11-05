@@ -16,11 +16,12 @@ export default {
 
 ## What it handles
 
-Service keys are module-level declarations with a literal key string, as a `const` or a class whose body never mentions `this` or `super`:
+Service keys are module-level declarations with a literal key string, as a `const` or a class whose body never mentions `this` or `super`. The class may also be a class expression bound to a module-level binding that is never reassigned, as bundlers emit class declarations, provided the class's own name, if any, is never referenced:
 
 ```js
 const Store = Context.Service('app/Store');
 class Client extends Context.Service<Client, Shape>()('app/Client') {}
+var Cache = class extends Context.Service()('app/Cache') {};
 ```
 
 A class key's body may declare only static members with constant names, and none of them may redeclare what the key inherits from `Context.Service`: `of`, `key`, `use`, `useSync`, `context`, `pipe`, `toJSON`, `toString`, `name`, `length`, `prototype`, `caller`, `arguments`, `constructor`, the other `Object.prototype` members, or a `~` id. Any other class extending `Context.Service` turns the pass off. A class key's own static members (`OpenAiConfig.getOrUndefined`) may be read; other uses of the key follow the rules below.
@@ -84,7 +85,24 @@ A service keeps every method when:
 - it is looked up other than by `yield*` with the key itself: `Context.get(context, Key)`, `Effect.updateService(Key, f)`, `Effect.provideService(Key, value)` and the other lookups listed below;
 - its Layer may leave the bundle or be used in an unrecognised way.
 
-Everything else in Effect is allowed and ignored: forks, joins, run options, `Effect.map`, `Effect.all`, loggers, Schema, Stream, retries and timeouts. Holding a Fiber or a Context is fine; the contract below rules out reflecting on them.
+Everything else in Effect is allowed: forks, joins, run options, `Effect.map`, `Effect.all`, loggers, Schema, Stream, retries and timeouts. Reads through Effect's runtime objects are analysed (next section).
+
+## Runtime objects
+
+Outside a keyed lookup, a service leaves a Context only through an object that holds one. Code outside Effect's own modules gets such an object only from these sources, read from effect 4.1.2's implementation:
+- `Effect.context()`, `contextWith`, `withFiber`, `withFiberSucceed`, `Effect.fiber`, `Fiber.getCurrent`, `updateContext`, `Layer.build*`, memo maps, `Layer.flatMap`/`tap`/`fromBuild*` callbacks, `ManagedRuntime.make`, and the modules `FiberHandle`, `FiberMap`, `FiberSet`, `RequestResolver`, `Cache`, `RcMap`, `LayerMap` and `LayerRef`;
+- Fibers from `fork*` and `runFork`, and fibers handed to callbacks by `Logger.make`, `Tracer.make`, `Runtime.makeRunMain`, `ErrorReporter.make` and the race `onWinner` options;
+- `Context.Service` used other than to declare a key, whose value yields a service;
+- members of the global object other than builtins: while a fiber runs, Effect keeps it in `globalThis["~effect/Fiber/currentFiber"]` (`internal/effect.js`, `runLoop`);
+- errors from `runSync` of an asynchronous Effect, which hold the fiber.
+
+Every other Effect API passes on what it was given. The analysis (`effect_service_shaking/reach.rs`) is a flow-insensitive abstract interpretation of the program. A value records whether it may be or contain a runtime object, whether what it succeeds with (as an Effect, a Promise or a Fiber) may, and whether the success of that success may. So `Effect.map(load, f)`, `Fiber.join(yield* Effect.forkChild(e))` and `await Effect.runPromise(e)` keep their precision. Containers are not split by field. Functions are followed through direct calls, Effect callbacks, and method calls by name, where every function defined under the name counts. A keyed lookup by a declared key, including curried forms such as `Context.getOrUndefined(Key)` passed to `Effect.map`, yields the service, which is followed per key as above.
+
+On a value that may hold a runtime object:
+- a static read `x.name`, a destructured name or a constant `in` test demands that name of every service, and a numeric index demands every index-named property;
+- a read or write by a name computed at run time, reflection (`Object.keys`, `Object.assign`, object spread, `for...in`, `JSON.stringify`, `structuredClone`, `Reflect.*`), conversion to a string or number (template literals, `String`, arithmetic and comparisons, `join`, `toString`), or passing it to code the analysis cannot see (a builtin, an external import, or a callee it cannot identify once a builtin or external function has been used as a value) keeps every method of every service.
+
+Nothing turns the pass off here: the cost of a reflective read is that services keep their methods. The demand is not split by run or fiber.
 
 The pass is turned off for the whole build when user code:
 - exports anything from the entry module, or imports an external module other than a Node builtin;
@@ -99,12 +117,12 @@ The pass is turned off for the whole build when user code:
 
 The POC targets closed Effect applications. It relies on these assumptions, approved for the POC; programs that break them can be miscompiled instead of keeping methods:
 
-- **A1.** User code does not read, enumerate, serialise, format or mutate Effect runtime objects (Contexts, Fibers, Exits, Layers, Effect descriptions and their prototypes), and does not modify builtin prototypes. Services are reached only through keyed lookups.
+- **A1, replaced by analysis.** Reads through Effect's runtime objects in code outside Effect's own modules are analysed (see "Runtime objects"). Writes to builtin prototypes still turn the pass off.
 - **A2.** The entry module exports nothing but primitive constants, and external imports are host builtins. Operations that load code (`eval`, `Function`, `require`, `vm`, `module.createRequire`) turn the pass off when the compiler can name them, including through the reflective reads `Reflect.get` and `getOwnPropertyDescriptor` with a constant key. User code does not reach a code loader through a member name built at run time, such as `(() => 0)[["con", "structor"].join("")]`. This is assumed, not checked: the pass does not detect it, and a program that does it can have methods removed and then fail at run time. Excluding it keeps ordinary computed reads on values other than services and host values, such as `settings[key]` or `fibers[i]`, from turning the pass off.
-- **A3.** Effect's own modules read properties of user service values only through keyed lookups, and enumerate Context entries only under their own key prefixes. User keys don't use those prefixes.
+- **A3, not yet replaced.** Effect's own modules (`effect`, `@effect/platform-node`) are not analysed: they are assumed to read user services only through keyed lookups. The runtime-object sources above are where they hand runtime objects to the program.
 - **A4.** Services are provided and read through the same bundled copy of `effect`.
 
-Some breaches are cheap to detect and turn the pass off rather than relying on A1: the string-keyed Context APIs (`Context.getOrUndefinedUnsafe`, `Context.makeUnsafe`), keyed lookups other than `yield*` by an untracked key, `Context.Service` used other than to declare a key, and writes to builtin prototypes. Every other Effect API is allowed. A consumer or provider shape the pass doesn't model keeps every method of the key involved.
+Some breaches still turn the pass off: the string-keyed Context APIs (`Context.getOrUndefinedUnsafe`, `Context.makeUnsafe`), keyed lookups other than `yield*` by an untracked key, `Context.Service` used other than to declare a key, and writes to builtin prototypes. Every other Effect API is allowed. A consumer or provider shape the pass doesn't model keeps every method of the key involved.
 
 ## Inspecting the result
 

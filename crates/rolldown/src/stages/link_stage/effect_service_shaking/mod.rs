@@ -27,13 +27,16 @@
 //!
 //! Anything outside the base case keeps every method of the key involved.
 //!
-//! The pass relies on the POC contract (`docs/in-depth/effect-service-shaking.md`):
-//! user code reaches services only through keyed lookups and does not reflect
-//! on Effect runtime objects (A1), the program is closed (A2), Effect reads
-//! services only by key (A3), and there is one bundled `effect` (A4). The
-//! cheap syntactic breaches (code loading, entry exports, external imports,
-//! string-keyed Context APIs, keyed lookups other than `yield*` by an untracked
-//! key, builtin prototype writes) turn the pass off.
+//! Reads through Effect's runtime objects (a Context, a Fiber, a runtime) in
+//! code outside Effect's own modules are analysed by `reach`: a static read
+//! demands that name of every service, reflection keeps every method.
+//!
+//! The pass still relies on part of the POC contract
+//! (`docs/in-depth/effect-service-shaking.md`): the program is closed (A2),
+//! Effect's own modules read services only by key (A3, not yet analysed), and
+//! there is one bundled `effect` (A4). Code loading, entry exports, external
+//! imports, string-keyed Context APIs, keyed lookups other than `yield*` by an
+//! untracked key and builtin prototype writes turn the pass off.
 
 use oxc::{
   allocator::Vec as ArenaVec,
@@ -61,9 +64,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::LinkStage;
 
-// Under the POC contract (A1) user code reaches services only through keyed
-// lookups. These cheap syntactic cases turn the pass off instead of relying on it.
-//
+mod reach;
+
 // Context functions that read or build a service map by key string.
 const CONTEXT_INTERNAL_APIS: &[&str] = &["Context.getOrUndefinedUnsafe"];
 // Keyed lookups other than `yield*`: their key argument may be a key the pass
@@ -427,6 +429,8 @@ struct GuardBinding {
 #[derive(Default, Debug)]
 struct Demand {
   all: bool,
+  /// Every property named by a canonical array index.
+  numeric: bool,
   names: FxHashSet<String>,
 }
 
@@ -447,6 +451,10 @@ impl Demand {
       return true;
     }
     let mut changed = false;
+    if other.numeric && !self.numeric {
+      self.numeric = true;
+      changed = true;
+    }
     for name in &other.names {
       changed |= self.add(name);
     }
@@ -457,8 +465,15 @@ impl Demand {
     self.all = true;
     changed
   }
+  fn set_numeric(&mut self) -> bool {
+    let changed = !self.all && !self.numeric;
+    self.numeric = true;
+    changed
+  }
   fn has(&self, name: &str) -> bool {
-    self.all || self.names.contains(name)
+    self.all
+      || self.names.contains(name)
+      || (self.numeric && name.parse::<u32>().is_ok_and(|index| index.to_string() == name))
   }
 }
 
@@ -466,6 +481,8 @@ impl Demand {
 #[derive(Default, Debug)]
 struct Report {
   global_bailouts: Vec<Bailout>,
+  /// Where a runtime object is read in a way that keeps every property.
+  reach: Vec<String>,
   /// Bailouts in statements Rolldown cannot include, which never run.
   dead_bailouts: Vec<Bailout>,
   key_bailouts: Vec<(String, String)>,
@@ -1187,6 +1204,23 @@ impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
             }
           }
         }
+        // `var K = class extends Context.Service()("key") {}`, as bundlers emit
+        // class declarations: a key when the binding is never reassigned and
+        // the class's own name, if any, is never referenced.
+        if self.depth == 0 {
+          if let Expression::ClassExpression(class) = strip(init) {
+            let scoping = self.shared.scoping(self.module);
+            let inner_name_used = class.id.as_ref().is_some_and(|inner| {
+              inner
+                .symbol_id
+                .get()
+                .is_none_or(|inner| !scoping.get_resolved_reference_ids(inner).is_empty())
+            });
+            if !scoping.symbol_is_mutated(symbol) && !inner_name_used {
+              self.class_key(symbol_ref, class);
+            }
+          }
+        }
       }
     }
     walk_js::walk_variable_declarator(self, it);
@@ -1200,22 +1234,32 @@ impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
     if let (0, Some(id), Some(super_class)) = (self.depth, &it.id, super_class) {
       let scoping = self.shared.scoping(self.module);
       let symbol = id.symbol_id.get().filter(|symbol| !scoping.symbol_is_mutated(*symbol));
-      if let (Some(symbol), Some((key, callee_start))) =
-        (symbol, self.shared.key_creation(self.module, super_class))
-      {
-        let statics = class_key_statics(it);
-        if let (oxc::ast::ast::ClassType::ClassDeclaration, false, Some(statics)) =
-          (it.r#type, class_body_reads_this(it), statics)
-        {
-          let symbol_ref: SymbolRef = (self.module, symbol).into();
-          self.keys.push((symbol_ref, key, callee_start));
-          self.key_statics.push((symbol_ref, statics));
-        }
+      if let (Some(symbol), oxc::ast::ast::ClassType::ClassDeclaration) = (symbol, it.r#type) {
+        let _ = super_class;
+        self.class_key((self.module, symbol).into(), it);
       }
     }
     self.depth += 1;
     walk_js::walk_class(self, it);
     self.depth -= 1;
+  }
+}
+
+impl KeyCollector<'_, '_> {
+  /// A class bound to `symbol` that extends a key creation is a key when its
+  /// body never mentions `this` or `super` and declares only constant static
+  /// names outside the inherited protocol.
+  fn class_key(&mut self, symbol: SymbolRef, class: &Class<'_>) {
+    let Some(super_class) = class.heritage.as_ref().map(|heritage| &heritage.expression) else {
+      return;
+    };
+    let Some((key, callee_start)) = self.shared.key_creation(self.module, super_class) else {
+      return;
+    };
+    if let (false, Some(statics)) = (class_body_reads_this(class), class_key_statics(class)) {
+      self.keys.push((symbol, key, callee_start));
+      self.key_statics.push((symbol, statics));
+    }
   }
 }
 
@@ -3016,6 +3060,37 @@ impl LinkStage<'_> {
       });
     }
 
+    // == runtime objects: what reads through a Context, Fiber or runtime observe.
+    let guard_declarators: FxHashMap<(ModuleIdx, u32), SymbolRef> = guard_bindings
+      .iter()
+      .map(|binding| ((binding.symbol.owner, binding.declarator.start), binding.symbol))
+      .collect();
+    let reach_outcome = {
+      let mut programs = vec![];
+      let mut effect_programs = vec![];
+      for module in &normal_modules {
+        let Some(ast) = self.ast_table[*module].as_ref() else { continue };
+        if shared.prefixes[module.index()].is_some() {
+          effect_programs.push(ast.program());
+        } else if *module != self.runtime.id() {
+          programs.push((*module, ast.program()));
+        }
+      }
+      reach::analyse(&reach::ReachInput {
+        shared: &shared,
+        programs,
+        effect_programs,
+        site_spans: &site_spans,
+        guard_declarators: &guard_declarators,
+        externals: self
+          .module_table
+          .modules
+          .iter()
+          .filter_map(|module| module.as_external().map(|external| external.idx))
+          .collect(),
+      })
+    };
+
     // A bailout only matters in code that can run: drop those in top-level
     // statements outside a superset of what Rolldown includes.
     if let Some(live) = self.effect_service_live_statements(&shared.namespaces) {
@@ -3195,8 +3270,21 @@ impl LinkStage<'_> {
           Guard::Binding(symbol) => live_bindings.contains(symbol),
         })
       };
+    let mut reach_demand = Demand::default();
     loop {
       let mut changed = false;
+      for (event, chain, _, _) in &reach_outcome.events {
+        if live(&site_demand, &live_bindings, chain) {
+          changed |= match event {
+            reach::ReachEvent::Name(name) => reach_demand.add(name),
+            reach::ReachEvent::Numeric => reach_demand.set_numeric(),
+            reach::ReachEvent::All(_) => reach_demand.set_all(),
+          };
+        }
+      }
+      for demand in &mut site_demand {
+        changed |= demand.add_all(&reach_demand);
+      }
       for (key, name, chain) in &consumer_reads {
         if live(&site_demand, &live_bindings, chain) {
           changed |= demand.entry(key.clone()).or_default().add(name);
@@ -3237,6 +3325,14 @@ impl LinkStage<'_> {
       }
       if !changed {
         break;
+      }
+    }
+
+    for (event, chain, module, start) in &reach_outcome.events {
+      if let reach::ReachEvent::All(reason) = event {
+        if live(&site_demand, &live_bindings, chain) && report.reach.len() < 20 {
+          report.reach.push(format!("{reason} (module {module:?} at {start})"));
+        }
       }
     }
 
@@ -3345,6 +3441,13 @@ impl LinkStage<'_> {
       eprintln!("[effect-service-shaking] global bailouts: {:#?}", report.global_bailouts);
       eprintln!("[effect-service-shaking] bailouts in dead code: {:#?}", report.dead_bailouts);
       eprintln!("[effect-service-shaking] key bailouts: {:#?}", report.key_bailouts);
+      eprintln!("[effect-service-shaking] runtime objects read wholly: {:#?}", report.reach);
+      let mut names: Vec<_> = reach_demand.names.iter().cloned().collect();
+      names.sort();
+      eprintln!(
+        "[effect-service-shaking] runtime object reads: all={} numeric={} {names:?}",
+        reach_demand.all, reach_demand.numeric
+      );
       eprintln!("[effect-service-shaking] removed: {:#?}", report.removed);
       let mut demand: Vec<_> = demand
         .iter()
