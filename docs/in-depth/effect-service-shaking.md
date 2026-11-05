@@ -108,11 +108,16 @@ The pass turns off for the whole build when:
 
 A static read on a value that may hold a runtime object keeps that method on every service instead.
 
-## Assumptions
+## Contract
 
-The pass assumes that:
-- the Effect and `@effect/platform-node` packages behave as the rows describe, and don't hand runtime values to user code except through the results and callback parameters the analysis treats as unknown;
-- printed output of user data doesn't change; printing a value that may hold a runtime object turns the pass off.
+The POC targets closed Effect applications. It relies on these assumptions, approved for the POC; programs that break them can be miscompiled instead of keeping methods:
+
+- **A1.** User code does not read, enumerate, serialise, format or mutate Effect runtime objects (Contexts, Fibers, Exits, Layers, Effect descriptions and their prototypes), and does not modify builtin prototypes. Services are reached only through keyed lookups.
+- **A2.** The entry module exports nothing but primitive constants, and external imports are host builtins. Operations that load code (`eval`, `Function`, `require`, `vm`, `module.createRequire`) turn the pass off.
+- **A3.** Effect's own modules read properties of user service values only through keyed lookups, and enumerate Context entries only under their own key prefixes. User keys don't use those prefixes.
+- **A4.** Services are provided and read through the same bundled copy of `effect`.
+
+Some breaches are cheap to detect and turn the pass off rather than relying on A1: the string-keyed Context APIs (`Context.getOrUndefinedUnsafe`, `Context.makeUnsafe`), `Context.Service` used other than to declare a key, and writes to builtin prototypes. Every other Effect API is allowed. A consumer or provider shape the pass doesn't model keeps every method of the key involved.
 
 ## Inspecting the result
 
@@ -135,7 +140,7 @@ The `tree_shaking/effect_service_real` fixtures run against the published `effec
 | `run_options` | `writeOne` and its helper, with `RunOptions.onFiberStart` | the program result |
 | `retained_fiber` | `writeOne` and its helper, with a forked Fiber kept after it ends | the program result |
 
-`reflection_clean_data`, `provenance_json_clean`, `clean_builtin_callback` and `unused_host_import` enumerate, serialize and transform user data, or import a Node module without calling it, and still remove `writeOne`. `provenance_success_channel` and `provenance_numeric_index` go through `Effect.map` and `Effect.all`, which have no row, so they currently keep everything although their tests expect removal. The other fixtures in `effect_service_real` reach a service through a Context, a forged key, a patched builtin, `Inspectable` or code outside the bundle, and check that every method stays.
+`reflection_clean_data`, `provenance_json_clean`, `clean_builtin_callback`, `unused_host_import`, `provenance_success_channel` and `provenance_numeric_index` enumerate, serialise and transform user data, pass Effects through `Effect.map` and `Effect.all`, or import a Node module without calling it, and must still remove `writeOne`. `forged_key`, `builtin_prototype_write`, `node_prefixed_vm` and `host_module_loader` reach a service through a lookup by an untracked key, a patched builtin or code outside the bundle, and check that every method stays. The stub fixtures in `tree_shaking/effect_service` cover key identity, service escapes and writes, unsupported consumer shapes, provider shapes, lifecycle and the A2 boundary.
 
 Once the `effect-verify` profile is built, `cargo test --profile effect-verify -p rolldown --test integration -- effect_service` runs every fixture in about 4 seconds. CI fails the step if it takes longer than 10 seconds.
 
