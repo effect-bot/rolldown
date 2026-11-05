@@ -727,7 +727,56 @@ impl<'a> UseCollector<'_, '_, 'a> {
     } else {
       key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
     };
-    self.check_member_name(name.as_deref(), span);
+    self.check_destructured_name(name.as_deref(), span);
+  }
+
+  fn check_destructured_name(&mut self, name: Option<&str>, span: Span) {
+    self.check_member_name(name, span);
+    if name == Some("getOwnPropertyDescriptor") {
+      self.bail_global(span, "`getOwnPropertyDescriptor` used as a value");
+    }
+  }
+
+  /// `Reflect.get` and `getOwnPropertyDescriptor` read the property named by
+  /// their second argument, so a constant loader name there is checked like a
+  /// member name. Used any other way, the name they will read is unknown.
+  fn check_reflective_read(&mut self, object: &Expression<'a>, name: &str, span: Span) {
+    let reflect_get = name == "get"
+      && matches!(strip(object), Expression::Identifier(ident) if ident.name == "Reflect")
+      && self.is_global_value(object);
+    if name != "getOwnPropertyDescriptor" && !reflect_get {
+      return;
+    }
+    let call = match self.parent(0) {
+      Some(AstKind::CallExpression(call)) if call.callee.span() == span => Some((
+        call.span,
+        call
+          .arguments
+          .get(1)
+          .and_then(Argument::as_expression)
+          .and_then(|key| self.shared.const_string(self.module, key)),
+      )),
+      _ => None,
+    };
+    match call {
+      Some((call_span, key)) => self.check_member_name(key.as_deref(), call_span),
+      None => self.bail_global(span, &format!("`{name}` used as a value")),
+    }
+  }
+
+  /// The global `Reflect` other than as the object of a member read or a
+  /// `typeof` operand, such as `const { get } = Reflect`, hides which name
+  /// `Reflect.get` will read.
+  fn check_reflect_reference(&mut self, it: &IdentifierReference<'a>) {
+    let allowed = match self.parent(0) {
+      Some(AstKind::StaticMemberExpression(member)) => member.object.span() == it.span,
+      Some(AstKind::ComputedMemberExpression(member)) => member.object.span() == it.span,
+      Some(AstKind::UnaryExpression(unary)) => unary.operator == UnaryOperator::Typeof,
+      _ => false,
+    };
+    if !allowed {
+      self.bail_global(it.span, "`Reflect` used as a value");
+    }
   }
 
   /// Code loaders and the host values that lead to them (A2).
@@ -1508,6 +1557,9 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     if !self.trusted {
       self.check_untrusted_reference(it, resolved);
       self.check_host_reference(it);
+      if it.name == "Reflect" && it.reference_id.get().is_some() && resolved.is_none() {
+        self.check_reflect_reference(it);
+      }
     }
     // The use expression of a key: the identifier, or `ns.Key` through any
     // number of namespace hops. `use_depth` is the ancestor index of its parent.
@@ -1539,6 +1591,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       && !matches!(self.shared.resolve_expr(self.module, &it.object), Some(Resolved::Namespace(_)))
     {
       self.check_member_name(Some(it.property.name.as_str()), it.span);
+      self.check_reflective_read(&it.object, it.property.name.as_str(), it.span);
       // A1 assumes builtins are not modified; writes to their prototypes are
       // cheap to see, so they turn the pass off instead.
       if it.property.name == "prototype"
@@ -1555,6 +1608,9 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     if !self.trusted {
       let name = self.shared.const_string(self.module, &it.expression);
       self.check_member_name(name.as_deref(), it.span);
+      if let Some(name) = name {
+        self.check_reflective_read(&it.object, &name, it.span);
+      }
     }
     walk_js::walk_computed_member_expression(self, it);
   }
@@ -1581,7 +1637,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     it: &AssignmentTargetPropertyIdentifier<'a>,
   ) {
     if !self.trusted {
-      self.check_member_name(Some(it.binding.name.as_str()), it.span);
+      self.check_destructured_name(Some(it.binding.name.as_str()), it.span);
     }
     walk_js::walk_assignment_target_property_identifier(self, it);
   }
