@@ -44,11 +44,12 @@ use oxc::{
     },
   },
   ast_visit::{VisitJs, VisitJsMut, walk_js, walk_js_mut},
-  semantic::{ReferenceId, Scoping, SymbolId},
+  semantic::{ReferenceId, Scoping, SymbolFlags, SymbolId},
   span::{GetSpan, Span},
 };
 use rolldown_common::{
-  GetLocalDb, ModuleIdx, StmtInfoIdx, SymbolOrMemberExprRef, SymbolRef, SymbolRefDb,
+  GetLocalDb, Module, ModuleIdx, Specifier, StmtInfoIdx, SymbolOrMemberExprRef, SymbolRef,
+  SymbolRefDb,
 };
 use rolldown_error::BuildDiagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -73,6 +74,10 @@ const KEYED_LOOKUPS: &[&str] = &[
   "Effect.service",
   "Effect.serviceOption",
   "Effect.updateService",
+  "Effect.updateServiceScoped",
+  "Layer.updateService",
+  "Stream.updateService",
+  "Channel.updateService",
 ];
 // Ways to run code that is not part of the module graph (A2), by global name,
 // member name (`globalThis.eval`, `fn.constructor`, `process.getBuiltinModule`)
@@ -91,6 +96,10 @@ const CODE_LOADERS: &[&str] = &[
 ];
 // Node modules whose operations run code in this realm (A2).
 const CODE_LOADING_MODULES: &[&str] = &["vm", "module", "inspector", "repl"];
+// Host values that lead to code loaders (`process.getBuiltinModule`, the global
+// `eval`): usable only through constant member names, calls and `typeof`.
+const CAPABILITY_GLOBALS: &[&str] =
+  &["process", "globalThis", "global", "self", "window", "module"];
 // Reading one of these on a service observes the whole object.
 const INHERITED_MEMBERS: &[&str] = &[
   "constructor",
@@ -373,6 +382,11 @@ struct Shared<'l> {
   keys: FxHashMap<SymbolRef, String>,
   key_creations: FxHashSet<(ModuleIdx, u32)>,
   this_free: FxHashSet<SymbolRef>,
+  /// Bindings of code loaders imported from Node builtins, directly or through
+  /// re-exports: the import binding, or the external namespace.
+  code_loaders: FxHashSet<SymbolRef>,
+  /// Namespace and default imports of `node:process`.
+  capabilities: FxHashSet<SymbolRef>,
   /// `const` bindings holding a constant string.
   const_strings: FxHashMap<SymbolRef, String>,
 }
@@ -727,8 +741,6 @@ struct UseCollector<'s, 'l, 'a> {
   guard_bindings: Vec<GuardBinding>,
   global_bailouts: Vec<Bailout>,
   key_bailouts: Vec<(String, String)>,
-  /// Imports of host operations that load code.
-  code_loaders: FxHashSet<SymbolId>,
 }
 
 impl<'a> UseCollector<'_, '_, 'a> {
@@ -755,6 +767,96 @@ impl<'a> UseCollector<'_, '_, 'a> {
       key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
     };
     self.check_member_name(name.as_deref(), span);
+  }
+
+  /// Code loaders and the host values that lead to them (A2).
+  fn check_host_reference(&mut self, it: &IdentifierReference<'a>) {
+    let local = it
+      .reference_id
+      .get()
+      .and_then(|reference| self.shared.scoping(self.module).get_reference(reference).symbol_id())
+      .map(|symbol| -> SymbolRef { (self.module, symbol).into() });
+    let bindings = local.map(|local| (local, self.shared.symbols.canonical_ref_for(local)));
+    let bound_to = |set: &FxHashSet<SymbolRef>| {
+      bindings.is_some_and(|(local, canonical)| set.contains(&local) || set.contains(&canonical))
+    };
+    let typeof_operand = matches!(self.parent(0), Some(AstKind::UnaryExpression(unary))
+      if unary.operator == UnaryOperator::Typeof);
+    if bound_to(&self.shared.code_loaders) {
+      if !typeof_operand {
+        self.bail_global(it.span, "host operation that loads code");
+      }
+      return;
+    }
+    let global_capability = local.is_none()
+      && it.reference_id.get().is_some()
+      && CAPABILITY_GLOBALS.contains(&it.name.as_str());
+    if !global_capability && !bound_to(&self.shared.capabilities) {
+      return;
+    }
+    // Follow constant member names while they still lead to a capability
+    // (`globalThis.process`); any other member is a plain read or call.
+    let mut span = it.span;
+    let mut depth = 0;
+    loop {
+      let name = match self.parent(depth) {
+        Some(AstKind::StaticMemberExpression(member)) if member.object.span() == span => {
+          Some((member.property.name.to_string(), member.span))
+        }
+        Some(AstKind::ComputedMemberExpression(member)) if member.object.span() == span => {
+          match self.shared.const_string(self.module, &member.expression) {
+            Some(name) => Some((name, member.span)),
+            None => {
+              self.bail_global(it.span, "host capability read by a non-constant name");
+              return;
+            }
+          }
+        }
+        _ => None,
+      };
+      match name {
+        Some((name, member_span)) if CAPABILITY_GLOBALS.contains(&name.as_str()) => {
+          span = member_span;
+          depth += 1;
+        }
+        Some(_) => return,
+        None => break,
+      }
+    }
+    let typeof_operand = matches!(self.parent(depth), Some(AstKind::UnaryExpression(unary))
+      if unary.operator == UnaryOperator::Typeof);
+    if !typeof_operand {
+      self.bail_global(it.span, "host capability used as a value");
+    }
+  }
+
+  /// Whether a provider property's identifier value is initialised wherever the
+  /// provider object is built, so reading it cannot throw. Function declarations
+  /// and `var` always are; a `const`, `let` or class must be declared earlier in
+  /// the source with no hoisted function declaration between, which could run
+  /// the site first. An import may be uninitialised through a module cycle.
+  fn initialized_at(&self, value: &Expression<'a>, site: u32) -> bool {
+    let Expression::Identifier(ident) = value else { return false };
+    let Some(reference) = ident.reference_id.get() else { return false };
+    let scoping = self.shared.scoping(self.module);
+    let Some(symbol) = scoping.get_reference(reference).symbol_id() else { return false };
+    let canonical = self.shared.symbols.canonical_ref_for((self.module, symbol).into());
+    if canonical.owner != self.module {
+      return false;
+    }
+    let flags = scoping.symbol_flags(symbol);
+    if flags.intersects(SymbolFlags::Function | SymbolFlags::FunctionScopedVariable) {
+      return true;
+    }
+    let declared = scoping.symbol_span(symbol);
+    declared.end <= site
+      && self.path.iter().all(|kind| match kind {
+        AstKind::Function(function) => {
+          function.r#type != FunctionType::FunctionDeclaration
+            || function.span.contains_inclusive(declared)
+        }
+        _ => true,
+      })
   }
 
   /// An unresolved global, such as `Map`.
@@ -1366,10 +1468,11 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
             Expression::TemplateLiteral(template) => (template.expressions.is_empty(), false),
             Expression::FunctionExpression(function) => (true, reads_this(function)),
             Expression::Identifier(_) => {
-              // A binding known to hold a function that never reads `this`.
+              // A binding known to hold a function that never reads `this`. Its
+              // read stays unless it cannot throw (temporal dead zone).
               let resolved = self.shared.resolve_expr(self.module, value);
               let this_free = matches!(resolved, Some(Resolved::Symbol(symbol)) if self.shared.this_free.contains(&symbol));
-              (true, !this_free)
+              (self.initialized_at(value, it.span.start), !this_free)
             }
             _ => (false, true),
           };
@@ -1436,19 +1539,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     let resolved = self.shared.resolve_ident(self.module, it);
     if !self.trusted {
       self.check_untrusted_reference(it, resolved);
-      let loader = it.reference_id.get().is_some_and(|reference| {
-        self
-          .shared
-          .scoping(self.module)
-          .get_reference(reference)
-          .symbol_id()
-          .is_some_and(|symbol| self.code_loaders.contains(&symbol))
-      });
-      let typeof_operand = matches!(self.parent(0), Some(AstKind::UnaryExpression(unary))
-        if unary.operator == UnaryOperator::Typeof);
-      if loader && !typeof_operand {
-        self.bail_global(it.span, "host operation that loads code");
-      }
+      self.check_host_reference(it);
     }
     // The use expression of a key: the identifier, or `ns.Key` through any
     // number of namespace hops. `use_depth` is the ancestor index of its parent.
@@ -1525,28 +1616,6 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       self.check_member_name(Some(it.binding.name.as_str()), it.span);
     }
     walk_js::walk_assignment_target_property_identifier(self, it);
-  }
-
-  fn visit_import_declaration(&mut self, it: &oxc::ast::ast::ImportDeclaration<'a>) {
-    if !self.trusted {
-      // Host operations that load code in this realm (A2), by module or name.
-      let source = it.source.value.as_str().unwrap_or_default();
-      let module = source.strip_prefix("node:").unwrap_or(source);
-      for specifier in it.specifiers.iter().flatten() {
-        let imported = match specifier {
-          oxc::ast::ast::ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
-            Some(specifier.imported.name())
-          }
-          _ => None,
-        };
-        let loads = CODE_LOADING_MODULES.contains(&module)
-          || imported.is_some_and(|name| CODE_LOADERS.contains(&name.as_str()));
-        if loads {
-          self.code_loaders.insert(specifier.local().symbol_id());
-        }
-      }
-    }
-    walk_js::walk_import_declaration(self, it);
   }
 
   fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
@@ -1636,6 +1705,46 @@ impl LinkStage<'_> {
         )));
       }
     }
+    // Imports of Node builtins that load code, followed through re-exports by
+    // canonical binding (A2).
+    let mut code_loaders: FxHashSet<SymbolRef> = FxHashSet::default();
+    let mut capabilities: FxHashSet<SymbolRef> = FxHashSet::default();
+    let bare = |name: &str| name.strip_prefix("node:").unwrap_or(name).to_string();
+    for module in &self.module_table.modules {
+      match module {
+        Module::Normal(normal) => {
+          for (symbol, named_import) in &normal.named_imports {
+            let Some(target) = normal.import_records[named_import.record_idx].resolved_module
+            else {
+              continue;
+            };
+            let Some(external) = self.module_table[target].as_external() else { continue };
+            let module_name = bare(external.name.as_str());
+            let imported = match &named_import.imported {
+              Specifier::Star => None,
+              Specifier::Literal(name) => Some(name.as_str()),
+            };
+            if CODE_LOADING_MODULES.contains(&module_name.as_str())
+              || imported.is_some_and(|name| CODE_LOADERS.contains(&name))
+            {
+              code_loaders.insert(*symbol);
+            }
+            if module_name == "process" && imported.is_none_or(|name| name == "default") {
+              capabilities.insert(*symbol);
+            }
+          }
+        }
+        Module::External(external) => {
+          let module_name = bare(external.name.as_str());
+          if CODE_LOADING_MODULES.contains(&module_name.as_str()) {
+            code_loaders.insert(external.namespace_ref);
+          }
+          if module_name == "process" {
+            capabilities.insert(external.namespace_ref);
+          }
+        }
+      }
+    }
     let mut api_names = FxHashMap::default();
     for exports in &resolved_exports {
       for symbol in exports.values() {
@@ -1655,6 +1764,8 @@ impl LinkStage<'_> {
       keys: FxHashMap::default(),
       key_creations: FxHashSet::default(),
       this_free: FxHashSet::default(),
+      code_loaders,
+      capabilities,
       const_strings: FxHashMap::default(),
     };
 
@@ -1757,7 +1868,6 @@ impl LinkStage<'_> {
           guard_bindings: vec![],
           global_bailouts: vec![],
           key_bailouts: vec![],
-          code_loaders: FxHashSet::default(),
         };
         collector.visit_program(&dep.program);
         consumers.extend(collector.consumers.into_iter().map(|c| (*module, c)));

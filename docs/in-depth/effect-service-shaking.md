@@ -49,7 +49,7 @@ With only `readOne` read anywhere, the pass removes `writeOne` from the provider
 
 ## What it never removes
 
-Demand is computed over code that can still run. Reads inside a removed method don't count. Anything that runs while a provider is constructed always counts. The pass deletes only object properties and unused constructor-local `const` functions. So service acquisition (`yield* Dep`), `acquireRelease` and its release, and construction-time calls keep running, in the same order.
+Demand is computed over code that can still run. Reads inside a removed method don't count. Anything that runs while a provider is constructed always counts. The pass deletes only object properties and unused constructor-local `const` functions. So service acquisition (`yield* Dep`), `acquireRelease` and its release, and construction-time calls keep running, in the same order. A property whose value is a binding is only removed when reading it cannot throw: the binding is a function declaration or a `var`, or a `const`, `let` or class declared earlier with no hoisted function declaration in between. An imported binding is always kept, because a module cycle can leave it uninitialised.
 
 ## When it keeps everything
 
@@ -63,8 +63,9 @@ Everything else in Effect is allowed and ignored: forks, joins, run options, `Ef
 
 The pass is turned off for the whole build when user code:
 - exports anything from the entry module, or imports an external module other than a Node builtin;
-- loads code outside the module graph: `eval`, `Function`, `require`, a `.constructor` read, dynamic `import()`, `process.getBuiltinModule`, `module.createRequire`, or any use of `vm`, `module`, `inspector` or `repl` other than `typeof`;
-- looks a service up other than by `yield*`: `Context.get`, `getUnsafe`, `getOption`, `getOrElse`, `getOrUndefined`, `pick`, `omit`, `Effect.service`, `serviceOption`, `updateService`. Their key argument may not be a tracked key;
+- loads code outside the module graph: `eval`, `Function`, `require`, a `.constructor` read, dynamic `import()`, `process.getBuiltinModule`, `module.createRequire`, or any use other than `typeof` of a binding imported from `vm`, `module`, `inspector` or `repl`, including through re-exports;
+- uses a host value that leads to code loaders (`process`, `globalThis`, `global`, `self`, `window`, `module`, or a namespace or default import of `node:process`) other than through constant member names, calls and `typeof`: for example `process[name]` or `const p = process`;
+- looks a service up other than by `yield*`: `Context.get`, `getUnsafe`, `getOption`, `getOrElse`, `getOrUndefined`, `pick`, `omit`, `Effect.service`, `serviceOption`, `updateService`, `updateServiceScoped`, and `Layer`, `Stream` and `Channel.updateService`. Their key argument may not be a tracked key;
 - calls `Context.getOrUndefinedUnsafe` or `Context.makeUnsafe`, which work on key strings;
 - uses `Context.Service` other than to declare a module-level key with a literal string, or writes to a key's members;
 - modifies a builtin prototype or uses one as a value (`Map.prototype.get = ...`).
