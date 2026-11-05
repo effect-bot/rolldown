@@ -4,5 +4,6 @@
     "experimental": {
       "effectServiceShaking": true
     }
-  }
+  },
+  "extendedTests": false
 }
