@@ -117,3 +117,8 @@ async fn constant_function_constructor_name_loads_code() {
   }
   assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reflect_get_with_a_loader_name_loads_code() {
+  assert_bailout("loader_reflect_get", "Reflect.get(").await;
+}
