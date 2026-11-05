@@ -751,6 +751,16 @@ export interface InputOptions {
      * @default false
      */
     importAttributes?: boolean;
+    /**
+     * Remove methods of Effect services that nothing in the bundle can read.
+     *
+     * Experimental and off by default. Programs that reach a service through code the
+     * bundler cannot see keep every method of that service; nothing is removed that the
+     * remaining code may read.
+     *
+     * @default false
+     */
+    effectServiceShaking?: boolean;
   };
   /**
    * Configure how the code is transformed. This process happens after the `transform` hook.

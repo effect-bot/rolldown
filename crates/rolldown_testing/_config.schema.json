@@ -1073,6 +1073,13 @@
             "boolean",
             "null"
           ]
+        },
+        "effectServiceShaking": {
+          "description": "Remove methods of Effect services that nothing in the bundle can read (experimental, off by default).",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

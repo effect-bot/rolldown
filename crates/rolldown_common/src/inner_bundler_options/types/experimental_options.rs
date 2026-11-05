@@ -81,6 +81,8 @@ pub struct ExperimentalOptions {
   pub chunk_optimization: Option<ChunkOptimizationOption>,
   pub lazy_barrel: Option<bool>,
   pub import_attributes: Option<bool>,
+  /// Remove methods of Effect services that nothing in the bundle can read (experimental, off by default).
+  pub effect_service_shaking: Option<bool>,
 }
 
 impl ExperimentalOptions {
@@ -125,5 +127,9 @@ impl ExperimentalOptions {
 
   pub fn is_import_attributes_enabled(&self) -> bool {
     self.import_attributes.unwrap_or(false)
+  }
+
+  pub fn is_effect_service_shaking_enabled(&self) -> bool {
+    self.effect_service_shaking.unwrap_or(false)
   }
 }
