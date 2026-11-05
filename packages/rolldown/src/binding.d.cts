@@ -2024,6 +2024,7 @@ export interface BindingChecksOptions {
   sourcemapBroken?: boolean
   namespaceConflict?: boolean
   shimmedExport?: boolean
+  effectServiceShaking?: boolean
 }
 
 export interface BindingChunkImportMap {

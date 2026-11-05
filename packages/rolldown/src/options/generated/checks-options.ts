@@ -213,4 +213,11 @@ export interface ChecksOptions {
    * @default true
    * */
   shimmedExport?: boolean;
+
+  /**
+   * Whether to emit warnings explaining why `experimental.effectServiceShaking` kept the
+   * methods of Effect services.
+   * @default true
+   * */
+  effectServiceShaking?: boolean;
 }

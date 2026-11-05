@@ -1,7 +1,71 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
-assertion_line: 778
 ---
+# warnings
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `Effect.repeat` without a summary receives a runtime value at 28:25 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `JSON.stringify` may read an Effect runtime object at 24:29 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `Schedule.map` without a summary receives a runtime value at 30:5 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 35:1 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 28:25 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 29:5 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 30:18 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 30:44 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 30:5 in main.js
+
+```
+
 # Assets
 
 ## main.js

@@ -1,6 +1,64 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
 ---
+# warnings
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `Effect.succeed` without a summary receives a runtime value at 28:54 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `Effect.withFiber` without a summary receives a runtime value at 28:26 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `Inspectable.toJson` without a summary receives a runtime value at 21:3 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 32:1 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unknown-callee] unknown callee receives a runtime value at 21:3 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 21:3 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 28:26 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 28:54 in main.js
+
+```
+
 # Assets
 
 ## main.js

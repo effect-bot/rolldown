@@ -1,6 +1,22 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
 ---
+# warnings
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `Reflect.get` may read an Effect runtime object at 27:27 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `globalThis` used other than by a direct call at 27:39 in main.js
+
+```
+
 # Assets
 
 ## main.js

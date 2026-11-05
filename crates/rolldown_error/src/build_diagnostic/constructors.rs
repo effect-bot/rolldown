@@ -509,6 +509,20 @@ impl BuildDiagnostic {
     })
   }
 
+  pub fn effect_service_shaking(
+    module_id: Option<String>,
+    tag: &'static str,
+    reason: String,
+    position: Option<(usize, usize)>,
+  ) -> Self {
+    Self::new_inner(super::events::effect_service_shaking::EffectServiceShaking {
+      module_id,
+      tag,
+      reason,
+      position,
+    })
+  }
+
   pub fn large_barrel_modules(module_id: String, reexport_count: usize) -> Self {
     Self::new_inner(super::events::large_barrel_modules::LargeBarrelModules {
       module_id,

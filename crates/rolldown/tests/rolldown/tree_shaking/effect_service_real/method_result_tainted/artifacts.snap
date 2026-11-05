@@ -1,7 +1,29 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
-assertion_line: 778
 ---
+# warnings
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `JSON.stringify` may read an Effect runtime object at 26:29 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 34:1 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 24:58 in main.js
+
+```
+
 # Assets
 
 ## main.js

@@ -1,7 +1,57 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
-assertion_line: 778
 ---
+# warnings
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `Effect.scoped` without a summary receives a runtime value at 25:17 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `FiberSet.run` without a summary receives a runtime value at 29:12 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `JSON.stringify` may read an Effect runtime object at 23:29 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 35:1 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 25:17 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 28:24 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 29:12 in main.js
+
+```
+
 # Assets
 
 ## main.js

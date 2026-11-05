@@ -1,6 +1,36 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
 ---
+# warnings
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `Effect.withFiber` without a summary receives a runtime value at 6:25 in other.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] `JSON.stringify` may read an Effect runtime object at 23:29 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 31:1 in main.js
+
+```
+
+## EFFECT_SERVICE_SHAKING
+
+```text
+[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 6:25 in other.js
+
+```
+
 # Assets
 
 ## main.js

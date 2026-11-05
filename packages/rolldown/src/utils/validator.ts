@@ -453,6 +453,12 @@ const ChecksOptionsSchema = v.strictObject({
       'Whether to emit warnings when a missing export is replaced with an undefined binding',
     ),
   ),
+  effectServiceShaking: v.pipe(
+    v.optional(v.boolean()),
+    v.description(
+      'Whether to emit warnings explaining why `experimental.effectServiceShaking` kept the',
+    ),
+  ),
 });
 isTypeTrue<IsSchemaSubType<typeof ChecksOptionsSchema, ChecksOptions>>();
 

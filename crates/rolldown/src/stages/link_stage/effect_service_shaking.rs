@@ -56,6 +56,7 @@ use oxc::{
 use rolldown_common::{
   GetLocalDb, ModuleIdx, StmtInfoIdx, SymbolOrMemberExprRef, SymbolRef, SymbolRefDb,
 };
+use rolldown_error::BuildDiagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::LinkStage;
@@ -94,8 +95,8 @@ const INHERITED_MEMBERS: &[&str] = &[
   "__lookupGetter__",
   "__lookupSetter__",
 ];
-// Node builtins other than those that run code in this realm (`vm`, `module`,
-// `inspector`, `repl`).
+// Node builtins. Importing one observes nothing; calling into one is a host
+// operation, which needs a summary.
 const NODE_BUILTINS: &[&str] = &[
   "assert",
   "assert/strict",
@@ -117,6 +118,8 @@ const NODE_BUILTINS: &[&str] = &[
   "http",
   "http2",
   "https",
+  "inspector",
+  "module",
   "net",
   "os",
   "path",
@@ -128,6 +131,7 @@ const NODE_BUILTINS: &[&str] = &[
   "querystring",
   "readline",
   "readline/promises",
+  "repl",
   "stream",
   "stream/promises",
   "stream/web",
@@ -141,6 +145,7 @@ const NODE_BUILTINS: &[&str] = &[
   "util",
   "util/types",
   "v8",
+  "vm",
   "wasi",
   "worker_threads",
   "zlib",
@@ -328,10 +333,30 @@ impl Demand {
 /// Outcome of the pass, printed when `ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT` is set.
 #[derive(Default, Debug)]
 struct Report {
-  global_bailouts: Vec<String>,
+  global_bailouts: Vec<Bailout>,
+  /// Reasons the heap bit was set. They don't disable the pass.
+  heap_reasons: Vec<Bailout>,
   key_bailouts: Vec<(String, String)>,
   removed: Vec<String>,
 }
+
+/// A reason reported as an `EFFECT_SERVICE_SHAKING` warning.
+#[derive(Debug, Clone)]
+struct Bailout {
+  tag: &'static str,
+  reason: String,
+  /// Module and span start of the site.
+  site: Option<(ModuleIdx, u32)>,
+}
+
+impl Bailout {
+  fn global(reason: String) -> Self {
+    Bailout { tag: "bailout", reason, site: None }
+  }
+}
+
+// The effect version the operation summaries were checked against.
+const EFFECT_VERSION: &str = "4.1.2";
 
 /// Facts shared by every module visit.
 struct Shared<'l> {
@@ -592,15 +617,19 @@ impl<'b, 'a> Returns<'b, 'a> {
           self.statements(&finalizer.body);
         }
       }
-      // Returns nested elsewhere (loops, switch, labels) are not followed.
-      Statement::ForStatement(_)
-      | Statement::ForInStatement(_)
-      | Statement::ForOfStatement(_)
-      | Statement::WhileStatement(_)
-      | Statement::DoWhileStatement(_)
-      | Statement::SwitchStatement(_)
-      | Statement::LabeledStatement(_)
-      | Statement::WithStatement(_) => self.1 = false,
+      // Returns inside loops, switches and labels are returns of the function too.
+      Statement::ForStatement(stmt) => self.statement(&stmt.body),
+      Statement::ForInStatement(stmt) => self.statement(&stmt.body),
+      Statement::ForOfStatement(stmt) => self.statement(&stmt.body),
+      Statement::WhileStatement(stmt) => self.statement(&stmt.body),
+      Statement::DoWhileStatement(stmt) => self.statement(&stmt.body),
+      Statement::LabeledStatement(stmt) => self.statement(&stmt.body),
+      Statement::SwitchStatement(stmt) => {
+        for case in &stmt.cases {
+          self.statements(&case.consequent);
+        }
+      }
+      Statement::WithStatement(_) => self.1 = false,
       _ => {}
     }
   }
@@ -692,7 +721,7 @@ struct UseCollector<'s, 'l, 'a> {
   consumers: Vec<Consumer>,
   providers: Vec<(String, Container)>,
   guard_bindings: Vec<GuardBinding>,
-  global_bailouts: Vec<String>,
+  global_bailouts: Vec<Bailout>,
   key_bailouts: Vec<(String, String)>,
   /// Static reads in untrusted code: (receiver span, name, guards). A `None`
   /// receiver is a value of unknown provenance.
@@ -707,7 +736,11 @@ type NameRead = (Option<(u32, u32)>, String, Vec<Guard>);
 
 impl<'a> UseCollector<'_, '_, 'a> {
   fn bail_global(&mut self, span: Span, reason: &str) {
-    self.global_bailouts.push(format!("{reason} (module {:?} at {})", self.module, span.start));
+    self.global_bailouts.push(Bailout {
+      tag: "bailout",
+      reason: reason.to_string(),
+      site: Some((self.module, span.start)),
+    });
   }
 
   /// A property read or written by `name`, `None` when the name is not constant.
@@ -1592,8 +1625,8 @@ enum Source<'a> {
   Primitive {
     numeric: bool,
   },
-  /// A function declaration.
-  Function,
+  /// A function declaration, by start.
+  Function(u32),
   Unknown,
 }
 
@@ -1654,11 +1687,14 @@ struct Flow<'a> {
   uses: FxHashMap<SymbolId, FnUses<'a>>,
   /// `yield*` expressions directly inside an Effect generator.
   effect_yields: FxHashSet<u32>,
-  /// Values stored into objects or collections.
-  heap_writes: Vec<&'a Expression<'a>>,
-  heap_unknown: bool,
-  /// Imports from Node modules that format their arguments.
-  formatting_imports: FxHashSet<SymbolId>,
+  /// Bindings outside each function that it reads, by function start.
+  captures: FxHashMap<u32, Vec<SymbolId>>,
+  /// Functions that read `this`, `arguments` or the global object.
+  opaque: FxHashSet<u32>,
+  /// Imports from Node builtins: host operations.
+  host_imports: FxHashSet<SymbolId>,
+  /// Imports of `node:assert`.
+  assert_imports: FxHashSet<SymbolId>,
 }
 
 // Methods that store their arguments in the receiver.
@@ -1679,8 +1715,19 @@ const MUTATORS: &[&str] = &[
   "call",
   "apply",
 ];
-// Methods whose result is clean when the receiver and arguments are.
-const CLEAN_METHODS: &[&str] = &[
+// Methods of arrays, strings and builtin collections. Their result is clean when
+// the receiver, the arguments and what callbacks return are.
+const BUILTIN_METHODS: &[&str] = &[
+  "map",
+  "forEach",
+  "reduce",
+  "reduceRight",
+  "flatMap",
+  "findIndex",
+  "findLastIndex",
+  "sort",
+  "toSorted",
+  "reverse",
   "join",
   "slice",
   "concat",
@@ -1734,7 +1781,6 @@ const READING_BUILTINS: &[&str] = &[
   "JSON.stringify",
   "structuredClone",
   "String",
-  "console",
   "Error",
   "TypeError",
   "RangeError",
@@ -1744,11 +1790,6 @@ const READING_BUILTINS: &[&str] = &[
   "URIError",
   "AggregateError",
 ];
-// Trusted APIs that format their arguments: logs and the pretty-printed Cause.
-const FORMATTING_API_PREFIXES: &[&str] =
-  &["Effect.fail", "Effect.die", "Effect.log", "Console.", "Inspectable.", "Cause.", "Logger."];
-// Node modules that format their arguments.
-const FORMATTING_MODULES: &[&str] = &["util", "console"];
 // Methods that format their receiver.
 const FORMATTING_METHODS: &[&str] = &["toString", "toLocaleString", "join"];
 // String methods that format their arguments.
@@ -1813,6 +1854,7 @@ fn collect_flow<'a>(shared: &Shared<'_>, module: ModuleIdx, program: &Program<'a
     effect_generators: FxHashSet::default(),
     functions: vec![],
     loop_head: None,
+    enclosing: vec![],
   };
   collector.visit_program(program);
   collector.flow
@@ -1830,6 +1872,8 @@ struct FlowCollector<'s, 'l, 'a> {
   functions: Vec<bool>,
   /// Bindings introduced by a `for...in` / `for...of` head: the iterated value.
   loop_head: Option<(bool, &'a Expression<'a>)>,
+  /// Enclosing functions: (start, span).
+  enclosing: Vec<(u32, Span)>,
 }
 
 impl<'a> FlowCollector<'_, '_, 'a> {
@@ -1890,19 +1934,11 @@ impl<'a> FlowCollector<'_, '_, 'a> {
           self.add(symbol, value.map_or(Source::Unknown, Source::Expr));
         }
       }
-      AssignmentTarget::StaticMemberExpression(_)
-      | AssignmentTarget::ComputedMemberExpression(_)
-      | AssignmentTarget::PrivateFieldExpression(_) => match value {
-        Some(value) => self.flow.heap_writes.push(value),
-        None => self.flow.heap_unknown = true,
-      },
+      // Member writes are checked by the heap rules.
       AssignmentTarget::ArrayAssignmentTarget(_) | AssignmentTarget::ObjectAssignmentTarget(_) => {
-        // Every identifier inside takes a part of the value; members are heap writes.
+        // Every identifier inside takes a part of the value.
         let mut finder = TargetFinder { identifiers: vec![], members: false, defaults: false };
         finder.visit_assignment_target(target);
-        if finder.members {
-          self.flow.heap_unknown = true;
-        }
         for ident in finder.identifiers {
           if let Some(symbol) = self.symbol(ident) {
             let source = match value {
@@ -1913,7 +1949,7 @@ impl<'a> FlowCollector<'_, '_, 'a> {
           }
         }
       }
-      _ => self.flow.heap_unknown = true,
+      _ => {}
     }
   }
 }
@@ -2073,14 +2109,16 @@ impl<'a> VisitJs<'a> for FlowCollector<'_, '_, 'a> {
     let it = self.alloc(it);
     self.function(FnNode::Function(it), it.span.start, &it.params);
     if let (Some(id), FunctionType::FunctionDeclaration) = (&it.id, it.r#type) {
-      self.add(id.symbol_id(), Source::Function);
+      self.add(id.symbol_id(), Source::Function(it.span.start));
       if !self.shared.scoping(self.module).symbol_is_mutated(id.symbol_id()) {
         self.flow.named.insert(id.symbol_id(), it.span.start);
         self.flow.named_by_function.insert(it.span.start, id.symbol_id());
       }
     }
     self.functions.push(it.generator && self.effect_generators.contains(&it.span.start));
+    self.enclosing.push((it.span.start, it.span));
     walk_js::walk_function(self, it, flags);
+    self.enclosing.pop();
     self.functions.pop();
   }
 
@@ -2088,7 +2126,9 @@ impl<'a> VisitJs<'a> for FlowCollector<'_, '_, 'a> {
     let it = self.alloc(it);
     self.function(FnNode::Arrow(it), it.span.start, &it.params);
     self.functions.push(false);
+    self.enclosing.push((it.span.start, it.span));
     walk_js::walk_arrow_function_expression(self, it);
+    self.enclosing.pop();
     self.functions.pop();
   }
 
@@ -2108,20 +2148,6 @@ impl<'a> VisitJs<'a> for FlowCollector<'_, '_, 'a> {
         self.flow.uses.entry(symbol).or_default().calls.push(&it.arguments);
       }
     }
-    if let Expression::StaticMemberExpression(member) = callee {
-      if MUTATORS.contains(&member.property.name.as_str()) {
-        for argument in &it.arguments {
-          match argument {
-            Argument::SpreadElement(spread) => self.flow.heap_writes.push(&spread.argument),
-            argument => {
-              if let Some(expr) = argument.as_expression() {
-                self.flow.heap_writes.push(expr);
-              }
-            }
-          }
-        }
-      }
-    }
     match self.shared.api_of(self.module, callee) {
       Some("Effect.gen" | "Effect.fn" | "Effect.fnUntraced") => {
         for argument in &it.arguments {
@@ -2130,7 +2156,8 @@ impl<'a> VisitJs<'a> for FlowCollector<'_, '_, 'a> {
           }
         }
       }
-      Some("Effect.map" | "Effect.flatMap" | "Effect.tap") if it.arguments.len() == 2 => {
+      // Row 7: the release callback receives the acquired value.
+      Some("Effect.acquireRelease") if it.arguments.len() == 2 => {
         let first_param = match it.arguments[1].as_expression().map(strip) {
           Some(Expression::ArrowFunctionExpression(f)) => f.params.items.first(),
           Some(Expression::FunctionExpression(f)) => f.params.items.first(),
@@ -2151,36 +2178,228 @@ impl<'a> VisitJs<'a> for FlowCollector<'_, '_, 'a> {
 
   fn visit_import_declaration(&mut self, it: &ImportDeclaration<'a>) {
     let source = it.source.value.as_str().unwrap_or_default();
-    let source = source.strip_prefix("node:").unwrap_or(source);
-    if FORMATTING_MODULES.contains(&source) {
-      for specifier in it.specifiers.iter().flatten() {
-        self.flow.formatting_imports.insert(specifier.local().symbol_id());
+    let bare = source.strip_prefix("node:").unwrap_or(source);
+    let host = source.starts_with("node:") || NODE_BUILTINS.contains(&bare);
+    for specifier in it.specifiers.iter().flatten() {
+      let symbol = specifier.local().symbol_id();
+      if host {
+        self.flow.host_imports.insert(symbol);
+      }
+      if matches!(bare, "assert" | "assert/strict") {
+        self.flow.assert_imports.insert(symbol);
       }
     }
   }
 
+  fn visit_this_expression(&mut self, _it: &oxc::ast::ast::ThisExpression) {
+    for (start, _) in &self.enclosing {
+      self.flow.opaque.insert(*start);
+    }
+  }
+
   fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+    let symbol = self.symbol(it);
     if !self.callee_spans.contains(&it.span.start) {
-      if let Some(symbol) = self.symbol(it) {
+      if let Some(symbol) = symbol {
         self.flow.uses.entry(symbol).or_default().escaped = true;
+      }
+    }
+    match symbol {
+      // A binding declared outside a function is one of its captures.
+      Some(symbol) => {
+        let declared = self.shared.scoping(self.module).symbol_span(symbol);
+        for (start, span) in &self.enclosing {
+          if !span.contains_inclusive(declared) {
+            self.flow.captures.entry(*start).or_default().push(symbol);
+          }
+        }
+      }
+      None => {
+        if it.name == "arguments" || GLOBAL_OBJECTS.contains(&it.name.as_str()) {
+          for (start, _) in &self.enclosing {
+            self.flow.opaque.insert(*start);
+          }
+        }
       }
     }
   }
 }
+
+/// Build-global facts, solved as a least fixpoint over every untrusted module.
+/// They start clean and only become tainted.
+#[derive(Clone, Default, PartialEq, Debug)]
+struct Facts {
+  /// Some object or collection in user code may hold a runtime value. While set,
+  /// every allocation, method result, join result and awaited run result is unknown.
+  heap: bool,
+  /// Key -> method -> whether calling it on a consumer returns a clean value.
+  /// A key that is missing is unknown.
+  methods: FxHashMap<String, FxHashMap<String, bool>>,
+  /// Key -> property -> whether reading it on a consumer gives a clean value.
+  properties: FxHashMap<String, FxHashMap<String, bool>>,
+  /// Exported binding of an untrusted module -> (value clean, returns clean if a
+  /// function). Missing entries are not computed yet and start clean.
+  exports: FxHashMap<SymbolRef, (bool, Option<bool>)>,
+}
+
+/// The guarded call shapes (rows) of the operation summaries, checked against effect
+/// 4.1.2. Any other trusted call takes the fallback.
+enum Row<'b, 'a> {
+  /// `Context.Service(...)`, a key declaration (validated by the key rules).
+  Key,
+  /// `K.of(v)`: identity.
+  Of(&'b Expression<'a>),
+  /// `Layer.succeed(K, v)`.
+  LayerSucceed(&'b Expression<'a>),
+  /// `Layer.effect(K, e)` or `Layer.effect(K)(e)`, with `e` a gen or acquireRelease row.
+  LayerEffect(&'b Expression<'a>),
+  /// `Layer.effect(K)`, applied right away.
+  LayerCurried,
+  /// `Layer.mergeAll(...)`, `Layer.provide(a, b)`.
+  LayerCombine,
+  /// `Effect.gen(function* () {...})`.
+  Gen(&'b Expression<'a>),
+  /// `Effect.sync(() => ...)`.
+  Sync(&'b Expression<'a>),
+  /// `Effect.acquireRelease(acquire, release)`.
+  AcquireRelease(&'b Expression<'a>, &'b Expression<'a>),
+  /// `Effect.provide(e, layer)`.
+  Provide(&'b Expression<'a>, &'b Expression<'a>),
+  /// `Effect.runPromise(e)` or `Effect.runPromise(e, { onFiberStart })`.
+  RunPromise(&'b Expression<'a>),
+  /// `Effect.forkChild(e)`.
+  ForkChild(&'b Expression<'a>),
+  /// `Fiber.join(f)`.
+  Join(&'b Expression<'a>),
+}
+
+// ECMAScript globals. Every other unresolved global is a host value.
+const ECMA_GLOBALS: &[&str] = &[
+  "Object",
+  "Function",
+  "Array",
+  "Number",
+  "Boolean",
+  "String",
+  "Symbol",
+  "BigInt",
+  "Math",
+  "JSON",
+  "Reflect",
+  "Proxy",
+  "Date",
+  "RegExp",
+  "Error",
+  "EvalError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "TypeError",
+  "URIError",
+  "AggregateError",
+  "Map",
+  "Set",
+  "WeakMap",
+  "WeakSet",
+  "WeakRef",
+  "FinalizationRegistry",
+  "Promise",
+  "ArrayBuffer",
+  "SharedArrayBuffer",
+  "DataView",
+  "Int8Array",
+  "Uint8Array",
+  "Uint8ClampedArray",
+  "Int16Array",
+  "Uint16Array",
+  "Int32Array",
+  "Uint32Array",
+  "Float32Array",
+  "Float64Array",
+  "BigInt64Array",
+  "BigUint64Array",
+  "Atomics",
+  "Intl",
+  "parseInt",
+  "parseFloat",
+  "isNaN",
+  "isFinite",
+  "encodeURI",
+  "encodeURIComponent",
+  "decodeURI",
+  "decodeURIComponent",
+  "structuredClone",
+  "eval",
+  "undefined",
+  "NaN",
+  "Infinity",
+];
+// Builtin results that are arrays or strings, so their methods are builtins too.
+const BUILTIN_VALUE_PATHS: &[&str] = &[
+  "Object.keys",
+  "Object.values",
+  "Object.entries",
+  "Object.getOwnPropertyNames",
+  "Array.from",
+  "Array.of",
+  "String",
+  "JSON.stringify",
+  "Reflect.ownKeys",
+];
+const BUILTIN_CONSTRUCTORS: &[&str] =
+  &["Map", "Set", "Array", "Date", "RegExp", "URL", "URLSearchParams"];
+// Array and string methods whose result is an array or a string again.
+const BUILTIN_VALUE_METHODS: &[&str] = &[
+  "map",
+  "filter",
+  "slice",
+  "concat",
+  "flat",
+  "flatMap",
+  "split",
+  "join",
+  "trim",
+  "trimStart",
+  "trimEnd",
+  "toUpperCase",
+  "toLowerCase",
+  "padStart",
+  "padEnd",
+  "repeat",
+  "replace",
+  "replaceAll",
+  "substring",
+  "charAt",
+  "toFixed",
+  "toString",
+];
+// Implicitly invoked hooks: serialization, coercion and iteration call them.
+const HOOK_NAMES: &[&str] = &["toJSON", "valueOf", "toString", "toLocaleString"];
+const HOOK_SYMBOLS: &[&str] = &["toPrimitive", "iterator", "asyncIterator"];
+// Operations that install callables run later by enumeration, serialization or
+// coercion. They set the heap bit unconditionally.
+const ACCESSOR_INSTALLERS: &[&str] = &[
+  "Object.defineProperty",
+  "Object.defineProperties",
+  "Object.setPrototypeOf",
+  "Object.assign",
+  "Reflect.defineProperty",
+  "Reflect.setPrototypeOf",
+  "Reflect.set",
+];
 
 /// Whether values in an untrusted module may hold an Effect runtime object.
 struct Prov<'f, 's, 'l, 'a> {
   shared: &'s Shared<'l>,
   module: ModuleIdx,
   flow: &'f Flow<'a>,
-  heap_tainted: bool,
-  /// Key -> method -> whether every provider's method returns a clean value.
-  facts: &'f FxHashMap<String, FxHashMap<String, bool>>,
+  facts: &'f Facts,
   /// Consumer bindings of this module -> key.
   consumers: &'f FxHashMap<SymbolId, String>,
   symbols: FxHashMap<SymbolId, Option<bool>>,
   numeric_symbols: FxHashMap<SymbolId, Option<bool>>,
   returns: FxHashMap<u32, Option<bool>>,
+  function_values: FxHashMap<u32, Option<bool>>,
   depth: usize,
 }
 
@@ -2189,22 +2408,25 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
     shared: &'s Shared<'l>,
     module: ModuleIdx,
     flow: &'f Flow<'a>,
-    heap_tainted: bool,
-    facts: &'f FxHashMap<String, FxHashMap<String, bool>>,
+    facts: &'f Facts,
     consumers: &'f FxHashMap<SymbolId, String>,
   ) -> Self {
     Prov {
       shared,
       module,
       flow,
-      heap_tainted,
       facts,
       consumers,
       symbols: FxHashMap::default(),
       numeric_symbols: FxHashMap::default(),
       returns: FxHashMap::default(),
+      function_values: FxHashMap::default(),
       depth: 0,
     }
+  }
+
+  fn heap(&self) -> bool {
+    self.facts.heap
   }
 
   fn symbol(&self, ident: &IdentifierReference<'_>) -> Option<SymbolId> {
@@ -2219,6 +2441,19 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
     })
   }
 
+  /// Whether every function argument returns a clean value: builtins return or
+  /// store what their callbacks return.
+  fn callbacks_clean(&mut self, args: &[Argument<'a>]) -> bool {
+    args.iter().all(|argument| {
+      let Some(expr) = argument.as_expression() else { return true };
+      match self.function_expr(expr) {
+        Some(node) => !node.is_generator() && self.returns_clean(node, false),
+        None => true,
+      }
+    })
+  }
+
+  /// The value taint `V`: whether `expr` provably holds no runtime object.
   fn clean(&mut self, expr: &Expression<'a>) -> bool {
     if self.depth > 64 {
       return false;
@@ -2240,18 +2475,18 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
       | Expression::TemplateLiteral(_)
       | Expression::UnaryExpression(_)
       | Expression::BinaryExpression(_)
-      | Expression::UpdateExpression(_)
-      | Expression::ArrowFunctionExpression(_)
-      | Expression::FunctionExpression(_) => true,
+      | Expression::UpdateExpression(_) => true,
+      Expression::ArrowFunctionExpression(f) => self.function_value_clean(f.span.start),
+      Expression::FunctionExpression(f) => self.function_value_clean(f.span.start),
       Expression::Identifier(ident) => match self.symbol(ident) {
-        Some(symbol) => self.symbol_clean(symbol),
+        Some(symbol) => self.binding_clean(symbol),
         None => {
           ident.reference_id.get().is_some()
             && matches!(ident.name.as_str(), "undefined" | "NaN" | "Infinity")
         }
       },
       Expression::ArrayExpression(array) => {
-        !self.heap_tainted
+        !self.heap()
           && array.elements.iter().all(|element| match element {
             ArrayExpressionElement::Elision(_) => true,
             ArrayExpressionElement::SpreadElement(spread) => self.clean(&spread.argument),
@@ -2259,21 +2494,10 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
           })
       }
       Expression::ObjectExpression(object) => {
-        !self.heap_tainted
+        !self.heap()
           && object.properties.iter().all(|property| match property {
             ObjectPropertyKind::SpreadProperty(spread) => self.clean(&spread.argument),
-            ObjectPropertyKind::ObjectProperty(property) => {
-              property.kind == PropertyKind::Init
-                && property
-                  .key
-                  .static_name()
-                  .and_then(|name| name.as_js_str().as_str().map(String::from))
-                  .as_deref()
-                  != Some("__proto__")
-                && (!property.computed
-                  || property.key.as_expression().is_some_and(|key| self.clean(key)))
-                && self.clean(&property.value)
-            }
+            ObjectPropertyKind::ObjectProperty(property) => self.property_clean(property),
           })
       }
       Expression::LogicalExpression(logical) => {
@@ -2290,13 +2514,16 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
           || self.clean(&assign.right)
       }
       Expression::AwaitExpression(await_expr) => self.clean(&await_expr.argument),
-      Expression::YieldExpression(yield_expr) => {
-        yield_expr.delegate
-          && self.flow.effect_yields.contains(&yield_expr.span.start)
-          && yield_expr.argument.as_ref().is_some_and(|argument| self.success(argument))
-      }
+      Expression::YieldExpression(yield_expr) => self.yield_clean(yield_expr),
       Expression::StaticMemberExpression(member) => {
-        self.shared.resolve_expr(self.module, expr).is_none() && self.clean(&member.object)
+        if let Some(resolved) = self.shared.resolve_expr(self.module, expr) {
+          return self.resolved_clean(resolved);
+        }
+        if let Some(key) = self.consumer_key(&member.object) {
+          return !self.heap()
+            && self.fact(&self.facts.properties, key, member.property.name.as_str());
+        }
+        self.clean(&member.object)
       }
       Expression::ComputedMemberExpression(member) => self.clean(&member.object),
       Expression::ChainExpression(chain) => match &chain.expression {
@@ -2307,13 +2534,91 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
       },
       Expression::CallExpression(call) => self.call_clean(call),
       Expression::NewExpression(new) => {
-        matches!(
-          self.shared.builtin_path(self.module, &new.callee).as_deref(),
-          Some("Map" | "Set" | "Date" | "Array" | "URL" | "URLSearchParams" | "RegExp")
-        ) && self.args_clean(&new.arguments)
+        !self.heap()
+          && self
+            .shared
+            .builtin_path(self.module, &new.callee)
+            .is_some_and(|path| BUILTIN_CONSTRUCTORS.contains(&path.as_str()))
+          && self.args_clean(&new.arguments)
+          && self.callbacks_clean(&new.arguments)
       }
       _ => false,
     }
+  }
+
+  /// A property of an object literal. Hooks contribute what they return: they run
+  /// during serialization, coercion and iteration. Accessors are not followed.
+  fn property_clean(&mut self, property: &oxc::ast::ast::ObjectProperty<'a>) -> bool {
+    if property.kind != PropertyKind::Init {
+      return false;
+    }
+    let name = property.key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from));
+    if !property.computed && name.as_deref() == Some("__proto__") {
+      return false;
+    }
+    if property.computed && !property.key.as_expression().is_some_and(|key| self.clean(key)) {
+      return false;
+    }
+    if !self.clean(&property.value) {
+      return false;
+    }
+    let hook = if property.computed {
+      property.key.as_expression().is_some_and(|key| self.is_hook_symbol(key))
+    } else {
+      name.as_deref().is_some_and(|name| HOOK_NAMES.contains(&name))
+    };
+    !hook
+      || self
+        .function_expr(&property.value)
+        .is_some_and(|node| !node.is_generator() && self.returns_clean(node, false))
+  }
+
+  fn is_hook_symbol(&self, key: &Expression<'a>) -> bool {
+    matches!(strip(key), Expression::StaticMemberExpression(member)
+      if self.shared.builtin_path(self.module, &member.object).as_deref() == Some("Symbol")
+        && HOOK_SYMBOLS.contains(&member.property.name.as_str()))
+  }
+
+  fn fact(
+    &self,
+    table: &FxHashMap<String, FxHashMap<String, bool>>,
+    key: &str,
+    name: &str,
+  ) -> bool {
+    table.get(key).and_then(|names| names.get(name)).copied().unwrap_or(false)
+  }
+
+  /// A binding referenced from this module: consumer, import or local.
+  fn binding_clean(&mut self, symbol: SymbolId) -> bool {
+    // Reads of consumers are tracked per key.
+    if self.consumers.contains_key(&symbol) {
+      return true;
+    }
+    let canonical = self.shared.symbols.canonical_ref_for((self.module, symbol).into());
+    if canonical.owner != self.module || self.shared.namespaces.contains_key(&canonical) {
+      return self.resolved_clean(self.shared.as_resolved(canonical));
+    }
+    self.symbol_clean(symbol)
+  }
+
+  fn resolved_clean(&self, resolved: Resolved) -> bool {
+    match resolved {
+      // Trusted modules and their exports are operation identities, not data.
+      Resolved::Namespace(module) => self.shared.prefixes[module.index()].is_some(),
+      Resolved::Symbol(symbol) => {
+        self.shared.keys.contains_key(&symbol)
+          || self.shared.prefixes[symbol.owner.index()].is_some()
+          || self.facts.exports.get(&symbol).is_none_or(|(value, _)| *value)
+      }
+    }
+  }
+
+  /// What calling an exported function of another untrusted module returns.
+  fn export_returns(&self, symbol: SymbolRef) -> bool {
+    if self.shared.prefixes[symbol.owner.index()].is_some() {
+      return false;
+    }
+    self.facts.exports.get(&symbol).is_none_or(|(_, returns)| returns.unwrap_or(false))
   }
 
   fn symbol_clean(&mut self, symbol: SymbolId) -> bool {
@@ -2341,7 +2646,8 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
         }
         clean &= match source {
           Source::Expr(expr) => self.clean(expr),
-          Source::Primitive { .. } | Source::Function => true,
+          Source::Primitive { .. } => true,
+          Source::Function(start) => self.function_value_clean(*start),
           Source::Unknown => false,
         };
       }
@@ -2351,12 +2657,11 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
     clean
   }
 
-  /// A parameter of a function only called directly, by every call site.
-  fn param_clean(&mut self, function: u32, index: usize) -> bool {
+  /// Whether a parameter is bound by direct calls only, in this module.
+  fn param_resolved(&self, function: u32) -> bool {
     let flow = self.flow;
     let Some(symbol) = flow.named_by_function.get(&function) else { return false };
-    let Some(node) = flow.functions.get(&function) else { return false };
-    if node.reads_arguments() {
+    if flow.functions.get(&function).is_none_or(|node| node.reads_arguments()) {
       return false;
     }
     // Other modules may call an exported function with anything.
@@ -2364,13 +2669,17 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
     let exported = self.shared.resolved_exports[self.module.index()]
       .values()
       .any(|export| self.shared.symbols.canonical_ref_for(*export) == this);
-    if exported {
+    !exported && flow.uses.get(symbol).is_none_or(|uses| !uses.escaped)
+  }
+
+  /// A parameter of a function only called directly, by every call site.
+  fn param_clean(&mut self, function: u32, index: usize) -> bool {
+    if !self.param_resolved(function) {
       return false;
     }
+    let flow = self.flow;
+    let Some(symbol) = flow.named_by_function.get(&function) else { return false };
     let Some(uses) = flow.uses.get(symbol) else { return true };
-    if uses.escaped {
-      return false;
-    }
     uses.calls.iter().all(|args| {
       if args.iter().take(index + 1).any(|arg| matches!(arg, Argument::SpreadElement(_))) {
         return false;
@@ -2380,6 +2689,26 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
         Some(arg) => arg.as_expression().is_some_and(|expr| self.clean(expr)),
       }
     })
+  }
+
+  /// A function value: an allocation that carries what it captures.
+  fn function_value_clean(&mut self, start: u32) -> bool {
+    if self.heap() || self.flow.opaque.contains(&start) {
+      return false;
+    }
+    match self.function_values.get(&start) {
+      Some(Some(clean)) => return *clean,
+      Some(None) => return false,
+      None => {}
+    }
+    self.function_values.insert(start, None);
+    let flow = self.flow;
+    let clean = flow
+      .captures
+      .get(&start)
+      .is_none_or(|captures| captures.iter().all(|symbol| self.binding_clean(*symbol)));
+    self.function_values.insert(start, Some(clean));
+    clean
   }
 
   fn returns_clean(&mut self, node: FnNode<'a>, success: bool) -> bool {
@@ -2421,52 +2750,243 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
     }
   }
 
-  fn call_clean(&mut self, call: &CallExpression<'a>) -> bool {
+  /// The row a call matches, if any: exact identity and call shape.
+  fn row<'b>(&self, call: &'b CallExpression<'a>) -> Option<Row<'b, 'a>> {
+    let args = &call.arguments;
+    if args.iter().any(|argument| matches!(argument, Argument::SpreadElement(_))) {
+      return None;
+    }
+    let arg = |index: usize| args.get(index).and_then(Argument::as_expression);
     let callee = strip(&call.callee);
-    if let Expression::Identifier(ident) = callee {
-      if let Some(&function) = self.symbol(ident).and_then(|symbol| self.flow.named.get(&symbol)) {
-        return self.function_clean(function);
+    if let Expression::StaticMemberExpression(member) = callee {
+      if member.property.name == "of" && self.shared.key_of(self.module, &member.object).is_some() {
+        return (args.len() == 1).then(|| arg(0).map(Row::Of)).flatten();
       }
     }
-    if let Some(path) = self.shared.builtin_path(self.module, callee) {
-      return match path.as_str() {
-        "JSON.parse" => call.arguments.len() == 1,
-        "String" | "Number" | "Boolean" | "parseInt" | "parseFloat" | "isNaN" | "isFinite"
-        | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI"
-        | "Array.isArray" | "Object.is" | "Reflect.ownKeys" | "Reflect.has" | "Date.now" => true,
-        "structuredClone"
-        | "Object.keys"
-        | "Object.values"
-        | "Object.entries"
-        | "Object.getOwnPropertyNames"
-        | "Object.fromEntries"
-        | "Object.freeze"
-        | "Array.from"
-        | "Array.of" => self.args_clean(&call.arguments),
-        path => path.starts_with("Math.") || path.starts_with("Number."),
+    if let Expression::CallExpression(inner) = callee {
+      return match self.shared.api_of(self.module, &inner.callee) {
+        Some("Layer.effect")
+          if inner.arguments.len() == 1
+            && inner.arguments[0]
+              .as_expression()
+              .is_some_and(|key| self.shared.key_of(self.module, key).is_some())
+            && args.len() == 1 =>
+        {
+          arg(0).filter(|e| self.layer_body(e)).map(Row::LayerEffect)
+        }
+        Some("Context.Service") if inner.arguments.is_empty() => Some(Row::Key),
+        _ => None,
       };
     }
-    if let Expression::StaticMemberExpression(member) = callee {
-      let name = member.property.name.as_str();
-      if let Some(key) = self.consumer_key(&member.object) {
-        return self.facts.get(key).and_then(|methods| methods.get(name)).copied().unwrap_or(false);
+    let key =
+      |index: usize| arg(index).is_some_and(|e| self.shared.key_of(self.module, e).is_some());
+    match self.shared.api_of(self.module, callee)? {
+      "Context.Service" => Some(Row::Key),
+      "Layer.succeed" if args.len() == 2 && key(0) => arg(1).map(Row::LayerSucceed),
+      "Layer.effect" if args.len() == 2 && key(0) => {
+        arg(1).filter(|e| self.layer_body(e)).map(Row::LayerEffect)
       }
-      if name == "of" && self.shared.key_of(self.module, &member.object).is_some() {
-        return call.arguments.len() == 1 && self.args_clean(&call.arguments);
+      "Layer.effect" if args.len() == 1 && key(0) => Some(Row::LayerCurried),
+      "Layer.mergeAll" if !args.is_empty() => Some(Row::LayerCombine),
+      "Layer.provide" if args.len() == 2 => Some(Row::LayerCombine),
+      "Effect.gen" if args.len() == 1 => arg(0)
+        .filter(|f| matches!(strip(f), Expression::FunctionExpression(f) if f.generator))
+        .map(Row::Gen),
+      "Effect.sync" if args.len() == 1 => arg(0)
+        .filter(|f| {
+          self.function_expr(f).is_some_and(|node| match node {
+            FnNode::Arrow(f) => f.params.items.is_empty() && f.params.rest.is_none() && !f.r#async,
+            FnNode::Function(f) => {
+              f.params.items.is_empty() && f.params.rest.is_none() && !f.generator && !f.r#async
+            }
+          }) && matches!(
+            strip(f),
+            Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+          )
+        })
+        .map(Row::Sync),
+      "Effect.acquireRelease" if args.len() == 2 => Some(Row::AcquireRelease(arg(0)?, arg(1)?)),
+      "Effect.provide" if args.len() == 2 => Some(Row::Provide(arg(0)?, arg(1)?)),
+      "Effect.runPromise" if args.len() == 1 => arg(0).map(Row::RunPromise),
+      "Effect.runPromise" if args.len() == 2 && arg(1).is_some_and(on_fiber_start_options) => {
+        arg(0).map(Row::RunPromise)
       }
-      if CLEAN_METHODS.contains(&name) {
-        return self.clean(&member.object) && self.args_clean(&call.arguments);
+      "Effect.forkChild" if args.len() == 1 => arg(0).map(Row::ForkChild),
+      "Fiber.join" if args.len() == 1 => arg(0).map(Row::Join),
+      _ => None,
+    }
+  }
+
+  /// Row 4: the effect of `Layer.effect` is a gen or acquireRelease row.
+  fn layer_body(&self, effect: &Expression<'a>) -> bool {
+    matches!(strip(effect), Expression::CallExpression(call)
+      if matches!(self.row(call), Some(Row::Gen(_) | Row::AcquireRelease(..))))
+  }
+
+  fn call_clean(&mut self, call: &CallExpression<'a>) -> bool {
+    if let Some(row) = self.row(call) {
+      return match row {
+        Row::Key | Row::LayerCurried => true,
+        Row::LayerCombine => self.args_clean(&call.arguments),
+        Row::Of(value) | Row::LayerSucceed(value) | Row::LayerEffect(value) => self.clean(value),
+        Row::Gen(f) | Row::Sync(f) | Row::ForkChild(f) | Row::Join(f) => self.clean(f),
+        Row::AcquireRelease(a, b) | Row::Provide(a, b) => self.clean(a) && self.clean(b),
+        // Row 10: the awaited value is the success of `e`, unless the heap may
+        // have replaced the Fiber's completion.
+        Row::RunPromise(effect) => !self.heap() && self.success(effect),
+      };
+    }
+    let callee = strip(&call.callee);
+    if let Expression::Identifier(ident) = callee {
+      if let Some(symbol) = self.symbol(ident) {
+        if let Some(&function) = self.flow.named.get(&symbol) {
+          return self.function_clean(function);
+        }
+        let canonical = self.shared.symbols.canonical_ref_for((self.module, symbol).into());
+        if canonical.owner != self.module {
+          return self.export_returns(canonical);
+        }
       }
     }
-    match self.shared.api_of(self.module, callee) {
-      Some("Effect.runPromise" | "Effect.runSync") => {
-        call.arguments.first().and_then(Argument::as_expression).is_some_and(|e| self.success(e))
+    match self.shared.resolve_expr(self.module, callee) {
+      Some(Resolved::Symbol(symbol)) => return self.export_returns(symbol),
+      Some(Resolved::Namespace(_)) => return false,
+      None => {}
+    }
+    if let Some(path) = self.shared.builtin_path(self.module, callee) {
+      let root = path.split('.').next().unwrap_or_default();
+      // A Proxy runs its traps on every access; their results are not followed.
+      return ECMA_GLOBALS.contains(&root)
+        && root != "Proxy"
+        && self.args_clean(&call.arguments)
+        && self.callbacks_clean(&call.arguments);
+    }
+    let Some((object, name)) = self.member_callee(callee) else { return false };
+    if let Some(key) = self.consumer_key(object) {
+      return !self.heap() && self.fact(&self.facts.methods, key, &name);
+    }
+    if let Some(node) = self.literal_method(object, &name) {
+      return !node.is_generator() && self.returns_clean(node, false);
+    }
+    self.builtin_value(object)
+      && BUILTIN_METHODS.contains(&name.as_str())
+      && self.clean(object)
+      && self.args_clean(&call.arguments)
+      && self.callbacks_clean(&call.arguments)
+  }
+
+  /// `object.name` or `object["name"]` as a callee.
+  fn member_callee<'b>(&self, callee: &'b Expression<'a>) -> Option<(&'b Expression<'a>, String)> {
+    match strip(callee) {
+      Expression::StaticMemberExpression(member) => {
+        Some((&member.object, member.property.name.to_string()))
+      }
+      Expression::ComputedMemberExpression(member) => {
+        Some((&member.object, self.shared.const_string(self.module, &member.expression)?))
+      }
+      _ => None,
+    }
+  }
+
+  /// A method of an object literal, inline or bound to a `const`.
+  fn literal_method(&self, object: &Expression<'a>, name: &str) -> Option<FnNode<'a>> {
+    let literal = match strip(object) {
+      Expression::ObjectExpression(object) => object,
+      Expression::Identifier(ident) => {
+        let symbol = self.symbol(ident)?;
+        if self.flow.params.contains_key(&symbol) {
+          return None;
+        }
+        match self.flow.sources.get(&symbol).map(Vec::as_slice) {
+          Some([Source::Expr(init)]) => match strip(init) {
+            Expression::ObjectExpression(object) => object,
+            _ => return None,
+          },
+          _ => return None,
+        }
+      }
+      _ => return None,
+    };
+    literal.properties.iter().find_map(|property| match property {
+      ObjectPropertyKind::ObjectProperty(property)
+        if !property.computed
+          && property.kind == PropertyKind::Init
+          && property
+            .key
+            .static_name()
+            .and_then(|n| n.as_js_str().as_str().map(String::from))
+            .as_deref()
+            == Some(name) =>
+      {
+        self.function_expr(&property.value)
+      }
+      _ => None,
+    })
+  }
+
+  /// Whether `expr` is an array, a string or a builtin collection, so its methods
+  /// are builtins.
+  fn builtin_value(&self, expr: &Expression<'a>) -> bool {
+    self.builtin_value_at(expr, 0)
+  }
+
+  fn builtin_value_at(&self, expr: &Expression<'a>, depth: usize) -> bool {
+    if depth > 16 {
+      return false;
+    }
+    match strip(expr) {
+      Expression::ArrayExpression(_)
+      | Expression::StringLiteral(_)
+      | Expression::TemplateLiteral(_) => true,
+      Expression::NewExpression(new) => self
+        .shared
+        .builtin_path(self.module, &new.callee)
+        .is_some_and(|path| BUILTIN_CONSTRUCTORS.contains(&path.as_str())),
+      Expression::CallExpression(call) => {
+        if let Some(path) = self.shared.builtin_path(self.module, &call.callee) {
+          return BUILTIN_VALUE_PATHS.contains(&path.as_str());
+        }
+        self.member_callee(&call.callee).is_some_and(|(object, name)| {
+          BUILTIN_VALUE_METHODS.contains(&name.as_str()) && self.builtin_value_at(object, depth + 1)
+        })
+      }
+      Expression::Identifier(ident) => {
+        let Some(symbol) = self.symbol(ident) else { return false };
+        if self.flow.params.contains_key(&symbol) {
+          return false;
+        }
+        self.flow.sources.get(&symbol).is_some_and(|sources| {
+          sources.iter().all(|source| match source {
+            Source::Expr(expr) => self.builtin_value_at(expr, depth + 1),
+            Source::Primitive { .. } => true,
+            Source::Function(_) | Source::Unknown => false,
+          })
+        })
       }
       _ => false,
     }
   }
 
-  /// Whether the success value of an Effect expression is clean.
+  /// `yield*` in an Effect generator: a consumer, or the success of row 6, 12 or 13.
+  fn yield_clean(&mut self, yield_expr: &YieldExpression<'a>) -> bool {
+    if !yield_expr.delegate || !self.flow.effect_yields.contains(&yield_expr.span.start) {
+      return false;
+    }
+    let Some(argument) = &yield_expr.argument else { return false };
+    if self.shared.key_of(self.module, argument).is_some() {
+      return true;
+    }
+    match strip(argument) {
+      Expression::CallExpression(call)
+        if matches!(self.row(call), Some(Row::Sync(_) | Row::ForkChild(_) | Row::Join(_))) =>
+      {
+        self.success(argument)
+      }
+      _ => false,
+    }
+  }
+
+  /// The success taint `X` of an Effect expression.
   fn success(&mut self, expr: &Expression<'a>) -> bool {
     if self.depth > 64 {
       return false;
@@ -2490,37 +3010,42 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
           _ => false,
         }
       }
-      Expression::CallExpression(call) => {
-        let args = &call.arguments;
-        let arg = |index: usize| args.get(index).and_then(Argument::as_expression);
-        match self.shared.api_of(self.module, &call.callee) {
-          Some("Effect.succeed") if args.len() == 1 => arg(0).is_some_and(|v| self.clean(v)),
-          Some("Effect.sync") if args.len() == 1 => arg(0)
-            .and_then(|f| self.function_expr(f))
-            .is_some_and(|f| !f.is_generator() && self.returns_clean(f, false)),
-          Some("Effect.gen") if !args.is_empty() => arg(args.len() - 1)
-            .and_then(|f| self.function_expr(f))
-            .is_some_and(|f| self.returns_clean(f, false)),
-          Some("Effect.map") if args.len() == 2 => arg(1)
-            .and_then(|f| self.function_expr(f))
-            .is_some_and(|f| !f.is_generator() && self.returns_clean(f, false)),
-          Some("Effect.flatMap") if args.len() == 2 => arg(1)
-            .and_then(|f| self.function_expr(f))
-            .is_some_and(|f| !f.is_generator() && self.returns_clean(f, true)),
-          Some("Effect.tap" | "Effect.provide") if args.len() == 2 => {
-            arg(0).is_some_and(|e| self.success(e))
-          }
-          Some("Effect.all") if !args.is_empty() => match arg(0).map(strip) {
-            Some(Expression::ArrayExpression(array)) => array
-              .elements
-              .iter()
-              .all(|element| element.as_expression().is_some_and(|e| self.success(e))),
-            _ => false,
-          },
-          _ => false,
+      Expression::CallExpression(call) => match self.row(call) {
+        Some(Row::Gen(f)) => {
+          self.function_expr(f).is_some_and(|node| self.returns_clean(node, false))
         }
-      }
+        Some(Row::Sync(f)) => self
+          .function_expr(f)
+          .is_some_and(|node| !node.is_generator() && self.returns_clean(node, false)),
+        Some(Row::AcquireRelease(effect, _) | Row::Provide(effect, _)) => self.success(effect),
+        // Row 13: the success of the forked effect, while the Fiber's completion
+        // cannot have been replaced.
+        Some(Row::Join(fiber)) => {
+          !self.heap() && self.forked(fiber).is_some_and(|effect| self.success(effect))
+        }
+        _ => false,
+      },
       _ => false,
+    }
+  }
+
+  /// The effect a `const` Fiber was forked from: `const f = yield* Effect.forkChild(e)`.
+  fn forked(&self, fiber: &Expression<'a>) -> Option<&'a Expression<'a>> {
+    let Expression::Identifier(ident) = strip(fiber) else { return None };
+    let symbol = self.symbol(ident)?;
+    if self.flow.params.contains_key(&symbol) {
+      return None;
+    }
+    let Some([Source::Expr(init)]) = self.flow.sources.get(&symbol).map(Vec::as_slice) else {
+      return None;
+    };
+    let Expression::YieldExpression(yield_expr) = strip(init) else { return None };
+    let Expression::CallExpression(call) = strip(yield_expr.argument.as_ref()?) else {
+      return None;
+    };
+    match self.row(call) {
+      Some(Row::ForkChild(_)) => call.arguments.first().and_then(Argument::as_expression),
+      _ => None,
     }
   }
 
@@ -2545,20 +3070,71 @@ impl<'f, 's, 'l, 'a> Prov<'f, 's, 'l, 'a> {
       sources.iter().all(|source| match source {
         Source::Expr(expr) => self.key_numeric(expr),
         Source::Primitive { numeric } => *numeric,
-        Source::Function | Source::Unknown => false,
+        Source::Function(_) | Source::Unknown => false,
       })
     });
     self.numeric_symbols.insert(symbol, Some(numeric));
     numeric
   }
+
+  /// Whether the receiver of a write is resolved: a binding, a literal, a fresh
+  /// allocation, or a parameter bound only by direct calls.
+  fn receiver_resolved(&self, expr: &Expression<'a>) -> bool {
+    match strip(expr) {
+      Expression::ArrayExpression(_)
+      | Expression::ObjectExpression(_)
+      | Expression::NewExpression(_)
+      | Expression::ArrowFunctionExpression(_)
+      | Expression::FunctionExpression(_) => true,
+      Expression::Identifier(ident) => {
+        let Some(symbol) = self.symbol(ident) else { return false };
+        let canonical = self.shared.symbols.canonical_ref_for((self.module, symbol).into());
+        if canonical.owner != self.module {
+          return true;
+        }
+        if self.flow.callback_params.contains_key(&symbol) {
+          return true;
+        }
+        if let Some(&(function, _)) = self.flow.params.get(&symbol) {
+          return self.param_resolved(function);
+        }
+        self
+          .flow
+          .sources
+          .get(&symbol)
+          .is_some_and(|sources| sources.iter().all(|source| !matches!(source, Source::Unknown)))
+      }
+      _ => false,
+    }
+  }
 }
 
-/// Pass D: method results of user providers, for consumers that format them.
+/// Row 10: `{ onFiberStart: fn }` with exactly that property, `fn` taking at most one parameter.
+fn on_fiber_start_options(options: &Expression<'_>) -> bool {
+  let Expression::ObjectExpression(object) = strip(options) else { return false };
+  let [ObjectPropertyKind::ObjectProperty(property)] = object.properties.as_slice() else {
+    return false;
+  };
+  let name = property.key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from));
+  !property.computed
+    && property.kind == PropertyKind::Init
+    && name.as_deref() == Some("onFiberStart")
+    && match strip(&property.value) {
+      Expression::ArrowFunctionExpression(f) => {
+        f.params.items.len() <= 1 && f.params.rest.is_none()
+      }
+      Expression::FunctionExpression(f) => f.params.items.len() <= 1 && f.params.rest.is_none(),
+      _ => false,
+    }
+}
+
+/// Pass D: per provider site property, whether its method returns a clean value
+/// and whether the property value is clean.
 struct FactCollector<'p, 'f, 's, 'l, 'a> {
   prov: &'p mut Prov<'f, 's, 'l, 'a>,
   /// Site object literal start -> site index.
   sites: &'p FxHashMap<u32, usize>,
-  facts: Vec<(usize, String, bool)>,
+  facts: Vec<(usize, String, bool, bool)>,
 }
 
 impl<'a> VisitJs<'a> for FactCollector<'_, '_, '_, '_, 'a> {
@@ -2574,18 +3150,242 @@ impl<'a> VisitJs<'a> for FactCollector<'_, '_, '_, '_, 'a> {
         else {
           continue;
         };
-        let clean = self
+        let returns = self
           .prov
           .function_expr(&property.value)
           .is_some_and(|f| !f.is_generator() && self.prov.returns_clean(f, false));
-        self.facts.push((site, name, clean));
+        let value = self.prov.clean(&property.value);
+        self.facts.push((site, name, returns, value));
       }
     }
     walk_js::walk_object_expression(self, it);
   }
 }
 
-/// Pass E: sinks whose operand may hold an Effect runtime object, and static
+/// Pass E: writes that may put a runtime value into the heap, and calls that may
+/// do so. Each one seeds the build-global heap bit.
+struct HeapChecker<'p, 'f, 's, 'l, 'a> {
+  prov: &'p mut Prov<'f, 's, 'l, 'a>,
+  /// Consumer and release bindings, whose writes keep their own per-key rules.
+  tracked: &'p FxHashSet<SymbolId>,
+  reasons: Vec<(&'static str, Span, String)>,
+}
+
+impl<'a> HeapChecker<'_, '_, '_, '_, 'a> {
+  fn seed(&mut self, tag: &'static str, span: Span, reason: &str) {
+    self.reasons.push((tag, span, reason.to_string()));
+  }
+
+  fn tracked(&self, expr: &Expression<'a>) -> bool {
+    match strip(expr) {
+      Expression::Identifier(ident) => {
+        self.prov.symbol(ident).is_some_and(|symbol| self.tracked.contains(&symbol))
+          || self.prov.shared.key_of(self.prov.module, expr).is_some()
+      }
+      _ => false,
+    }
+  }
+
+  /// Clause 1: a write into a runtime object, or into an object of unresolved provenance.
+  fn receiver(&mut self, object: &Expression<'a>, span: Span) {
+    if self.tracked(object) || self.prov.clean(object) {
+      return;
+    }
+    if self.prov.receiver_resolved(object) {
+      self.seed("heap:receiver-runtime", span, "write into an object that may be a runtime object");
+    } else {
+      self.seed("heap:receiver-unresolved", span, "write into an object of unresolved provenance");
+    }
+  }
+
+  /// Clause 2: a stored value that may hold a runtime object, or a callable that returns one.
+  fn stored(&mut self, value: &Expression<'a>, span: Span) {
+    let tainted = !self.prov.clean(value)
+      || self
+        .prov
+        .function_expr(value)
+        .is_some_and(|node| node.is_generator() || !self.prov.returns_clean(node, false));
+    if tainted {
+      self.seed("heap:stored-value", span, "stored value may hold a runtime object");
+    }
+  }
+
+  fn member_write(
+    &mut self,
+    target: &oxc::ast::ast::MemberExpression<'a>,
+    value: Option<&Expression<'a>>,
+  ) {
+    let span = target.span();
+    let object = target.object();
+    self.receiver(object, span);
+    if let Some(value) = value {
+      self.stored(value, span);
+    }
+    let name = match target {
+      oxc::ast::ast::MemberExpression::StaticMemberExpression(member) => {
+        Some(member.property.name.to_string())
+      }
+      oxc::ast::ast::MemberExpression::ComputedMemberExpression(member) => {
+        if self.prov.is_hook_symbol(&member.expression) {
+          self.seed("heap:hook-name", span, "write of an implicitly invoked hook");
+        }
+        let name = self.prov.shared.const_string(self.prov.module, &member.expression);
+        // Clause 4: a non-constant key, except a number on an array.
+        if name.is_none()
+          && !(self.prov.builtin_value(&member.object) && self.prov.key_numeric(&member.expression))
+        {
+          self.seed("heap:unknown-target", span, "write by a non-constant name");
+        }
+        name
+      }
+      oxc::ast::ast::MemberExpression::PrivateFieldExpression(_) => None,
+    };
+    // Clause 3: hooks run during serialization, coercion and iteration.
+    if name
+      .as_deref()
+      .is_some_and(|name| HOOK_NAMES.contains(&name) || matches!(name, "constructor" | "__proto__"))
+    {
+      self.seed("heap:hook-name", span, "write of an implicitly invoked hook");
+    }
+  }
+
+  /// Whether the callee of a call is understood: a row, a trusted or builtin
+  /// operation, a host operation, or user code the analysis follows.
+  fn known_callee(&self, call: &CallExpression<'a>) -> bool {
+    if self.prov.row(call).is_some() {
+      return true;
+    }
+    let callee = strip(&call.callee);
+    let module = self.prov.module;
+    if matches!(callee, Expression::Super(_))
+      || self.prov.shared.api_of(module, callee).is_some()
+      || self.prov.shared.builtin_path(module, callee).is_some()
+      || self.prov.shared.resolve_expr(module, callee).is_some()
+    {
+      return true;
+    }
+    if let Expression::Identifier(ident) = callee {
+      return self.prov.symbol(ident).is_some_and(|symbol| {
+        self.prov.flow.named.contains_key(&symbol)
+          || self.prov.flow.host_imports.contains(&symbol)
+          || self.prov.shared.symbols.canonical_ref_for((module, symbol).into()).owner != module
+      });
+    }
+    let Some((object, name)) = self.prov.member_callee(callee) else { return false };
+    self.prov.consumer_key(object).is_some()
+      || self.prov.literal_method(object, &name).is_some()
+      || self.prov.builtin_value(object)
+      || host_root(self.prov, callee)
+  }
+}
+
+/// Whether a callee's root is a host value: an import from a Node builtin, or a
+/// global that is not part of ECMAScript.
+fn host_root(prov: &Prov<'_, '_, '_, '_>, callee: &Expression<'_>) -> bool {
+  let mut expr = strip(callee);
+  loop {
+    expr = match expr {
+      Expression::StaticMemberExpression(member) => strip(&member.object),
+      Expression::ComputedMemberExpression(member) => strip(&member.object),
+      _ => break,
+    }
+  }
+  let Expression::Identifier(ident) = expr else { return false };
+  match prov.symbol(ident) {
+    Some(symbol) => prov.flow.host_imports.contains(&symbol),
+    None => prov
+      .shared
+      .builtin_path(prov.module, callee)
+      .and_then(|path| path.split('.').next().map(String::from))
+      .is_some_and(|root| !ECMA_GLOBALS.contains(&root.as_str()) && root != "arguments"),
+  }
+}
+
+impl<'a> VisitJs<'a> for HeapChecker<'_, '_, '_, '_, 'a> {
+  fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+    let it = self.alloc(it);
+    let stores = it.operator == AssignmentOperator::Assign || it.operator.is_logical();
+    match &it.left {
+      target @ (AssignmentTarget::StaticMemberExpression(_)
+      | AssignmentTarget::ComputedMemberExpression(_)
+      | AssignmentTarget::PrivateFieldExpression(_)) => {
+        if let Some(member) = target.as_member_expression() {
+          self.member_write(member, stores.then_some(&it.right));
+        }
+      }
+      AssignmentTarget::ArrayAssignmentTarget(_) | AssignmentTarget::ObjectAssignmentTarget(_) => {
+        let mut finder = TargetFinder { identifiers: vec![], members: false, defaults: false };
+        finder.visit_assignment_target(&it.left);
+        if finder.members {
+          self.seed("heap:unknown-target", it.left.span(), "destructuring write into members");
+        }
+      }
+      _ => {}
+    }
+    walk_js::walk_assignment_expression(self, it);
+  }
+
+  fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
+    let it = self.alloc(it);
+    if let Some(member) = it.argument.as_member_expression() {
+      self.member_write(member, None);
+    }
+    walk_js::walk_update_expression(self, it);
+  }
+
+  fn visit_unary_expression(&mut self, it: &oxc::ast::ast::UnaryExpression<'a>) {
+    let it = self.alloc(it);
+    if it.operator.is_delete() {
+      if let Some(member) = it.argument.as_member_expression() {
+        self.member_write(member, None);
+      }
+    }
+    walk_js::walk_unary_expression(self, it);
+  }
+
+  fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+    let it = self.alloc(it);
+    let module = self.prov.module;
+    let callee = strip(&it.callee);
+    let path = self.prov.shared.builtin_path(module, callee);
+    let member = self.prov.member_callee(callee);
+    let installs = path.as_deref().is_some_and(|path| ACCESSOR_INSTALLERS.contains(&path))
+      || (path.as_deref() == Some("Object.create") && it.arguments.len() > 1)
+      || member
+        .as_ref()
+        .is_some_and(|(_, name)| matches!(name.as_str(), "__defineGetter__" | "__defineSetter__"));
+    if installs {
+      self.seed("heap:accessor-install", it.span, "installs a callable that runs later");
+    } else if let Some((object, name)) = &member {
+      if MUTATORS.contains(&name.as_str()) && path.is_none() {
+        self.receiver(object, it.span);
+        for argument in &it.arguments {
+          match argument {
+            Argument::SpreadElement(spread) => self.stored(&spread.argument, it.span),
+            argument => {
+              if let Some(value) = argument.as_expression() {
+                self.stored(value, it.span);
+              }
+            }
+          }
+        }
+      }
+    }
+    let any_tainted = it.arguments.iter().any(|argument| match argument {
+      Argument::SpreadElement(spread) => !self.prov.clean(&spread.argument),
+      argument => argument.as_expression().is_some_and(|expr| !self.prov.clean(expr)),
+    });
+    if self.prov.row(it).is_none() && self.prov.shared.api_of(module, callee).is_some() {
+      // The trusted call may store ambient runtime values into its arguments.
+      self.seed("heap:unsummarized-call", it.span, "Effect call without a summary");
+    } else if any_tainted && !self.known_callee(it) {
+      self.seed("heap:unknown-callee", it.span, "unknown callee receives a runtime value");
+    }
+    walk_js::walk_call_expression(self, it);
+  }
+}
+
+/// Pass F: sinks whose operand may hold an Effect runtime object, and static
 /// reads on such values.
 struct SinkChecker<'p, 'f, 's, 'l, 'a> {
   prov: &'p mut Prov<'f, 's, 'l, 'a>,
@@ -2597,14 +3397,16 @@ struct SinkChecker<'p, 'f, 's, 'l, 'a> {
   unclean_receivers: FxHashSet<(u32, u32)>,
   /// Names whose presence is observed on a value that may hold a service.
   names: Vec<String>,
-  global_bailouts: Vec<String>,
+  global_bailouts: Vec<Bailout>,
 }
 
 impl<'a> SinkChecker<'_, '_, '_, '_, 'a> {
   fn bail(&mut self, span: Span, reason: &str) {
-    self
-      .global_bailouts
-      .push(format!("{reason} (module {:?} at {})", self.prov.module, span.start));
+    self.global_bailouts.push(Bailout {
+      tag: "bailout",
+      reason: reason.to_string(),
+      site: Some((self.prov.module, span.start)),
+    });
   }
 
   fn parent(&self, depth: usize) -> Option<&AstKind<'a>> {
@@ -2627,16 +3429,6 @@ impl<'a> SinkChecker<'_, '_, '_, '_, 'a> {
     }
   }
 
-  /// A member path rooted at an import from a Node formatting module.
-  fn formatter_callee(&self, callee: &Expression<'a>) -> bool {
-    let mut expr = strip(callee);
-    while let Expression::StaticMemberExpression(member) = expr {
-      expr = strip(&member.object);
-    }
-    matches!(expr, Expression::Identifier(ident)
-      if self.prov.symbol(ident).is_some_and(|s| self.prov.flow.formatting_imports.contains(&s)))
-  }
-
   fn unclean(&mut self, expr: &Expression<'a>) -> bool {
     !self.tracked_receiver(expr) && !self.prov.clean(expr)
   }
@@ -2657,7 +3449,25 @@ impl<'a> SinkChecker<'_, '_, '_, '_, 'a> {
     }
   }
 
-  fn check_call(&mut self, span: Span, callee: &Expression<'a>, args: &'a [Argument<'a>]) {
+  /// Row 11: `assert.strictEqual(a, b)`, `assert.deepStrictEqual(a, b)`, `assert.ok(x)`
+  /// on an import of `node:assert`.
+  fn assert_row(&self, callee: &Expression<'a>, arity: usize) -> bool {
+    let Expression::StaticMemberExpression(member) = strip(callee) else { return false };
+    let Expression::Identifier(ident) = strip(&member.object) else { return false };
+    self.prov.symbol(ident).is_some_and(|symbol| self.prov.flow.assert_imports.contains(&symbol))
+      && matches!(
+        (member.property.name.as_str(), arity),
+        ("strictEqual" | "deepStrictEqual", 2) | ("ok", 1)
+      )
+  }
+
+  fn check_call(
+    &mut self,
+    span: Span,
+    callee: &Expression<'a>,
+    args: &'a [Argument<'a>],
+    is_row: bool,
+  ) {
     let module = self.prov.module;
     let shared = self.prov.shared;
     if let Some(path) = shared.builtin_path(module, callee) {
@@ -2670,16 +3480,23 @@ impl<'a> SinkChecker<'_, '_, '_, '_, 'a> {
         return;
       }
     }
-    if let Some(name) = shared.api_of(module, callee) {
-      if FORMATTING_API_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
-        && self.any_unclean(args)
-      {
-        self.bail(span, &format!("`{name}` may format an Effect runtime object"));
-        return;
+    // Host operations need a summary; the only ones are the assertions, which
+    // format their operands on failure.
+    if host_root(self.prov, callee) {
+      if self.assert_row(callee, args.len()) {
+        if self.any_unclean(args) {
+          self.bail(span, "assertion may format an Effect runtime object");
+        }
+      } else {
+        self.bail(span, "host operation without a summary");
       }
+      return;
     }
-    if self.formatter_callee(callee) && self.any_unclean(args) {
-      self.bail(span, "a Node formatter may format an Effect runtime object");
+    // A trusted call without a summary may observe a runtime value it receives.
+    if let Some(name) = shared.api_of(module, callee) {
+      if !is_row && self.any_unclean(args) {
+        self.bail(span, &format!("`{name}` without a summary receives a runtime value"));
+      }
       return;
     }
     let export = shared.resolve_expr(module, callee).is_some();
@@ -2735,9 +3552,9 @@ impl<'a> VisitJs<'a> for SinkChecker<'_, '_, '_, '_, 'a> {
     let mut depth = 0;
     let mut path = it.name.to_string();
     let global = it.reference_id.get().is_some() && shared.resolve_ident(module, it).is_none();
-    let formatter = !global
-      && self.prov.symbol(it).is_some_and(|s| self.prov.flow.formatting_imports.contains(&s));
-    if global || formatter {
+    let host_import =
+      !global && self.prov.symbol(it).is_some_and(|s| self.prov.flow.host_imports.contains(&s));
+    if global || host_import {
       loop {
         match self.parent(depth) {
           Some(AstKind::StaticMemberExpression(member)) if member.object.span() == span => {
@@ -2759,8 +3576,14 @@ impl<'a> VisitJs<'a> for SinkChecker<'_, '_, '_, '_, 'a> {
           _ => break,
         }
       }
+      // A host value used as data may be called later without a summary.
+      let root = path.split('.').next().unwrap_or_default();
+      let host = host_import
+        || (!ECMA_GLOBALS.contains(&root)
+          && !GLOBAL_OBJECTS.contains(&root)
+          && !matches!(root, "arguments" | "require"));
       // Error classes are fine as values: `extends Error`, `instanceof Error`.
-      let hidden = formatter
+      let hidden = host
         || GLOBAL_OBJECTS.contains(&path.as_str())
         || matches!(path.as_str(), "Object" | "JSON")
         || READING_BUILTINS
@@ -2781,13 +3604,14 @@ impl<'a> VisitJs<'a> for SinkChecker<'_, '_, '_, '_, 'a> {
     if matches!(it.callee, Expression::Super(_)) && self.any_unclean(&it.arguments) {
       self.bail(it.span, "`super` call may format an Effect runtime object");
     }
-    self.check_call(it.span, &it.callee, &it.arguments);
+    let is_row = self.prov.row(it).is_some();
+    self.check_call(it.span, &it.callee, &it.arguments, is_row);
     walk_js::walk_call_expression(self, it);
   }
 
   fn visit_new_expression(&mut self, it: &NewExpression<'a>) {
     let it = self.alloc(it);
-    self.check_call(it.span, &it.callee, &it.arguments);
+    self.check_call(it.span, &it.callee, &it.arguments, false);
     walk_js::walk_new_expression(self, it);
   }
 
@@ -2917,16 +3741,49 @@ impl LinkStage<'_> {
       let bare = name.strip_prefix("node:").unwrap_or(name);
       let builtin = NODE_BUILTINS.contains(&bare) || name.starts_with("bun:");
       if !builtin {
-        report.global_bailouts.push(format!("external import `{name}`"));
+        report.global_bailouts.push(Bailout::global(format!("external import `{name}`")));
       }
     }
     for entry in &self.user_defined_entry_modules {
       let Some(module) = self.module_table[*entry].as_normal() else { continue };
       if !module.named_exports.is_empty() || module.has_star_export() {
-        report.global_bailouts.push(format!(
+        report.global_bailouts.push(Bailout::global(format!(
           "entry module `{}` has exports, which code outside the bundle can call",
           module.stable_id
-        ));
+        )));
+      }
+    }
+    // The operation summaries are claims about one effect version.
+    let mut versions: FxHashSet<(String, String)> = FxHashSet::default();
+    for module in &self.module_table.modules {
+      let Some(normal) = module.as_normal() else { continue };
+      let id = normal.id.as_str().replace('\\', "/");
+      for marker in ["/node_modules/effect/", "/packages/effect/"] {
+        let Some(index) = id.rfind(marker) else { continue };
+        let root = id[..index + marker.len() - 1].to_string();
+        if versions.iter().any(|(seen, _)| *seen == root) {
+          break;
+        }
+        let version = std::fs::read_to_string(format!("{root}/package.json"))
+          .ok()
+          .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+          .and_then(|json| json.get("version").and_then(|v| v.as_str()).map(String::from))
+          .unwrap_or_else(|| "unknown".to_string());
+        versions.insert((root, version));
+        break;
+      }
+    }
+    let mut versions: Vec<_> = versions.into_iter().collect();
+    versions.sort();
+    for (root, version) in versions {
+      if version != EFFECT_VERSION {
+        report.global_bailouts.push(Bailout {
+          tag: "version-mismatch",
+          reason: format!(
+            "effect {version} at `{root}` is not the version the operation summaries were checked against ({EFFECT_VERSION})"
+          ),
+          site: None,
+        });
       }
     }
     let mut api_names = FxHashMap::default();
@@ -3012,7 +3869,11 @@ impl LinkStage<'_> {
     }
     for module in dynamic_keys {
       if shared.prefixes[module.index()].is_none() {
-        report.global_bailouts.push(format!("service key with a dynamic key string ({module:?})"));
+        report.global_bailouts.push(Bailout {
+          tag: "bailout",
+          reason: "service key with a dynamic key string".to_string(),
+          site: Some((module, 0)),
+        });
       }
     }
 
@@ -3152,79 +4013,98 @@ impl LinkStage<'_> {
       .map(|(_, key)| key)
       .collect();
     let empty_consumers = FxHashMap::default();
-    let empty_facts: FxHashMap<String, FxHashMap<String, bool>> = FxHashMap::default();
-    // Method results of user providers, for consumers that format them.
-    let compute_facts = |heap_tainted: bool| {
-      let mut site_facts: FxHashMap<(usize, String), bool> = FxHashMap::default();
-      for module in &untrusted {
-        let starts: FxHashMap<u32, usize> = sites
-          .iter()
-          .enumerate()
-          .filter(|(_, site)| site.module == *module)
-          .map(|(index, site)| (site.start, index))
-          .collect();
-        if starts.is_empty() {
-          continue;
-        }
-        let Some(ast) = self.ast_table[*module].as_ref() else { continue };
-        ast.program.with_dependent(|_owner, dep| {
-          let flow = collect_flow(&shared, *module, &dep.program);
-          let mut prov =
-            Prov::new(&shared, *module, &flow, heap_tainted, &empty_facts, &empty_consumers);
-          let mut collector = FactCollector { prov: &mut prov, sites: &starts, facts: vec![] };
-          collector.visit_program(&dep.program);
-          for (site, name, clean) in collector.facts {
-            site_facts.insert((site, name), clean);
-          }
-        });
+    let empty_tracked = FxHashSet::default();
+    // Keys whose method results can be followed: user keys whose every provider
+    // is a recognised literal site, none kept whole.
+    let mut eligible: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    for key in &user_keys {
+      if incomplete_keys.contains(*key) {
+        continue;
       }
-      let mut facts: FxHashMap<String, FxHashMap<String, bool>> = FxHashMap::default();
-      for key in &user_keys {
-        if incomplete_keys.contains(*key) {
-          continue;
-        }
-        let key_sites: Vec<usize> =
-          (0..sites.len()).filter(|index| sites[*index].keys.contains(*key)).collect();
-        if key_sites.is_empty() {
-          continue;
-        }
-        let names: FxHashSet<&String> = site_facts
-          .keys()
-          .filter(|(site, _)| key_sites.contains(site))
-          .map(|(_, name)| name)
-          .collect();
-        let methods = names
-          .into_iter()
-          .map(|name| {
-            let clean = key_sites
-              .iter()
-              .all(|site| site_facts.get(&(*site, name.clone())).copied().unwrap_or(false));
-            (name.clone(), clean)
-          })
-          .collect();
-        facts.insert((*key).clone(), methods);
-      }
-      facts
-    };
-    // Whether any object or collection in user code may hold a runtime value,
-    // assuming none does: every write must keep that true.
-    let mut facts = compute_facts(false);
-    let mut heap_tainted = false;
-    for module in &untrusted {
-      let Some(ast) = self.ast_table[*module].as_ref() else { continue };
-      ast.program.with_dependent(|_owner, dep| {
-        let flow = collect_flow(&shared, *module, &dep.program);
-        let consumers = module_consumers.get(module).unwrap_or(&empty_consumers);
-        let mut prov = Prov::new(&shared, *module, &flow, false, &facts, consumers);
-        heap_tainted |=
-          flow.heap_unknown || flow.heap_writes.iter().any(|value| !prov.clean(value));
-      });
-      if heap_tainted {
-        break;
+      let key_sites: Vec<usize> =
+        (0..sites.len()).filter(|index| sites[*index].keys.contains(*key)).collect();
+      if !key_sites.is_empty() && key_sites.iter().all(|index| !sites[*index].top) {
+        eligible.insert((*key).clone(), key_sites);
       }
     }
-    if heap_tainted {
-      facts = compute_facts(true);
+    let mut site_starts: FxHashMap<ModuleIdx, FxHashMap<u32, usize>> = FxHashMap::default();
+    for (index, site) in sites.iter().enumerate() {
+      site_starts.entry(site.module).or_default().insert(site.start, index);
+    }
+    let site_names = |key_sites: &[usize]| -> FxHashSet<String> {
+      key_sites
+        .iter()
+        .flat_map(|index| sites[*index].props.iter().filter_map(|prop| prop.name.clone()))
+        .collect()
+    };
+    // Least fixpoint: every fact starts clean and only becomes tainted.
+    let mut facts = Facts::default();
+    for (key, key_sites) in &eligible {
+      let names: FxHashMap<String, bool> =
+        site_names(key_sites).into_iter().map(|name| (name, true)).collect();
+      facts.methods.insert(key.clone(), names.clone());
+      facts.properties.insert(key.clone(), names);
+    }
+    let mut converged = false;
+    for _ in 0..32 {
+      let mut next = Facts { heap: facts.heap, ..Facts::default() };
+      let mut site_facts: FxHashMap<(usize, String), (bool, bool)> = FxHashMap::default();
+      let mut reasons: Vec<Bailout> = vec![];
+      for module in &untrusted {
+        let Some(ast) = self.ast_table[*module].as_ref() else { continue };
+        let consumers = module_consumers.get(module).unwrap_or(&empty_consumers);
+        let module_tracked = tracked.get(module).unwrap_or(&empty_tracked);
+        ast.program.with_dependent(|_owner, dep| {
+          let flow = collect_flow(&shared, *module, &dep.program);
+          let mut prov = Prov::new(&shared, *module, &flow, &facts, consumers);
+          for symbol in shared.resolved_exports[module.index()].values() {
+            let canonical = shared.symbols.canonical_ref_for(*symbol);
+            if canonical.owner != *module {
+              continue;
+            }
+            let value = prov.symbol_clean(canonical.symbol);
+            let returns = flow.named.get(&canonical.symbol).map(|f| prov.function_clean(*f));
+            next.exports.insert(canonical, (value, returns));
+          }
+          if let Some(starts) = site_starts.get(module) {
+            let mut collector = FactCollector { prov: &mut prov, sites: starts, facts: vec![] };
+            collector.visit_program(&dep.program);
+            for (site, name, returns, value) in collector.facts {
+              site_facts.insert((site, name), (returns, value));
+            }
+          }
+          let mut heap = HeapChecker { prov: &mut prov, tracked: module_tracked, reasons: vec![] };
+          heap.visit_program(&dep.program);
+          reasons.extend(heap.reasons.into_iter().map(|(tag, span, reason)| Bailout {
+            tag,
+            reason,
+            site: Some((*module, span.start)),
+          }));
+        });
+      }
+      next.heap = facts.heap || !reasons.is_empty();
+      for (key, key_sites) in &eligible {
+        let mut methods = FxHashMap::default();
+        let mut properties = FxHashMap::default();
+        for name in site_names(key_sites) {
+          let at = |site: &usize| site_facts.get(&(*site, name.clone())).copied();
+          let returns = key_sites.iter().all(|site| at(site).is_some_and(|f| f.0));
+          let value = key_sites.iter().all(|site| at(site).is_some_and(|f| f.1));
+          methods.insert(name.clone(), returns);
+          properties.insert(name, value);
+        }
+        next.methods.insert(key.clone(), methods);
+        next.properties.insert(key.clone(), properties);
+      }
+      if next == facts {
+        report.heap_reasons = reasons;
+        converged = true;
+        break;
+      }
+      facts = next;
+    }
+    if !converged {
+      report.global_bailouts.push(Bailout::global("provenance facts did not converge".to_string()));
     }
     let mut unknown_reads: Vec<(String, Vec<Guard>)> = vec![];
     for module in &untrusted {
@@ -3234,12 +4114,11 @@ impl LinkStage<'_> {
         .filter(|(owner, _)| owner == module)
         .filter_map(|(_, (receiver, _, _))| *receiver)
         .collect();
-      let empty_tracked = FxHashSet::default();
       let module_tracked = tracked.get(module).unwrap_or(&empty_tracked);
       ast.program.with_dependent(|_owner, dep| {
         let flow = collect_flow(&shared, *module, &dep.program);
         let consumers = module_consumers.get(module).unwrap_or(&empty_consumers);
-        let mut prov = Prov::new(&shared, *module, &flow, heap_tainted, &facts, consumers);
+        let mut prov = Prov::new(&shared, *module, &flow, &facts, consumers);
         let mut checker = SinkChecker {
           prov: &mut prov,
           path: vec![],
@@ -3485,10 +4364,34 @@ impl LinkStage<'_> {
       });
     }
 
+    // Every reason, deduplicated by tag and site, as a warning.
+    let mut reported: FxHashSet<(&'static str, Option<(ModuleIdx, u32)>)> = FxHashSet::default();
+    for reason in report.global_bailouts.iter().chain(&report.heap_reasons) {
+      if !reported.insert((reason.tag, reason.site)) {
+        continue;
+      }
+      let site = reason
+        .site
+        .and_then(|(module, offset)| self.module_table[module].as_normal().map(|n| (n, offset)));
+      let (id, position) = match site {
+        Some((normal, offset)) => {
+          let before = normal.source.get(..offset as usize).unwrap_or_default();
+          let line = before.matches('\n').count() + 1;
+          let column = before.len() - before.rfind('\n').map_or(0, |newline| newline + 1) + 1;
+          (Some(normal.id.to_string()), Some((line, column)))
+        }
+        None => (None, None),
+      };
+      self.diagnostics.push(
+        BuildDiagnostic::effect_service_shaking(id, reason.tag, reason.reason.clone(), position)
+          .with_severity_warning(),
+      );
+    }
     tracing::debug!(?report, "effect service shaking");
     #[expect(clippy::print_stderr, reason = "opt-in report for measuring the experimental pass")]
     if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some() {
       eprintln!("[effect-service-shaking] global bailouts: {:#?}", report.global_bailouts);
+      eprintln!("[effect-service-shaking] heap reasons: {:#?}", report.heap_reasons);
       eprintln!("[effect-service-shaking] key bailouts: {:#?}", report.key_bailouts);
       eprintln!("[effect-service-shaking] removed: {:#?}", report.removed);
       let mut demand: Vec<_> = demand
