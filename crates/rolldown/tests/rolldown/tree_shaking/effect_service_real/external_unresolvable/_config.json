@@ -1,0 +1,9 @@
+{
+  "_comment": "Uses the real effect package from the repository devDependencies. `./late.js` is external and does not exist at build time; _test.mjs writes it next to the bundle before running it.",
+  "config": {
+    "external": ["./late.js"],
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  }
+}

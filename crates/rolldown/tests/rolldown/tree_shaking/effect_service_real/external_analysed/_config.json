@@ -1,0 +1,9 @@
+{
+  "_comment": "Uses the real effect package from the repository devDependencies. `./ext/reader.js` stays external: it is on disk next to main.js when the program is bundled, and _test.mjs copies it next to the bundle before running it.",
+  "config": {
+    "external": ["./ext/reader.js"],
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  }
+}
