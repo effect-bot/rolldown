@@ -1,0 +1,9 @@
+{
+  "_comment": "Measurement fixture: the real @effect/ai-openai generated client. The bundle is about 2 MB, so it is not snapshotted, and it sits outside the effect_service filter to keep that 10-second CI step within budget.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false
+}
