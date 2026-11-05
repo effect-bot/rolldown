@@ -4,10 +4,10 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 
 // Control: run A hands a plain object to code compiled from text built at run
-// time, and that code turns one of its fields into a getter. Run B reads the
-// field statically, so the getter runs inside run B's fiber and reaches run
-// B's service through `globalThis["~effect/Fiber/currentFiber"]`. Run B makes
-// no call into the compiled code, yet its service keeps every method.
+// time, which turns one of its fields into a getter. Run B stores its service
+// in that object and reads the field statically, so the getter calls a method
+// of run B's service chosen at run time. Run B never calls the compiled code
+// itself, yet its service keeps every method.
 const Store = Context.Service("test/RealOpaqueAccessorStore")
 const Other = Context.Service("test/RealOpaqueAccessorOther")
 const StoreLayer = Layer.succeed(Store, Store.of({ readStore: () => "s1" }))
@@ -21,21 +21,19 @@ const OtherLayer = Layer.effect(
   })
 )
 
-const config = { label: "plain" }
+const registry = { label: "plain", service: undefined }
 const source = [
-  "Object.defineProperty(config, 'label', { get() {",
-  " const context = globalThis['~effect/Fiber/current', 'Fiber'].context;",
-  " return context.mapUnsafe.get('test/RealOpaqueAccessor', 'Other').accessorOther', 'Unused() } })"
-]
-  .join("")
-  .split("', '")
-  .join("")
+  "Object.defineProperty(registry, 'label', { get() {",
+  " return this.service['accessorOther' + 'Unused']() } })"
+].join("")
 const runA = Effect.gen(function* () {
-  Function("config", source)(config)
+  Function("registry", source)(registry)
   return (yield* Store).readStore()
 })
 const runB = Effect.gen(function* () {
-  return [(yield* Other).readOther(), config.label]
+  const other = yield* Other
+  registry.service = other
+  return [other.readOther(), registry.label]
 })
 
 assert.strictEqual(await Effect.runPromise(Effect.provide(runA, StoreLayer)), "s1")

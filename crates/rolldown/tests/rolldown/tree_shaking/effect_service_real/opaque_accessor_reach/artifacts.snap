@@ -6,7 +6,7 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## EFFECT_SERVICE_SHAKING
 
 ```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Function` may run code outside the bundle at 34:3 in main.js
+[EFFECT_SERVICE_SHAKING] [bailout] `Function` may run code outside the bundle at 30:3 in main.js
 
 ```
 
@@ -4702,18 +4702,19 @@ const OtherLayer = effect(Other, gen(function* () {
 		accessorOtherUnused
 	});
 }));
-const config = { label: "plain" };
-const source = [
-	"Object.defineProperty(config, 'label', { get() {",
-	" const context = globalThis['~effect/Fiber/current', 'Fiber'].context;",
-	" return context.mapUnsafe.get('test/RealOpaqueAccessor', 'Other').accessorOther', 'Unused() } })"
-].join("").split("', '").join("");
+const registry = {
+	label: "plain",
+	service: void 0
+};
+const source = ["Object.defineProperty(registry, 'label', { get() {", " return this.service['accessorOther' + 'Unused']() } })"].join("");
 const runA = gen(function* () {
-	Function("config", source)(config);
+	Function("registry", source)(registry);
 	return (yield* Store).readStore();
 });
 const runB = gen(function* () {
-	return [(yield* Other).readOther(), config.label];
+	const other = yield* Other;
+	registry.service = other;
+	return [other.readOther(), registry.label];
 });
 assert.strictEqual(await runPromise(provide(runA, StoreLayer)), "s1");
 assert.deepStrictEqual(await runPromise(provide(runB, OtherLayer)), ["o1", "o2"]);

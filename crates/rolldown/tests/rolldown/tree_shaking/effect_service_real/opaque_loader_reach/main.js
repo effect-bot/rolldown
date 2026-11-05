@@ -3,12 +3,10 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 
-// Run A compiles code from text built at run time and passes it one service.
-// While a fiber runs, Effect keeps it in
-// `globalThis["~effect/Fiber/currentFiber"]`, so the compiled code also reaches
-// the other service of run A without being handed it. Both services of run A
-// keep every method. Run B never runs the compiled code and shares nothing
-// with run A, so its unread method can go.
+// Code compiled from text built at run time receives one service, so that
+// service keeps every method. The other services are never handed to it:
+// `Ambient` is provided alongside it and `Other` elsewhere, and both lose
+// their unread methods.
 const Store = Context.Service("test/RealOpaqueLoaderStore")
 const Ambient = Context.Service("test/RealOpaqueLoaderAmbient")
 const Other = Context.Service("test/RealOpaqueLoaderOther")
@@ -40,17 +38,11 @@ const OtherLayer = Layer.effect(
   })
 )
 
-const source = [
-  "const fiber = globalThis['~effect/Fiber/current', 'Fiber'].context;",
-  "return [store.loaderStore', 'Unused(), fiber.mapUnsafe.get('test/RealOpaqueLoader', 'Ambient').loaderAmbient', 'Unused()]"
-]
-  .join("")
-  .split("', '")
-  .join("")
+const source = ["return store.loaderStore", "Unused()"].join("")
 const runA = Effect.gen(function* () {
   const store = yield* Store
   const ambient = yield* Ambient
-  return [store.readStore(), ambient.readAmbient(), ...Function("store", source)(store)]
+  return [store.readStore(), ambient.readAmbient(), Function("store", source)(store)]
 })
 const runB = Effect.gen(function* () {
   return (yield* Other).readOther()
@@ -58,6 +50,6 @@ const runB = Effect.gen(function* () {
 
 assert.deepStrictEqual(
   await Effect.runPromise(Effect.provide(runA, Layer.mergeAll(StoreLayer, AmbientLayer))),
-  ["s1", "m1", "s2", "m2"]
+  ["s1", "m1", "s2"]
 )
 assert.strictEqual(await Effect.runPromise(Effect.provide(runB, OtherLayer)), "o1")

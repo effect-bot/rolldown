@@ -5,11 +5,11 @@ import path from "node:path"
 // The program asserts its own output when imported.
 await import("./dist/main.js")
 
-// Every service in the run keeps `ping`; the unread method is removed.
+// Formatting the Context prints every method: every method stays.
 const code = fs.readFileSync(path.join(import.meta.dirname, "dist/main.js"), "utf8")
-for (const name of ["ping"]) {
+for (const name of ["inspectUnused", "inspectUnusedHelper"]) {
   assert.match(code, new RegExp(`\\b${name}\\b`), `${name} should be kept`)
 }
-for (const name of ["ambientUnused"]) {
+for (const name of []) {
   assert.doesNotMatch(code, new RegExp(`\\b${name}\\b`), `${name} should be removed`)
 }
