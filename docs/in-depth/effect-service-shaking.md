@@ -23,7 +23,7 @@ const Store = Context.Service('app/Store');
 class Client extends Context.Service<Client, Shape>()('app/Client') {}
 ```
 
-A class key's own static members (`OpenAiConfig.getOrUndefined`) may be read; other uses of the key follow the rules below.
+A class key's body may declare only static members with constant names, and none of them may redeclare what the key inherits from `Context.Service`: `of`, `key`, `use`, `useSync`, `context`, `pipe`, `toJSON`, `toString`, `name`, `length`, `prototype`, `caller`, `arguments`, `constructor`, the other `Object.prototype` members, or a `~` id. Any other class extending `Context.Service` turns the pass off. A class key's own static members (`OpenAiConfig.getOrUndefined`) may be read; other uses of the key follow the rules below.
 
 Consumers read methods from `yield* Key` inside `Effect.gen` or `Effect.fn`:
 
@@ -69,7 +69,7 @@ export const layer = (options) => Layer.effect(Client, make(options));
 const ClientLayer = layer({ apiUrl }).pipe(Layer.provide(HttpLayer));
 ```
 
-The pass follows `Layer.effect(Key, make(args))` into a module-level `Effect.fn` or `Effect.fnUntraced` constructor of the same module. It follows `return value` and `return yield* effect` there, and then a call to a module-level function, in any module, that returns only object literals. Those literals are provider objects only when every reference to the constructor and to the builder function is a call the pass followed into a provider; any other caller would get the same pruned object. The constructor's extra arguments must be `Effect.updateService`, `Effect.provideService`, `Effect.withSpan` or `Effect.annotateLogs` calls, which only change its context or tracing. A Layer returned from a module-level function is followed through each call of that function, and `layer.pipe(Layer.provide(a), ...)` with curried `Layer.provide`, `Layer.provideMerge` or `Layer.merge` is followed like the plain call.
+The pass follows `Layer.effect(Key, make(args))` into a module-level `Effect.fn` or `Effect.fnUntraced` constructor of the same module. It follows `return value` and `return yield* effect` there, and then a call to a module-level function, in any module, that returns only object literals. That function must be a function declaration, an arrow or an anonymous function expression; a named function expression is not followed, because its own name can hand it out where the pass does not look. Those literals are provider objects only when every reference to the constructor and to the builder function is a call the pass followed into a provider; any other caller would get the same pruned object. The constructor's extra arguments must be `Effect.updateService`, `Effect.provideService`, `Effect.withSpan` or `Effect.annotateLogs` calls, which only change its context or tracing. A Layer returned from a module-level function is followed through each call of that function, and `layer.pipe(Layer.provide(a), ...)` with curried `Layer.provide`, `Layer.provideMerge` or `Layer.merge` is followed like the plain call.
 
 ## What it never removes
 
