@@ -1293,9 +1293,22 @@ struct UseCollector<'s, 'l, 'a> {
   guard_bindings: Vec<GuardBinding>,
   global_bailouts: Vec<Bailout>,
   key_bailouts: Vec<(String, String)>,
+  /// Keys used where they may be provided with a value the pass does not
+  /// see: created again, held by Effect's code or a curried provider.
+  opaque_keys: Vec<String>,
 }
 
 impl<'a> UseCollector<'_, '_, 'a> {
+  /// A key bailout for a use through which the key may be provided unseen.
+  /// Effect's own modules provide their keys through the fiber, which the
+  /// analysis follows in Effect's code.
+  fn bail_key_opaque(&mut self, key: &str, span: Span, reason: &str) {
+    if !self.trusted {
+      self.opaque_keys.push(key.to_string());
+    }
+    self.bail_key(key, span, reason);
+  }
+
   fn bail_global(&mut self, span: Span, reason: &str) {
     self.global_bailouts.push(Bailout::at(self.module, span.start, reason.to_string()));
   }
@@ -2274,7 +2287,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
       _ => None,
     };
     match call {
-      Some(Some(key)) => self.bail_key(&key, use_span, "service key created outside a declaration"),
+      Some(Some(key)) => {
+        self.bail_key_opaque(&key, use_span, "service key created outside a declaration");
+      }
       _ if self.trusted => {}
       Some(None) => self.bail_global(use_span, "service key with a dynamic key string"),
       None => self.bail_global(use_span, "service key constructor used as a value"),
@@ -2311,7 +2326,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
       // Opaque code holding a key may change its key string, which moves
       // lookups to another service, so outside trusted modules this is global.
       if self.trusted {
-        self.bail_key(key, use_span, &format!("service key used in {parent}"));
+        self.bail_key_opaque(key, use_span, &format!("service key used in {parent}"));
       } else {
         self.bail_global(use_span, &format!("service key `{key}` used in {parent}"));
       }
@@ -2475,10 +2490,10 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
               self.provider(&key, kind, value, container);
             }
           } else {
-            self.bail_key(&key, it.span, "curried provider not applied");
+            self.bail_key_opaque(&key, it.span, "curried provider not applied");
           }
         } else {
-          self.bail_key(&key, it.span, "curried provider not applied");
+          self.bail_key_opaque(&key, it.span, "curried provider not applied");
         }
       }
     }
@@ -2496,7 +2511,9 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
           .and_then(Argument::as_expression)
           .and_then(|argument| self.shared.const_string(self.module, argument));
         match key {
-          Some(key) => self.bail_key(&key, it.span, "service key created outside a declaration"),
+          Some(key) => {
+            self.bail_key_opaque(&key, it.span, "service key created outside a declaration");
+          }
           // Effect's own modules create keys from constants or arguments.
           None if trusted => {}
           None => self.bail_global(it.span, "service key with a dynamic key string"),
@@ -3020,6 +3037,7 @@ impl LinkStage<'_> {
     let mut refs: FxHashMap<ModuleIdx, FxHashMap<ReferenceId, RefInfo>> = FxHashMap::default();
     let mut namespace_refs: Vec<(SymbolRef, RefInfo)> = vec![];
     let mut key_bailouts = vec![];
+    let mut opaque_keys: Vec<String> = vec![];
     for module in &normal_modules {
       let Some(ast) = self.ast_table[*module].as_ref() else { continue };
       // Rolldown's own runtime module is trusted like the effect package.
@@ -3047,8 +3065,10 @@ impl LinkStage<'_> {
           guard_bindings: vec![],
           global_bailouts: vec![],
           key_bailouts: vec![],
+          opaque_keys: vec![],
         };
         collector.visit_program(&dep.program);
+        opaque_keys.extend(collector.opaque_keys);
         accounted.extend(collector.accounted);
         consumers.extend(collector.consumers.into_iter().map(|c| (*module, c)));
         providers.extend(collector.providers.into_iter().map(|p| (*module, p)));
@@ -3087,6 +3107,13 @@ impl LinkStage<'_> {
           .modules
           .iter()
           .filter_map(|module| module.as_external().map(|external| external.idx))
+          .collect(),
+        opaque_keys: opaque_keys.iter().cloned().collect(),
+        effect_keys: shared
+          .keys
+          .iter()
+          .filter(|(symbol, _)| shared.prefixes[symbol.owner.index()].is_some())
+          .map(|(_, key)| key.clone())
           .collect(),
       })
     };

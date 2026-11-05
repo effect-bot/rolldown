@@ -40,6 +40,9 @@ use super::{
 #[derive(Default)]
 pub(super) struct EffectDefs<'s, 'a> {
   defs: FxHashMap<SymbolRef, (ModuleIdx, Def<'s, 'a>)>,
+  /// Members of the fiber's class: the running fiber's own operations, as
+  /// opposed to members of the global object it is also reached through.
+  fiber_members: rustc_hash::FxHashSet<String>,
   /// `F.prototype = P` statements at module level.
   prototypes: FxHashMap<SymbolRef, (ModuleIdx, &'s Expression<'a>)>,
   /// Module-level values, evaluated once: `None` while in progress or when
@@ -127,6 +130,17 @@ impl<'s, 'a> EffectDefs<'s, 'a> {
           let fiber = class.id.as_ref().is_some_and(|id| id.name == "FiberImpl")
             && shared.prefixes[module.index()].as_deref() == Some("internal/effect");
           if let Some(symbol) = class.id.as_ref().and_then(|id| id.symbol_id.get()) {
+            if fiber {
+              for element in &class.body.body {
+                if let Some(name) = element
+                  .property_key()
+                  .and_then(oxc::ast::ast::PropertyKey::static_name)
+                  .and_then(|name| name.as_js_str().as_str().map(String::from))
+                {
+                  self.fiber_members.insert(name);
+                }
+              }
+            }
             let def = if fiber { Def::FiberClass } else { Def::Class(class) };
             self.defs.insert(canonical(symbol), (module, def));
           }
@@ -806,10 +820,21 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
     #[expect(clippy::print_stderr, reason = "opt-in debugging of the experimental pass")]
     if value.is_none() && std::env::var_os("ROLLDOWN_EFFECT_SERVICE_REACH_TRACE").is_some() {
       let kind = format!("{expr:?}");
+      let source = self
+        .input
+        .effect_programs
+        .iter()
+        .find(|(module, _)| *module == ctx.module)
+        .map_or("", |(_, program)| program.source_text);
+      let span = expr.span();
+      let snippet = source
+        .get(span.start as usize..(span.end as usize).min(span.start as usize + 100))
+        .unwrap_or("")
+        .replace('\n', " ");
       eprintln!(
-        "[reach] no value: module {:?} at {} ({})",
+        "[reach] no value: module {:?} at {} ({}): {snippet}",
         ctx.module,
-        expr.span().start,
+        span.start,
         kind.split('(').next().unwrap_or_default()
       );
     }
@@ -1189,6 +1214,7 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
   }
 
   /// `value.key`, or `value[unknown]` when `key` is `None`.
+  #[expect(clippy::too_many_lines, reason = "one case per kind of object")]
   fn member_def(
     &mut self,
     object: &Value<'s, 'a>,
@@ -1227,6 +1253,21 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
           out = out.join(
             arguments.get(index).cloned().unwrap_or_else(|| Value::constant(Constant::Undefined)),
           );
+        }
+        Some(key) if Self::method_of(ObjectKind::Array, key, false).is_some() => {
+          // An array method of a rest parameter or `arguments`: on the list.
+          let elements = arguments.iter().fold(Value::default(), |acc, a| acc.join(a.clone()));
+          let list = Rc::new(std::cell::RefCell::new(Object {
+            kind: ObjectKind::Array,
+            other: elements,
+            ..Object::default()
+          }));
+          if let Some(method) = Self::method_of(ObjectKind::Array, key, false) {
+            out = out.join(Value {
+              callables: vec![Callable::Method(method, list)],
+              ..Value::default()
+            });
+          }
         }
         _ => {
           for argument in arguments.iter() {
@@ -1284,7 +1325,9 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
         (ObjectKind::Fiber, Some("_exit")) => {
           self.exit_object(data.other.clone()).join(Value::constant(Constant::Undefined))
         }
-        (ObjectKind::Fiber | ObjectKind::Promise, _)
+        // A created fiber's state, such as its Context: runtime state.
+        (ObjectKind::Fiber, _) => Value { fiber: true, ..Value::default() },
+        (ObjectKind::Promise, _)
         | (ObjectKind::Array | ObjectKind::Map, Some("length" | "size")) => Value::unknown(),
         (_, Some(key)) => {
           data.fields.get(key).cloned().unwrap_or_default().join(data.other.clone())
@@ -1508,6 +1551,23 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
     expr: &'s Expression<'a>,
     depth: usize,
   ) -> Option<bool> {
+    // `a && b` and `a || b` as a condition: only their truth matters.
+    if let Expression::LogicalExpression(logical) = strip(expr) {
+      let and = match logical.operator {
+        oxc::ast::ast::LogicalOperator::And => true,
+        oxc::ast::ast::LogicalOperator::Or => false,
+        oxc::ast::ast::LogicalOperator::Coalesce => {
+          let value = self.eval_def(ctx, expr, depth)?;
+          return value.constant.as_ref().map(Constant::truthy);
+        }
+      };
+      let left = self.eval_test(ctx, &logical.left, depth);
+      if left == Some(!and) {
+        return left;
+      }
+      let right = self.eval_test(ctx, &logical.right, depth);
+      return if left.is_some() || right == Some(!and) { right } else { None };
+    }
     let value = self.eval_def(ctx, expr, depth)?;
     value.constant.as_ref().map(Constant::truthy)
   }
@@ -1613,15 +1673,34 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
 
   /// Stores `value` in the objects `object` may be.
   fn store_def(
-    &self,
+    &mut self,
     object: &Value<'s, 'a>,
     key: Option<&str>,
     value: &Value<'s, 'a>,
   ) -> Option<()> {
-    // Into objects Effect's code built here. Anything else (the program's
-    // values, the fiber, builtins) is not modelled, so only Effect's own
-    // values may be stored there.
-    if object.objects.is_empty() || object.fiber || object.reach.any() || object.unknown {
+    // Into objects Effect's code built here. The running fiber's state
+    // keeps what is stored there, as a runtime store. Anything else (the
+    // program's values, builtins) is not modelled, so only Effect's own
+    // values may be stored there. A primitive, such as a counter, holds
+    // nothing anywhere.
+    let primitive = value.objects.is_empty()
+      && value.callables.is_empty()
+      && !value.fiber
+      && value.arguments.is_none()
+      && value.generator.is_none()
+      && !value.carries_program();
+    if primitive && (object.objects.is_empty() || object.reach.any() || object.unknown) {
+      return Some(());
+    }
+    if object.fiber && !object.reach.any() && !object.unknown && !object.carries_program_shallow_target()
+    {
+      if value.carries_program() {
+        self.store_in_runtime(std::slice::from_ref(value), 0, "a store into the fiber's state");
+      }
+      if object.objects.is_empty() {
+        return Some(());
+      }
+    } else if object.objects.is_empty() || object.reach.any() || object.unknown {
       return (!value.carries_program() && !object.carries_program_shallow_target()).then_some(());
     }
     for target in &object.objects {
@@ -1738,7 +1817,9 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
       return self.construct_builtin(name, &args, depth);
     }
     if let [Callable::FiberClass] = callee.callables.as_slice() {
-      // `new FiberImpl(context, ...)`: a fiber that has run nothing yet.
+      // `new FiberImpl(context, ...)`: a fiber that has run nothing yet,
+      // holding the Context it is given.
+      self.store_in_runtime(&args, depth, "FiberImpl");
       return Some(Value::object(Object { kind: ObjectKind::Fiber, ..Object::default() }));
     }
     if let [Callable::Class(module, class)] = callee.callables.as_slice() {
@@ -1798,6 +1879,11 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
     if depth > DEFINITION_DEPTH || callee.opaque_callee {
       return None;
     }
+    if callee.is_empty() {
+      // No value: a recursion's first approximation, or a member no object
+      // has (a call that throws). The call has no value either.
+      return Some(Value::default());
+    }
     #[expect(clippy::print_stderr, reason = "opt-in debugging of the experimental pass")]
     if callee.callables.is_empty()
       && !(callee.unknown && !args.iter().any(Value::carries_program) && !this.carries_program())
@@ -1830,7 +1916,8 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
       }
       // A method of a runtime object (a Context, a memo map, a fiber): its
       // result is runtime state, and functions it is given may be called
-      // back with that state.
+      // back with that state. What it is given may be stored there.
+      self.store_in_runtime(args, depth, "a runtime object's method");
       let state = Value { fiber: true, ..Value::default() };
       self.call_back_unknown(args, &state, depth)?;
       return Some(state);
@@ -1850,7 +1937,9 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
       let value = match callable {
         Callable::Program(function) => self.call_program_from_def(function, args)?,
         Callable::Closure { module, params, body, frame, lexical, .. } => {
-          let key = std::ptr::from_ref(params).addr();
+          // A function is its code and the frame it closes over: closures
+          // `dual` returns share their code.
+          let key = std::ptr::from_ref(params).addr().wrapping_mul(31) ^ Rc::as_ptr(&frame).addr();
           if self.defs.active.borrow().contains(&key) {
             // Recursion: the current approximation of the result.
             let mut recursive = self.defs.recursive.borrow_mut();
@@ -1914,6 +2003,9 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
           // objects (`children()`), so it reaches anything. Functions they
           // are given may be called back with that state.
           _ => {
+            if self.defs.fiber_members.contains(name.as_str()) {
+              self.store_in_runtime(args, depth, &name);
+            }
             let state = Value { fiber: true, ..Value::default() };
             self.call_back_unknown(args, &state, depth)?;
             state
@@ -1923,6 +2015,29 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
       result = result.join(value);
     }
     Some(result)
+  }
+
+  /// Values handed to the running fiber or another runtime object, which may
+  /// keep them in a Context: services of Effect's own keys may be any of
+  /// them.
+  fn store_in_runtime(&mut self, args: &[Value<'s, 'a>], depth: usize, what: &str) {
+    let mut stored = Reach::NONE;
+    for arg in args {
+      stored = stored.join(self.to_reach(arg, depth + 1).unwrap_or(Reach::TOP));
+    }
+    #[expect(clippy::print_stderr, reason = "opt-in debugging of the experimental pass")]
+    if stored.any()
+      && !self.state.runtime_stores.any()
+      && std::env::var_os("ROLLDOWN_EFFECT_SERVICE_REACH_DEBUG").is_some()
+    {
+      let name = self
+        .state
+        .deriving
+        .and_then(|api| self.shared().api_names.get(&api))
+        .map_or("?", String::as_str);
+      eprintln!("[reach] runtime store {stored:?} in {name} by {what}");
+    }
+    self.state.join_runtime_store(stored.collapse());
   }
 
   /// What awaiting a value gives: a Promise's resolution, or the value.
@@ -2083,6 +2198,27 @@ impl<'s, 'a> Walker<'_, 's, '_, 'a> {
           data.primitive = data.primitive.or(proto.primitive);
         }
         Value::object(data)
+      }
+      // Decided when the value is only objects Effect's code built, or only
+      // a constant: whether each is an array is known.
+      "Array.isArray"
+        if first.callables.is_empty()
+          && !first.fiber
+          && !first.unknown
+          && !first.carries_program_shallow_target()
+          && first.arguments.is_none()
+          && first.generator.is_none() =>
+      {
+        let mut kinds = first.objects.iter().map(|object| object.borrow().kind == ObjectKind::Array);
+        let all = first.objects.iter().all(|object| object.borrow().kind == ObjectKind::Array);
+        let any = kinds.any(|array| array);
+        match (first.objects.is_empty(), first.constant.is_some(), all, any) {
+          (true, true, _, _) | (false, false, false, false) => {
+            Value::constant(Constant::Bool(false))
+          }
+          (false, false, true, _) => Value::constant(Constant::Bool(true)),
+          _ => Value::unknown(),
+        }
       }
       "Promise.resolve" => Value::object(Object {
         kind: ObjectKind::Promise,

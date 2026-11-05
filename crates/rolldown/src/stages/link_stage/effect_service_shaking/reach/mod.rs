@@ -605,6 +605,13 @@ struct ReachState {
   opaque_fn: bool,
   /// Values stored under each property name by the analysed code.
   props: FxHashMap<String, Reach>,
+  /// What the services provided under each key may reach: every value the
+  /// program provides for the key, joined over its providers.
+  services: FxHashMap<String, Reach>,
+  /// Values Effect's code handed to a fiber or another runtime object, and
+  /// values given to Effect APIs not derived from their code: services of
+  /// Effect's own keys may be any of them.
+  runtime_stores: Reach,
   /// Effect APIs whose calls were derived from their definitions, and those
   /// that fell back to the API tables, for the report.
   derived: FxHashSet<String>,
@@ -683,6 +690,24 @@ impl ReachState {
       self.changed = true;
     }
   }
+  fn join_runtime_store(&mut self, value: Reach) {
+    let joined = self.runtime_stores.join(value);
+    if joined != self.runtime_stores {
+      self.runtime_stores = joined;
+      self.changed = true;
+    }
+  }
+  fn join_service(&mut self, key: &str, value: Reach) {
+    if !value.any() {
+      return;
+    }
+    let entry = self.services.entry(key.to_string()).or_default();
+    let joined = entry.join(value);
+    if joined != *entry {
+      *entry = joined;
+      self.changed = true;
+    }
+  }
   fn escape(&mut self, function: FnId) {
     if self.escaped.insert(function) {
       self.changed = true;
@@ -709,6 +734,12 @@ pub(super) struct ReachInput<'s, 'l, 'a> {
   pub(super) guard_declarators: &'s FxHashMap<(ModuleIdx, u32), SymbolRef>,
   /// Modules outside the bundle.
   pub(super) externals: FxHashSet<ModuleIdx>,
+  /// Keys whose services may be provided where the analysis does not see
+  /// the value.
+  pub(super) opaque_keys: FxHashSet<String>,
+  /// Keys Effect's own modules declare, whose services Effect's code
+  /// provides.
+  pub(super) effect_keys: FxHashSet<String>,
 }
 
 pub(super) fn analyse(input: &ReachInput<'_, '_, '_>) -> ReachOutcome {
@@ -1167,6 +1198,7 @@ enum Heritage {
 }
 
 /// An argument after evaluation.
+#[derive(Clone)]
 struct Arg {
   value: Reach,
   spread: bool,
@@ -1590,17 +1622,19 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
       Expression::YieldExpression(yield_expr) => {
         let value =
           yield_expr.argument.as_ref().map_or(Reach::NONE, |argument| self.eval(argument));
-        // A tracked key: the pass follows the service per key.
+        // A tracked key: the pass follows the service's methods per key; the
+        // value is what the key's providers provide.
         let tracked = yield_expr
           .argument
           .as_ref()
-          .is_some_and(|argument| self.shared().key_of(self.module, argument).is_some());
+          .and_then(|argument| self.shared().key_of(self.module, argument))
+          .cloned();
         let effect_generator = self
           .functions
           .last()
           .is_some_and(|function| self.info.effect_generators.contains(function));
-        if yield_expr.delegate && tracked {
-          Reach::NONE
+        if let (true, Some(key)) = (yield_expr.delegate, &tracked) {
+          self.service_of(key)
         } else if yield_expr.delegate && effect_generator {
           value.success()
         } else if yield_expr.delegate {
@@ -2258,7 +2292,9 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
         ret = ret.join(self.state.ret(*function));
       }
       match arg.kind {
-        ArgKind::Known | ArgKind::Lookup => {}
+        ArgKind::Known => {}
+        // A curried keyed lookup: the services it returns.
+        ArgKind::Lookup => ret = ret.join(arg.value),
         ArgKind::Effect => ret = ret.join(param.join(arg.value).collapse()),
         ArgKind::Host | ArgKind::Unknown => {
           if param.any() {
@@ -2313,12 +2349,13 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
       let api = api.to_string();
       self.eval_member_object(callee);
       let args = self.eval_args(&call.arguments, true);
-      if self.shared().key_creations.contains(&(self.module, call.callee.span().start))
-        || self.tracked_lookup(&api, &call.arguments, 0)
-      {
-        // A declared key, or a lookup by tracked keys: the pass follows those
-        // services per key.
+      if self.shared().key_creations.contains(&(self.module, call.callee.span().start)) {
+        // A declared key: the pass follows its services per key.
+        self.key_defaults(&call.arguments, &args);
         return Reach::NONE;
+      }
+      if let Some(result) = self.keyed_call(&api, &call.arguments, &args, &[]) {
+        return result;
       }
       if let Some(Resolved::Symbol(symbol)) = self.shared().resolve_expr(self.module, callee) {
         if let Some(result) = self.derive_api(symbol, &args, (self.module, call.span.start)) {
@@ -2408,10 +2445,12 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
         let inner_args = self.eval_args(&inner.arguments, true);
         let args = self.eval_args(&call.arguments, false);
         let piped = Self::join_all(&args);
-        if self.tracked_lookup(&api, &inner.arguments, 1)
-          || self.shared().key_creations.contains(&(self.module, call.callee.span().start))
-        {
+        if self.shared().key_creations.contains(&(self.module, call.callee.span().start)) {
+          self.key_defaults(&call.arguments, &args);
           return Reach::NONE;
+        }
+        if let Some(result) = self.keyed_call(&api, &inner.arguments, &inner_args, &args) {
+          return result;
         }
         self.apply_api_or_derive(&inner.callee, &api, piped, inner_args, call.span)
       }
@@ -2439,6 +2478,107 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
       }
       _ => {}
     }
+  }
+
+  /// A key declaration `Context.Reference("key", { defaultValue })`: what its
+  /// options produce is provided under the key when no other value is.
+  fn key_defaults(&mut self, arguments: &ArenaVec<'a, Argument<'a>>, args: &[Arg]) {
+    let Some(key) = arguments
+      .first()
+      .and_then(Argument::as_expression)
+      .and_then(|argument| self.shared().const_string(self.module, argument))
+    else {
+      return;
+    };
+    let mut provided = Reach::NONE;
+    for arg in args.iter().skip(1) {
+      let mut value = arg.value;
+      for function in &arg.functions {
+        value = value.join(self.state.ret(*function));
+      }
+      provided = provided.join(value).join(value.success());
+    }
+    self.state.join_service(&key, provided);
+  }
+
+  /// What the services provided under `key` may reach.
+  fn service_of(&self, key: &str) -> Reach {
+    if self.input.opaque_keys.contains(key) {
+      return Reach::TOP;
+    }
+    let provided = self.state.services.get(key).copied().unwrap_or_default();
+    if self.input.effect_keys.contains(key) {
+      return provided.join(self.state.runtime_stores);
+    }
+    provided
+  }
+
+  /// A call of an Effect API with tracked keys among `arguments`: a keyed
+  /// lookup yields what the keys' providers provide; any other call may
+  /// provide its other arguments, or what they succeed with, under the keys.
+  /// `piped` are the values a data-last call is applied to. `None` when the
+  /// call is not a lookup, and is evaluated as any other call.
+  fn keyed_call(
+    &mut self,
+    api: &str,
+    arguments: &ArenaVec<'a, Argument<'a>>,
+    args: &[Arg],
+    piped: &[Arg],
+  ) -> Option<Reach> {
+    let mut keys = vec![];
+    let mut others: Vec<Arg> = vec![];
+    for (argument, arg) in arguments.iter().zip(args) {
+      match argument.as_expression().and_then(|expr| self.shared().key_of(self.module, expr)) {
+        Some(key) => keys.push(key.clone()),
+        None => others.push(arg.clone()),
+      }
+    }
+    if keys.is_empty() {
+      return None;
+    }
+    if self.tracked_lookup(api, arguments, piped.len()) {
+      let services = keys.iter().fold(Reach::NONE, |acc, key| acc.join(self.service_of(key)));
+      let data = others
+        .iter()
+        .chain(piped)
+        .filter(|arg| arg.functions.is_empty())
+        .fold(Reach::NONE, |acc, arg| acc.join(arg.value));
+      return Some(match api {
+        // A Context holding the services of the keys, or all the others.
+        "Context.pick" | "Context.omit" => Reach::TOP,
+        "Effect.service" | "Effect.serviceOption" => services.effect_of(),
+        "Context.getOrElse" => {
+          let ret = self.call_back(&others, Reach::NONE);
+          services.join(ret)
+        }
+        "Effect.updateService"
+        | "Effect.updateServiceScoped"
+        | "Layer.updateService"
+        | "Stream.updateService"
+        | "Channel.updateService" => {
+          // The update is called with the service, and its result is
+          // provided under the key in its place.
+          let ret = self.call_back(&others, services);
+          for key in &keys {
+            self.state.join_service(key, ret);
+          }
+          if api == "Effect.updateServiceScoped" { Reach::NONE } else { data }
+        }
+        _ => services,
+      });
+    }
+    let mut provided = Reach::NONE;
+    for arg in others.iter().chain(piped) {
+      let mut value = arg.value;
+      for function in &arg.functions {
+        value = value.join(self.state.ret(*function));
+      }
+      provided = provided.join(value).join(value.success());
+    }
+    for key in &keys {
+      self.state.join_service(key, provided);
+    }
+    None
   }
 
   /// A keyed lookup whose keys are all tracked; `piped` counts arguments
@@ -2751,10 +2891,11 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
           if let Some(api) = self.shared().api_of(self.module, &call.callee).map(str::to_string) {
             self.eval_member_object(strip(&call.callee));
             let args = self.eval_args(&call.arguments, true);
-            value = if self.tracked_lookup(&api, &call.arguments, 1) {
-              Reach::NONE
-            } else {
-              self.apply_api_or_derive(&call.callee, &api, value, args, call.span)
+            let piped =
+              [Arg { value, spread: false, functions: vec![], kind: ArgKind::Known, site: None }];
+            value = match self.keyed_call(&api, &call.arguments, &args, &piped) {
+              Some(result) => result,
+              None => self.apply_api_or_derive(&call.callee, &api, value, args, call.span),
             };
             continue;
           }
@@ -2977,6 +3118,10 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
         ]
         .iter()
         .any(|word| lower.contains(word));
+        if all.any() && !self.state.runtime_stores.any() {
+          self.origin("runtime store (API not derived)", span);
+        }
+        self.state.join_runtime_store(all.collapse());
         let param = if errors { all.collapse().join(self.state.thrown) } else { all.collapse() };
         let ret = self.call_back(&args, param);
         all.join(ret).collapse()
