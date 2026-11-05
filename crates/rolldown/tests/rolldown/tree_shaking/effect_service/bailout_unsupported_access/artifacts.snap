@@ -6,56 +6,7 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## EFFECT_SERVICE_SHAKING
 
 ```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Context.get` without a summary receives a runtime value at 56:81 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Effect.flatMap` without a summary receives a runtime value at 56:20 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Effect.map` without a summary receives a runtime value at 55:20 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Effect.succeed` without a summary receives a runtime value at 56:66 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Effect.succeed` without a summary receives a runtime value at 57:33 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Layer.effect` without a summary receives a runtime value at 23:3 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `join` may read an Effect runtime object at 60:16 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 65:1 in main.js
+[EFFECT_SERVICE_SHAKING] [bailout] `Context.get` looks a service up other than by `yield*` at 56:81 in main.js
 
 ```
 
@@ -112,69 +63,6 @@ source: crates/rolldown_testing/src/integration_test.rs
 
 ```text
 [EFFECT_SERVICE_SHAKING] [bailout] service key `test/E` used in CallExpression at 48:12 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unknown-callee] unknown callee receives a runtime value at 27:14 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unknown-callee] unknown callee receives a runtime value at 57:20 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 23:3 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 55:20 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 56:20 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 56:35 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 56:66 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 56:81 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 57:33 in main.js
 
 ```
 

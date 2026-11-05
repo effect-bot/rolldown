@@ -6,119 +6,14 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## EFFECT_SERVICE_SHAKING
 
 ```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Effect.succeed` without a summary receives a runtime value at 35:54 in main.js
+[EFFECT_SERVICE_SHAKING] [bailout] builtin prototype modified or used as a value at 21:1 in main.js
 
 ```
 
 ## EFFECT_SERVICE_SHAKING
 
 ```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Effect.withFiber` without a summary receives a runtime value at 35:26 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 39:1 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:receiver-runtime] write into an object that may be a runtime object at 22:3 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:receiver-runtime] write into an object that may be a runtime object at 23:10 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:receiver-runtime] write into an object that may be a runtime object at 29:10 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:receiver-unresolved] write into an object of unresolved provenance at 21:1 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:receiver-unresolved] write into an object of unresolved provenance at 27:3 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:stored-value] stored value may hold a runtime object at 21:1 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:stored-value] stored value may hold a runtime object at 22:3 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:stored-value] stored value may hold a runtime object at 23:10 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:stored-value] stored value may hold a runtime object at 27:3 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:stored-value] stored value may hold a runtime object at 29:10 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unknown-callee] unknown callee receives a runtime value at 23:10 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unknown-callee] unknown callee receives a runtime value at 29:10 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 35:26 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 35:54 in main.js
+[EFFECT_SERVICE_SHAKING] [bailout] builtin prototype modified or used as a value at 27:3 in main.js
 
 ```
 

@@ -1,15 +1,6 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
 ---
-# warnings
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 39:1 in main.js
-
-```
-
 # Assets
 
 ## main.js

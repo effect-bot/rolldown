@@ -54,59 +54,20 @@ Demand is computed over code that can still run. Reads inside a removed method d
 ## When it keeps everything
 
 A service keeps every method when:
-- its key is used in any way not listed above, such as `Key.use`, `Effect.map(Key, ...)`, `Context.get` or `updateService`;
+- its key is used in any way not listed above, such as `Key.use` or `Effect.map(Key, ...)`;
 - the service value is passed anywhere, read with a computed key, or read through an inherited `Object.prototype` member;
 - a provider method may read `this`, the object has getters, spreads or an explicit `__proto__`, or a release callback takes anything other than a single plain parameter;
 - its Layer may leave the bundle or be used in an unrecognised way.
 
-Holding a Fiber or a Context is fine. A Context only hands out a service through a lookup by key, and the pass tracks every key. Every other way to reach a service goes through a value that may hold an Effect runtime object (a Context, a Fiber, a service, or anything that leads to one). User code is anything outside the Effect and `@effect/platform-node` packages. The pass tracks two facts for every value in user code:
-- its value taint: whether it may hold a runtime object;
-- for Effects, its success taint: whether the value it succeeds with may hold one.
+Everything else in Effect is allowed and ignored: forks, joins, run options, `Effect.map`, `Effect.all`, loggers, Schema, Stream, retries and timeouts. Holding a Fiber or a Context is fine; the contract below rules out reflecting on them.
 
-Facts start clean and are solved as a least fixpoint across keys and modules. A value is clean when it is one of:
-- a literal, or an array or object built from clean values;
-- a function whose captured bindings are all clean and which doesn't read `this`, `arguments` or the global object;
-- the result of an ECMAScript builtin whose arguments, and the values its callbacks return, are clean;
-- the result of a method called on an array, a string or a builtin collection, under the same conditions.
-
-The methods named `toJSON`, `valueOf`, `toString` and `toLocaleString` and the symbol hooks run implicitly, so what they return counts toward the object. Parameters are clean only for local functions called directly with clean arguments. A consumer's method result is the join of that method's returns over every provider of the key, and an import is the exporting module's fact.
-
-Effect operations are followed only in these exact shapes; any other trusted call takes the fallback:
-
-| row | shape |
-| --- | --- |
-| 1 | `Context.Service("literal")` declaring a module-level key |
-| 2 | `Key.of(value)` |
-| 3, 4 | `Layer.succeed(Key, value)`, `Layer.effect(Key, effect)` or `Layer.effect(Key)(effect)`, with `effect` from row 5 or 7 |
-| 5, 6 | `Effect.gen(function* () {...})`, `Effect.sync(() => ...)` |
-| 7 | `Effect.acquireRelease(acquire, release)` |
-| 8, 9 | `Layer.mergeAll(...)`, `Layer.provide(a, b)`, `Effect.provide(effect, layer)` |
-| 10 | `Effect.runPromise(effect)` or `Effect.runPromise(effect, { onFiberStart })` |
-| 11 | `assert.strictEqual(a, b)`, `assert.deepStrictEqual(a, b)`, `assert.ok(x)` from `node:assert` |
-| 12, 13 | `Effect.forkChild(effect)`, `Fiber.join(fiber)` |
-
-The summaries are checked against effect 4.1.2. Any other resolved `effect` version turns the pass off.
-
-The heap bit is one build-wide fact. It is set when user code:
-- writes into an object that may be a runtime object or whose provenance is unresolved;
-- stores a value that may hold one;
-- assigns an implicitly invoked hook;
-- writes by a non-constant name;
-- installs accessors or prototypes (`Object.defineProperty`, `Object.assign`, `setPrototypeOf`, ...);
-- calls an Effect API without a row;
-- passes a runtime value to a callee the analysis doesn't follow.
-
-While it is set, every allocation, method result, join result and awaited run result may hold a runtime object.
-
-The pass turns off for the whole build when:
-- user code reads a Context internal by name (`mapUnsafe`, `_flat`, `base`, `overlay`, `cacheRoot`, `toJSON`), uses `__lookupGetter__` and friends, `Context.getOrUndefinedUnsafe` or `Context.makeUnsafe`;
-- user code runs code outside the module graph: `eval`, `Function`, `require`, `.constructor`, `with`, dynamic `import()`;
-- the entry module has exports, user code imports an external module other than a Node builtin, or a `Context.Service` call declares no module-level key with a literal string;
-- user code calls a host operation without a summary (any Node builtin or non-ECMAScript global other than the assertions above), or uses one as a value;
-- an Effect API without a row receives a value that may hold a runtime object;
-- a value that may hold a runtime object reaches enumeration (`Object.keys`, `Reflect`, `for...in`, `structuredClone`, ...), a member read by a non-constant name (numeric indexes aside), serialization or formatting (`JSON.stringify`, templates, `String()`, `+`, loose comparisons, `toString`, `join`, string methods, `throw`, `Error`, the assertions).
-
-A static read on a value that may hold a runtime object keeps that method on every service instead.
+The pass is turned off for the whole build when user code:
+- exports anything from the entry module, or imports an external module other than a Node builtin;
+- loads code outside the module graph: `eval`, `Function`, `require`, a `.constructor` read, dynamic `import()`, `process.getBuiltinModule`, `module.createRequire`, or any use of `vm`, `module`, `inspector` or `repl` other than `typeof`;
+- looks a service up other than by `yield*`: `Context.get`, `getUnsafe`, `getOption`, `getOrElse`, `getOrUndefined`, `pick`, `omit`, `Effect.service`, `serviceOption`, `updateService`. Their key argument may not be a tracked key;
+- calls `Context.getOrUndefinedUnsafe` or `Context.makeUnsafe`, which work on key strings;
+- uses `Context.Service` other than to declare a module-level key with a literal string, or writes to a key's members;
+- modifies a builtin prototype or uses one as a value (`Map.prototype.get = ...`).
 
 ## Contract
 
@@ -117,14 +78,14 @@ The POC targets closed Effect applications. It relies on these assumptions, appr
 - **A3.** Effect's own modules read properties of user service values only through keyed lookups, and enumerate Context entries only under their own key prefixes. User keys don't use those prefixes.
 - **A4.** Services are provided and read through the same bundled copy of `effect`.
 
-Some breaches are cheap to detect and turn the pass off rather than relying on A1: the string-keyed Context APIs (`Context.getOrUndefinedUnsafe`, `Context.makeUnsafe`), `Context.Service` used other than to declare a key, and writes to builtin prototypes. Every other Effect API is allowed. A consumer or provider shape the pass doesn't model keeps every method of the key involved.
+Some breaches are cheap to detect and turn the pass off rather than relying on A1: the string-keyed Context APIs (`Context.getOrUndefinedUnsafe`, `Context.makeUnsafe`), keyed lookups other than `yield*` (whose key may be untracked), `Context.Service` used other than to declare a key, and writes to builtin prototypes. Every other Effect API is allowed. A consumer or provider shape the pass doesn't model keeps every method of the key involved.
 
 ## Inspecting the result
 
-Every reason that turns the pass off, and every reason that sets the heap bit, is reported once per tag and site as an `EFFECT_SERVICE_SHAKING` warning. The message contains `[<tag>]` and `at <line>:<col>`. `checks.effectServiceShaking: false` silences them.
+Every reason that turns the pass off is reported once per site as an `EFFECT_SERVICE_SHAKING` warning, with `at <line>:<col>` and the module. `checks.effectServiceShaking: false` silences them.
 
 Set `ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT=1` to print, for each build:
-- the reasons above;
+- why the pass was turned off, if it was;
 - which keys kept every method, and why;
 - the demand per key;
 - every removed property and local.
@@ -148,4 +109,4 @@ The analysis costs about 1.1–1.2x of an unoptimized build on Effect programs o
 
 ## Limitations
 
-This is a proof of concept for the generator/constructor base case. The `NodeFileSystem` provider builds its object by spreading a parameter, keyed access other than `yield*`, combinator consumers and library builds with exports are not optimized.
+This is a proof of concept for the generator/constructor base case. The `NodeFileSystem` provider builds its object by spreading a parameter, keyed access other than `yield*` turns the pass off, combinator consumers keep their key, and library builds with exports are not optimized. Programs that break the contract can be miscompiled instead of keeping methods.

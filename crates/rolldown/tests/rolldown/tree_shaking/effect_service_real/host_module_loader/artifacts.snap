@@ -6,49 +6,7 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## EFFECT_SERVICE_SHAKING
 
 ```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Effect.succeed` without a summary receives a runtime value at 26:54 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Effect.withFiber` without a summary receives a runtime value at 26:26 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] assertion may format an Effect runtime object at 30:1 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] host operation without a summary at 21:3 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unknown-callee] unknown callee receives a runtime value at 21:3 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 26:26 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [heap:unsummarized-call] Effect call without a summary at 26:54 in main.js
+[EFFECT_SERVICE_SHAKING] [bailout] `compileFunction` may run code outside the bundle at 21:3 in main.js
 
 ```
 
