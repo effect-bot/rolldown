@@ -147,6 +147,24 @@ const CODE_LOADING_MODULES: &[&str] = &["vm", "module", "inspector", "repl"];
 const GLOBAL_OBJECTS: &[&str] = &["globalThis", "global", "self", "window"];
 const CAPABILITY_GLOBALS: &[&str] =
   &["process", "globalThis", "global", "self", "window", "module"];
+// Members a class-form key inherits from `Context.Service` (effect 4.1.2), and
+// function members; a class key may not redeclare them. Names starting with
+// `~` (`~effect/Effect`) are protocol ids too.
+const SERVICE_PROTOCOL: &[&str] = &[
+  "of",
+  "key",
+  "use",
+  "useSync",
+  "context",
+  "pipe",
+  "toJSON",
+  "toString",
+  "name",
+  "length",
+  "prototype",
+  "caller",
+  "arguments",
+];
 // Reading one of these on a service observes the whole object.
 const INHERITED_MEMBERS: &[&str] = &[
   "constructor",
@@ -649,6 +667,38 @@ fn class_body_reads_this(class: &Class<'_>) -> bool {
   finder.0
 }
 
+/// The static member names of a class-form key's body, when every member is
+/// static, has a constant name and leaves the inherited `Context.Service`
+/// protocol (`of`, `key`, ...) alone; `None` otherwise.
+fn class_key_statics(class: &Class<'_>) -> Option<FxHashSet<String>> {
+  class
+    .body
+    .body
+    .iter()
+    .map(|element| {
+      let (key, is_static, computed) = match element {
+        ClassElement::MethodDefinition(method) => (&method.key, method.r#static, method.computed),
+        ClassElement::PropertyDefinition(property) => {
+          (&property.key, property.r#static, property.computed)
+        }
+        ClassElement::AccessorProperty(accessor) => {
+          (&accessor.key, accessor.r#static, accessor.computed)
+        }
+        _ => return None,
+      };
+      if !is_static || computed {
+        return None;
+      }
+      let name = key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))?;
+      let protocol = SERVICE_PROTOCOL.contains(&name.as_str())
+        || INHERITED_MEMBERS.contains(&name.as_str())
+        || name == "constructor"
+        || name.starts_with('~');
+      (!protocol).then_some(name)
+    })
+    .collect()
+}
+
 /// Span starts of the object literals a function body returns, when every
 /// return is an object literal.
 fn object_returns(body: &FunctionBody<'_>) -> Option<Vec<u32>> {
@@ -678,7 +728,9 @@ fn builder_returns(function: &Expression<'_>) -> Option<Vec<u32>> {
       },
       None => f.body.as_function_body().and_then(object_returns),
     },
-    Expression::FunctionExpression(f) if !f.r#async && !f.generator => {
+    // A named function expression can hand itself out through its own name,
+    // which the reference check on the outer binding does not see.
+    Expression::FunctionExpression(f) if !f.r#async && !f.generator && f.id.is_none() => {
       f.body.as_ref().and_then(|body| object_returns(body))
     }
     _ => None,
@@ -822,24 +874,11 @@ impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
       if let (Some(symbol), Some((key, callee_start))) =
         (symbol, self.shared.key_creation(self.module, super_class))
       {
-        if it.r#type == oxc::ast::ast::ClassType::ClassDeclaration && !class_body_reads_this(it) {
+        let statics = class_key_statics(it);
+        if let (oxc::ast::ast::ClassType::ClassDeclaration, false, Some(statics)) =
+          (it.r#type, class_body_reads_this(it), statics)
+        {
           let symbol_ref: SymbolRef = (self.module, symbol).into();
-          let statics = it
-            .body
-            .body
-            .iter()
-            .filter_map(|element| match element {
-              ClassElement::MethodDefinition(method) if method.r#static && !method.computed => {
-                method.key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
-              }
-              ClassElement::PropertyDefinition(property)
-                if property.r#static && !property.computed =>
-              {
-                property.key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
-              }
-              _ => None,
-            })
-            .collect();
           self.keys.push((symbol_ref, key, callee_start));
           self.key_statics.push((symbol_ref, statics));
         }
@@ -873,6 +912,9 @@ struct UseCollector<'s, 'l, 'a> {
   accounted: Vec<(ModuleIdx, u32)>,
   /// Callee span starts of keyed lookups whose keys were all resolved.
   handled_lookups: FxHashSet<u32>,
+  /// Constructors being followed, and whether one was reached again.
+  constructors_in_progress: Vec<SymbolRef>,
+  constructor_cycle: bool,
   consumers: Vec<Consumer>,
   providers: Vec<(String, Container)>,
   guard_bindings: Vec<GuardBinding>,
@@ -1361,8 +1403,16 @@ impl<'a> UseCollector<'_, '_, 'a> {
           return false;
         };
         let Some(generator) = self.constructor_generator(symbol) else { return false };
+        // A constructor returning its own result: stop at the cycle, and keep
+        // every property of the provider.
+        if self.constructors_in_progress.contains(&symbol) {
+          self.constructor_cycle = true;
+          return false;
+        }
+        self.constructors_in_progress.push(symbol);
         let mut returned = vec![];
         let complete = self.return_sites(generator, true, &mut returned);
+        self.constructors_in_progress.pop();
         self.accounted.push((self.module, call.callee.span().start));
         for (module, span, bindings, top, mut via) in returned {
           via.push(symbol);
@@ -1486,12 +1536,15 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// whether every source was followed does not matter here.
   fn provider(&mut self, key: &str, kind: &str, value: &Expression<'a>, container: Container) {
     let mut found = vec![];
+    self.constructor_cycle = false;
     if kind == "Layer.succeed" {
       self.value_sites(value, &mut found);
     } else {
       self.effect_sites(value, &mut found);
     }
+    let cycle = std::mem::take(&mut self.constructor_cycle);
     for (module, start, bindings, top, via) in found {
+      let top = top || cycle;
       let index = *self.site_spans.entry((module, start)).or_insert_with(|| {
         self.sites.push(Site {
           module,
@@ -1832,7 +1885,11 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     // A keyed lookup or `provideService` whose key arguments are all tracked
     // keys reaches only those services: each keeps every method. Otherwise a
     // lookup turns the pass off (`check_api`).
-    if let Some(positions) = api.and_then(|api| key_arguments(api, it.arguments.len())) {
+    // A spread moves arguments at run time, so positions are unknown.
+    let spread = it.arguments.iter().any(|argument| matches!(argument, Argument::SpreadElement(_)));
+    if let Some(positions) =
+      api.filter(|_| !spread).and_then(|api| key_arguments(api, it.arguments.len()))
+    {
       let keys: Option<Vec<(String, u32)>> = positions
         .iter()
         .map(|&position| {
@@ -2407,6 +2464,8 @@ impl LinkStage<'_> {
           module_consts,
           accounted: vec![],
           handled_lookups: FxHashSet::default(),
+          constructors_in_progress: vec![],
+          constructor_cycle: false,
           consumers: vec![],
           providers: vec![],
           guard_bindings: vec![],
