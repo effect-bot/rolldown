@@ -60,7 +60,8 @@ fn reports_site(message: &str, site: &str) -> bool {
     .any(|(offset, _)| !message[offset + needle.len()..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
-async fn assert_bailout(dir: &str, needle: &str) {
+/// `None` if bundling `<dir>/main.js` reports a bailout at `needle`, else why not.
+async fn missing_bailout(dir: &str, needle: &str) -> Option<String> {
   let reasons = reasons(dir).await;
   let site = position(dir, needle);
   let found = reasons.iter().any(|(id, message)| {
@@ -68,7 +69,14 @@ async fn assert_bailout(dir: &str, needle: &str) {
       && message.contains("[bailout]")
       && reports_site(message, &site)
   });
-  assert!(found, "expected a bailout at {dir}/main.js:{site} (`{needle}`), got: {reasons:#?}");
+  (!found)
+    .then(|| format!("expected a bailout at {dir}/main.js:{site} (`{needle}`), got: {reasons:#?}"))
+}
+
+async fn assert_bailout(dir: &str, needle: &str) {
+  if let Some(error) = missing_bailout(dir, needle).await {
+    panic!("{error}");
+  }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -94,4 +102,16 @@ async fn reexported_loader_loads_code() {
 #[tokio::test(flavor = "multi_thread")]
 async fn computed_host_access_may_load_code() {
   assert_bailout("loader_computed_access", "process[").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn computed_function_constructor_access_may_load_code() {
+  let mut errors = Vec::new();
+  for (dir, needle) in [
+    ("loader_function_constructor_global", "globalThis.Object["),
+    ("loader_function_constructor_arrow", "(() => 0)["),
+  ] {
+    errors.extend(missing_bailout(dir, needle).await);
+  }
+  assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
