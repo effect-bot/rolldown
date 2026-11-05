@@ -3071,7 +3071,7 @@ impl LinkStage<'_> {
       for module in &normal_modules {
         let Some(ast) = self.ast_table[*module].as_ref() else { continue };
         if shared.prefixes[module.index()].is_some() {
-          effect_programs.push(ast.program());
+          effect_programs.push((*module, ast.program()));
         } else if *module != self.runtime.id() {
           programs.push((*module, ast.program()));
         }

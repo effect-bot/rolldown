@@ -3,14 +3,15 @@
 //! one without a key.
 //!
 //! Services leave a Context through a keyed lookup, which the pass tracks per
-//! key, or through such an object. Effect hands these objects to the program
-//! only at the sources below, read from effect 4.1.2's implementation:
-//! `Effect.context()` and `withFiber` return the running fiber's Context or
-//! the fiber, `fork*` and `runFork` return Fibers, `Layer.build` returns a
-//! Context, `ManagedRuntime.make` holds one, and while a fiber runs Effect
-//! keeps it in `globalThis["~effect/Fiber/currentFiber"]`
-//! (`internal/effect.js`, `runLoop`). Every other Effect API only passes on
-//! what it was given.
+//! key, or through such an object. A call of an Effect API is first evaluated
+//! through the API's own definition in Effect's code (see "Effect's own code"
+//! below), where only the primitives the fiber interprets are modelled: a
+//! `withFiber` closure receives the fiber, whose `context` holds every
+//! service. When the evaluator does not cover a definition yet, the call
+//! falls back to the API tables: the sources (`fork*`, `runFork`,
+//! `Layer.build`, `ManagedRuntime.make`, callbacks receiving a fiber, ...),
+//! a few precise summaries, and, for every other API, passing on what it was
+//! given. Members of the global object other than builtins are unknown values.
 //!
 //! The analysis is a flow-insensitive abstract interpretation of the code
 //! outside Effect's own modules. A value is three bits: it may be or contain a
@@ -41,6 +42,8 @@ use oxc::{
   span::{GetSpan, Span},
 };
 use rolldown_common::{ModuleIdx, SymbolRef};
+use std::rc::Rc;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{GLOBAL_OBJECTS, Guard, Resolved, Shared, strip};
@@ -469,6 +472,9 @@ const BUILTIN_MEMBERS: &[&str] = &[
 /// A function: module and span start of its node.
 type FnId = (ModuleIdx, u32);
 
+/// An Effect API and the reach and functions of each argument.
+type DeriveKey = (SymbolRef, Vec<(u8, Vec<FnId>)>);
+
 /// What a read of a runtime object observes, with the guards around the read
 /// and its module and offset.
 pub(super) type ReachEvents = Vec<(ReachEvent, Vec<Guard>, ModuleIdx, u32)>;
@@ -595,6 +601,16 @@ struct ReachState {
   opaque_fn: bool,
   /// Values stored under each property name by the analysed code.
   props: FxHashMap<String, Reach>,
+  /// Effect APIs whose calls were derived from their definitions, and those
+  /// that fell back to the API tables, for the report.
+  derived: FxHashSet<String>,
+  underived: FxHashSet<String>,
+  /// Derived results of this iteration, and derivations that failed, by API
+  /// and argument shape.
+  derive_cache: FxHashMap<DeriveKey, Option<Reach>>,
+  derive_failures: FxHashSet<DeriveKey>,
+  /// The last walk records events: derivations run again.
+  final_walk: bool,
   /// Where each global fact first grew, for debugging.
   origins: Vec<(&'static str, ModuleIdx, u32)>,
   changed: bool,
@@ -675,7 +691,7 @@ pub(super) struct ReachInput<'s, 'l, 'a> {
   /// The analysed modules and their programs.
   pub(super) programs: Vec<(ModuleIdx, &'s Program<'a>)>,
   /// Effect's own bundled modules.
-  pub(super) effect_programs: Vec<&'s Program<'a>>,
+  pub(super) effect_programs: Vec<(ModuleIdx, &'s Program<'a>)>,
   pub(super) site_spans: &'s FxHashMap<(ModuleIdx, u32), usize>,
   pub(super) guard_declarators: &'s FxHashMap<(ModuleIdx, u32), SymbolRef>,
   /// Modules outside the bundle.
@@ -683,11 +699,15 @@ pub(super) struct ReachInput<'s, 'l, 'a> {
 }
 
 pub(super) fn analyse(input: &ReachInput<'_, '_, '_>) -> ReachOutcome {
+  let started = std::time::Instant::now();
   let mut info = ReachInfo::default();
-  for program in &input.effect_programs {
+  let mut defs = EffectDefs::default();
+  for (module, program) in &input.effect_programs {
     let mut names = NameCollector { names: &mut info.effect_names };
     names.visit_program(program);
+    defs.collect(input.shared, *module, program);
   }
+  defs.find_keys(input.shared);
   // Function bindings first, then properties whose value is one of them.
   let mut pending_props: Vec<(String, SymbolRef)> = vec![];
   for (module, program) in &input.programs {
@@ -705,12 +725,17 @@ pub(super) fn analyse(input: &ReachInput<'_, '_, '_>) -> ReachOutcome {
     }
   }
 
+  #[expect(clippy::print_stderr, reason = "opt-in debugging of the experimental pass")]
+  if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_REACH_DEBUG").is_some() {
+    eprintln!("[reach] setup {} ms", started.elapsed().as_millis());
+  }
   let mut state = ReachState::default();
   // Flow-insensitive: walk everything until no value grows.
   for _ in 0..64 {
     state.changed = false;
+    state.derive_cache.clear();
     for (module, program) in &input.programs {
-      let mut walker = Walker::new(input, &info, &mut state, *module, None);
+      let mut walker = Walker::new(input, &info, &defs, &mut state, *module, None);
       walker.visit_program(program);
     }
     let mut esc_ret = Reach::NONE;
@@ -725,6 +750,18 @@ pub(super) fn analyse(input: &ReachInput<'_, '_, '_>) -> ReachOutcome {
   }
   #[expect(clippy::print_stderr, reason = "opt-in debugging of the experimental pass")]
   if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_REACH_DEBUG").is_some() {
+    let mut derived: Vec<_> = state.derived.iter().collect();
+    derived.sort();
+    let mut underived: Vec<_> = state.underived.difference(&state.derived).collect();
+    underived.sort();
+    eprintln!(
+      "[reach] {} ms, {} derivations cached, {} failed",
+      started.elapsed().as_millis(),
+      state.derive_cache.len(),
+      state.derive_failures.len()
+    );
+    eprintln!("[reach] derived from definitions: {derived:?}");
+    eprintln!("[reach] from the API tables: {underived:?}");
     eprintln!(
       "[reach] thrown={:?} esc_params={:?} esc_ret={:?} this={:?} global={:?} escaped={}",
       state.thrown,
@@ -742,9 +779,11 @@ pub(super) fn analyse(input: &ReachInput<'_, '_, '_>) -> ReachOutcome {
       eprintln!("[reach] origin {what} module {module:?} at {start}: {snippet}");
     }
   }
+  state.final_walk = true;
+  state.derive_cache.clear();
   let mut events = vec![];
   for (module, program) in &input.programs {
-    let mut walker = Walker::new(input, &info, &mut state, *module, Some(&mut events));
+    let mut walker = Walker::new(input, &info, &defs, &mut state, *module, Some(&mut events));
     walker.visit_program(program);
   }
   ReachOutcome { events }
@@ -1109,6 +1148,7 @@ enum ArgKind {
 struct Walker<'w, 's, 'l, 'a> {
   input: &'w ReachInput<'s, 'l, 'a>,
   info: &'w ReachInfo,
+  defs: &'w EffectDefs<'s, 'a>,
   state: &'w mut ReachState,
   module: ModuleIdx,
   functions: Vec<FnId>,
@@ -1125,6 +1165,7 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
   fn new(
     input: &'w ReachInput<'s, 'l, 'a>,
     info: &'w ReachInfo,
+    defs: &'w EffectDefs<'s, 'a>,
     state: &'w mut ReachState,
     module: ModuleIdx,
     events: Option<&'w mut ReachEvents>,
@@ -1132,6 +1173,7 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
     Walker {
       input,
       info,
+      defs,
       state,
       module,
       functions: vec![],
@@ -2201,6 +2243,13 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
         // services per key.
         return Reach::NONE;
       }
+      if let Some(Resolved::Symbol(symbol)) = self.shared().resolve_expr(self.module, callee) {
+        if let Some(result) = self.derive_api(symbol, &args) {
+          self.state.derived.insert(api);
+          return result;
+        }
+      }
+      self.state.underived.insert(api.clone());
       return self.apply_api(&api, None, args, call.span);
     }
     // A known function, called directly or through `.call`.
@@ -2287,7 +2336,7 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
         {
           return Reach::NONE;
         }
-        self.apply_api(&api, Some(piped), inner_args, call.span)
+        self.apply_api_or_derive(&inner.callee, &api, piped, inner_args, call.span)
       }
       _ => {
         let args = self.eval_args(&call.arguments, false);
@@ -2615,7 +2664,7 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
             value = if self.tracked_lookup(&api, &call.arguments, 1) {
               Reach::NONE
             } else {
-              self.apply_api(&api, Some(value), args, call.span)
+              self.apply_api_or_derive(&call.callee, &api, value, args, call.span)
             };
             continue;
           }
@@ -2652,6 +2701,34 @@ impl<'w, 's, 'l, 'a> Walker<'w, 's, 'l, 'a> {
       }
     }
     value
+  }
+
+  /// A data-last call of an Effect API applied to `piped`, derived from the
+  /// API's definition as the data-first call when the evaluator covers it.
+  fn apply_api_or_derive(
+    &mut self,
+    callee: &Expression<'a>,
+    api: &str,
+    piped: Reach,
+    args: Vec<Arg>,
+    span: Span,
+  ) -> Reach {
+    if let Some(Resolved::Symbol(symbol)) = self.shared().resolve_expr(self.module, strip(callee)) {
+      let mut full =
+        vec![Arg { value: piped, spread: false, functions: vec![], kind: ArgKind::Known }];
+      full.extend(args.iter().map(|arg| Arg {
+        value: arg.value,
+        spread: arg.spread,
+        functions: arg.functions.clone(),
+        kind: arg.kind,
+      }));
+      if let Some(result) = self.derive_api(symbol, &full) {
+        self.state.derived.insert(api.to_string());
+        return result;
+      }
+    }
+    self.state.underived.insert(api.to_string());
+    self.apply_api(api, Some(piped), args, span)
   }
 
   /// A call of an Effect API: `piped` is the value a data-last call receives
@@ -2959,5 +3036,1455 @@ impl<'a> Walker<'_, '_, '_, 'a> {
         }
       }
     }
+  }
+}
+
+// == Effect's own code
+//
+// A call of an Effect API is evaluated through the API's definition in
+// Effect's modules, at the call site, with the call's arguments. The
+// evaluator interprets the JavaScript of those definitions: constants,
+// closures and their frames, objects and their fields, `this`, `new` with
+// prototypes, `arguments`, conditionals, `switch`, `try`. Calls of the
+// program's own functions go through the analysis above.
+//
+// Only what the fiber does is modelled, as the fiber interprets primitive
+// operations and never reads a Context itself: the primitives are recognised
+// by the `op` they are declared with (`makePrimitive`, `makeExit` and
+// `makePrimitiveProto` in `internal/core.js`), and the fiber methods a
+// continuation calls (`succeedWith`, `yieldWith`) return the Effect they are
+// given. A `withFiber` closure receives the fiber, whose `context` holds every
+// service.
+//
+// A definition the evaluator does not cover yields `None`, and the call falls
+// back to the treatment of an unanalysed API.
+
+/// Module-level definitions of Effect's modules, by canonical binding.
+#[derive(Default)]
+pub(super) struct EffectDefs<'s, 'a> {
+  defs: FxHashMap<SymbolRef, (ModuleIdx, Def<'s, 'a>)>,
+  /// `F.prototype = P` statements at module level.
+  prototypes: FxHashMap<SymbolRef, (ModuleIdx, &'s Expression<'a>)>,
+  /// Module-level values, evaluated once: `None` while in progress or when
+  /// the evaluator does not cover the definition.
+  values: std::cell::RefCell<FxHashMap<SymbolRef, Option<Value<'s, 'a>>>>,
+  /// The keys under which a primitive stores its input and continuation
+  /// (`args`, `contA` in `internal/core.js`).
+  args_key: Option<String>,
+  cont_key: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum Def<'s, 'a> {
+  Expr(&'s Expression<'a>),
+  Function(&'s Function<'a>),
+}
+
+impl<'s, 'a> EffectDefs<'s, 'a> {
+  fn collect(&mut self, shared: &Shared<'_>, module: ModuleIdx, program: &'s Program<'a>) {
+    let canonical =
+      |symbol: oxc::semantic::SymbolId| shared.symbols.canonical_ref_for((module, symbol).into());
+    for statement in &program.body {
+      let declaration = match statement {
+        Statement::ExportDeclaration(export) => Some(&export.declaration),
+        Statement::ExpressionStatement(expression) => {
+          // `F.prototype = P`.
+          if let Expression::AssignmentExpression(assign) = &expression.expression {
+            if let AssignmentTarget::StaticMemberExpression(member) = &assign.left {
+              if let (Expression::Identifier(ident), "prototype") =
+                (strip(&member.object), member.property.name.as_str())
+              {
+                if let Some(Resolved::Symbol(symbol)) = shared.resolve_ident(module, ident) {
+                  self.prototypes.insert(symbol, (module, &assign.right));
+                }
+              }
+            }
+          }
+          None
+        }
+        _ => statement.as_declaration(),
+      };
+      match declaration {
+        Some(oxc::ast::ast::Declaration::VariableDeclaration(declaration))
+          if declaration.kind == oxc::ast::ast::VariableDeclarationKind::Const =>
+        {
+          for declarator in &declaration.declarations {
+            if let (BindingPattern::BindingIdentifier(id), Some(init)) =
+              (&declarator.id, &declarator.init)
+            {
+              if let Some(symbol) = id.symbol_id.get() {
+                self.defs.insert(canonical(symbol), (module, Def::Expr(init)));
+              }
+            }
+          }
+        }
+        Some(oxc::ast::ast::Declaration::FunctionDeclaration(function)) => {
+          if let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get()) {
+            self.defs.insert(canonical(symbol), (module, Def::Function(function)));
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+
+  fn find_keys(&mut self, shared: &Shared<'_>) {
+    for (symbol, name) in &shared.api_names {
+      match name.as_str() {
+        "internal/core.args" => self.args_key = shared.const_strings.get(symbol).cloned(),
+        "internal/core.contA" => self.cont_key = shared.const_strings.get(symbol).cloned(),
+        _ => {}
+      }
+    }
+  }
+}
+
+/// A primitive operation of the fiber, by the `op` it is declared with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Primitive {
+  Success,
+  Failure,
+  WithFiber,
+  WithFiberSucceed,
+  Sync,
+  Suspend,
+  /// A success continuation: the fiber runs the input, then calls the
+  /// continuation with its success.
+  OnSuccess,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Constant {
+  Undefined,
+  Null,
+  Bool(bool),
+  Number(f64),
+  Str(String),
+}
+
+impl Constant {
+  fn truthy(&self) -> bool {
+    match self {
+      Constant::Undefined | Constant::Null => false,
+      Constant::Bool(value) => *value,
+      Constant::Number(value) => *value != 0.0 && !value.is_nan(),
+      Constant::Str(value) => !value.is_empty(),
+    }
+  }
+  fn type_name(&self) -> &'static str {
+    match self {
+      Constant::Undefined => "undefined",
+      Constant::Null => "object",
+      Constant::Bool(_) => "boolean",
+      Constant::Number(_) => "number",
+      Constant::Str(_) => "string",
+    }
+  }
+  fn key(&self) -> Option<String> {
+    match self {
+      Constant::Str(value) => Some(value.clone()),
+      #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "non-negative integral property indices only"
+      )]
+      Constant::Number(value) if value.fract() == 0.0 && *value >= 0.0 => {
+        Some((*value as u64).to_string())
+      }
+      _ => None,
+    }
+  }
+}
+
+type ObjectRef<'s, 'a> = Rc<std::cell::RefCell<Object<'s, 'a>>>;
+
+#[derive(Default)]
+struct Object<'s, 'a> {
+  fields: FxHashMap<String, Value<'s, 'a>>,
+  /// Values stored under keys that are not constant.
+  other: Value<'s, 'a>,
+  primitive: Option<Primitive>,
+}
+
+#[derive(Clone)]
+enum Callable<'s, 'a> {
+  /// A function of the program, followed by the analysis above.
+  Program(FnId),
+  /// A function of Effect's modules, with the frame it was created in and
+  /// the binding it is declared as, for its prototype.
+  Closure {
+    module: ModuleIdx,
+    params: &'s FormalParameters<'a>,
+    body: ClosureBody<'s, 'a>,
+    frame: Rc<Frame<'s, 'a>>,
+    symbol: Option<SymbolRef>,
+    /// An arrow's `this` and `arguments`, from where it was created.
+    lexical: Option<(Box<Value<'s, 'a>>, Rc<[Value<'s, 'a>]>)>,
+  },
+  /// A primitive constructor (`makePrimitive`, `makeExit`).
+  Primitive(Primitive),
+  /// A method of the fiber, read in a continuation.
+  FiberMethod(String),
+}
+
+#[derive(Clone, Copy)]
+enum ClosureBody<'s, 'a> {
+  Expr(&'s Expression<'a>),
+  Block(&'s oxc::ast::ast::FunctionBody<'a>),
+}
+
+#[derive(Default)]
+struct Frame<'s, 'a> {
+  vars: std::cell::RefCell<FxHashMap<(ModuleIdx, oxc::semantic::SymbolId), Value<'s, 'a>>>,
+  parent: Option<Rc<Frame<'s, 'a>>>,
+}
+
+impl<'s, 'a> Frame<'s, 'a> {
+  fn child(parent: &Rc<Frame<'s, 'a>>) -> Rc<Frame<'s, 'a>> {
+    Rc::new(Frame { vars: std::cell::RefCell::default(), parent: Some(Rc::clone(parent)) })
+  }
+  fn get(&self, key: (ModuleIdx, oxc::semantic::SymbolId)) -> Option<Value<'s, 'a>> {
+    if let Some(value) = self.vars.borrow().get(&key) {
+      return Some(value.clone());
+    }
+    self.parent.as_ref().and_then(|parent| parent.get(key))
+  }
+  fn declare(&self, key: (ModuleIdx, oxc::semantic::SymbolId), value: Value<'s, 'a>) {
+    self.vars.borrow_mut().insert(key, value);
+  }
+  /// An assignment: joined into the binding wherever it is declared.
+  fn assign(&self, key: (ModuleIdx, oxc::semantic::SymbolId), value: Value<'s, 'a>) -> bool {
+    if let Some(current) = self.vars.borrow_mut().get_mut(&key) {
+      *current = std::mem::take(current).join(value);
+      return true;
+    }
+    self.parent.as_ref().is_some_and(|parent| parent.assign(key, value))
+  }
+}
+
+/// A value inside Effect's code.
+#[derive(Clone, Default)]
+struct Value<'s, 'a> {
+  /// What the program's values in it may reach.
+  reach: Reach,
+  callables: Vec<Callable<'s, 'a>>,
+  objects: Vec<ObjectRef<'s, 'a>>,
+  constant: Option<Constant>,
+  /// The running fiber.
+  fiber: bool,
+  /// `arguments` of the call being evaluated.
+  arguments: Option<Rc<[Value<'s, 'a>]>>,
+  /// `makePrimitiveProto({ op })`.
+  primitive_proto: Option<Primitive>,
+  /// Not known: usable only to choose a branch or as a discarded result.
+  unknown: bool,
+  /// May be a function the analysis cannot see: calling it is not followed.
+  opaque_callee: bool,
+}
+
+impl<'s, 'a> Value<'s, 'a> {
+  fn reach(reach: Reach) -> Self {
+    Value { reach, ..Value::default() }
+  }
+  fn constant(constant: Constant) -> Self {
+    Value { constant: Some(constant), ..Value::default() }
+  }
+  fn unknown() -> Self {
+    Value { unknown: true, ..Value::default() }
+  }
+  fn join(mut self, other: Value<'s, 'a>) -> Self {
+    self.reach = self.reach.join(other.reach);
+    self.callables.extend(other.callables);
+    for object in other.objects {
+      if !self.objects.iter().any(|known| Rc::ptr_eq(known, &object)) {
+        self.objects.push(object);
+      }
+    }
+    if self.constant != other.constant {
+      self.constant = None;
+    }
+    self.fiber |= other.fiber;
+    if !matches!((&self.arguments, &other.arguments), (Some(a), Some(b)) if Rc::ptr_eq(a, b)) {
+      self.arguments = None;
+    }
+    if self.primitive_proto != other.primitive_proto {
+      self.primitive_proto = None;
+    }
+    self.unknown |= other.unknown;
+    self.opaque_callee |= other.opaque_callee;
+    self
+  }
+  /// Whether the value may carry something of the program.
+  fn carries_program(&self) -> bool {
+    self.carries_program_within(&mut vec![], 0)
+  }
+  /// Whether writing into the value may write into the program's values.
+  fn carries_program_shallow_target(&self) -> bool {
+    self.reach.any()
+      || self.opaque_callee
+      || self.callables.iter().any(|callable| matches!(callable, Callable::Program(_)))
+  }
+  fn carries_program_within(
+    &self,
+    seen: &mut Vec<*const std::cell::RefCell<Object<'s, 'a>>>,
+    depth: usize,
+  ) -> bool {
+    if self.reach.any()
+      || self.fiber
+      || self.opaque_callee
+      || self.callables.iter().any(|callable| matches!(callable, Callable::Program(_)))
+      || self.arguments.as_ref().is_some_and(|arguments| {
+        arguments.iter().any(|argument| argument.carries_program_within(seen, depth + 1))
+      })
+    {
+      return true;
+    }
+    if depth > DEFINITION_DEPTH {
+      return true;
+    }
+    self.objects.iter().any(|object| {
+      if seen.contains(&Rc::as_ptr(object)) {
+        return false;
+      }
+      seen.push(Rc::as_ptr(object));
+      let object = object.borrow();
+      object.fields.values().any(|field| field.carries_program_within(seen, depth + 1))
+        || object.other.carries_program_within(seen, depth + 1)
+    })
+  }
+}
+
+/// The evaluation context of a call in Effect's code.
+struct Ctx<'s, 'a> {
+  module: ModuleIdx,
+  frame: Rc<Frame<'s, 'a>>,
+  this: Value<'s, 'a>,
+  arguments: Rc<[Value<'s, 'a>]>,
+}
+
+/// How a statement list ends.
+#[derive(Default)]
+struct Flow<'s, 'a> {
+  returns: Value<'s, 'a>,
+  /// May run past its end.
+  falls_through: bool,
+  /// Ended by `break`.
+  broke: bool,
+}
+
+const DEFINITION_DEPTH: usize = 48;
+
+impl<'s, 'a> Walker<'_, 's, '_, 'a> {
+  /// The result of calling the Effect API bound to `api` with `args`, derived
+  /// from its definition; `None` when the definition is outside what the
+  /// evaluator covers.
+  fn derive_api(&mut self, api: SymbolRef, args: &[Arg]) -> Option<Reach> {
+    let key: DeriveKey =
+      (api, args.iter().map(|arg| (arg.value.0, arg.functions.clone())).collect());
+    if self.state.derive_failures.contains(&key) {
+      return None;
+    }
+    if !self.state.final_walk {
+      if let Some(cached) = self.state.derive_cache.get(&key) {
+        return *cached;
+      }
+    }
+    let result = self.derive_api_uncached(api, args);
+    if result.is_none() {
+      self.state.derive_failures.insert(key.clone());
+    }
+    self.state.derive_cache.insert(key, result);
+    result
+  }
+
+  fn derive_api_uncached(&mut self, api: SymbolRef, args: &[Arg]) -> Option<Reach> {
+    let mut values = vec![];
+    for arg in args {
+      // A spread, or a curried keyed lookup, is not followed into Effect's
+      // code. A value that may be a function the analysis cannot see stops
+      // the derivation only if Effect's code calls it.
+      if arg.spread || arg.kind == ArgKind::Lookup {
+        return None;
+      }
+      values.push(Value {
+        reach: arg.value,
+        callables: arg.functions.iter().map(|function| Callable::Program(*function)).collect(),
+        opaque_callee: matches!(arg.kind, ArgKind::Host | ArgKind::Unknown),
+        ..Value::default()
+      });
+    }
+    let callee = self.def_value(api, 0)?;
+    let result = self.call_value_def(&callee, &Value::default(), &values, 0)?;
+    if result.unknown {
+      return None;
+    }
+    self.to_reach(&result, 0)
+  }
+
+  /// The value a module-level definition of Effect's modules evaluates to.
+  fn def_value(&mut self, symbol: SymbolRef, depth: usize) -> Option<Value<'s, 'a>> {
+    if depth > DEFINITION_DEPTH {
+      return None;
+    }
+    if let Some(cached) = self.defs.values.borrow().get(&symbol) {
+      return cached.clone();
+    }
+    let (module, def) = *self.defs.defs.get(&symbol)?;
+    self.defs.values.borrow_mut().insert(symbol, None);
+    let value = match def {
+      Def::Function(function) => function.body.as_deref().map(|body| Value {
+        callables: vec![Callable::Closure {
+          module,
+          params: &function.params,
+          body: ClosureBody::Block(body),
+          frame: Rc::default(),
+          symbol: Some(symbol),
+          lexical: None,
+        }],
+        ..Value::default()
+      }),
+      Def::Expr(init) => match self.primitive_declaration(module, init) {
+        Some(value) => Some(value),
+        None => {
+          let ctx =
+            Ctx { module, frame: Rc::default(), this: Value::default(), arguments: Rc::default() };
+          self.eval_def(&ctx, init, depth + 1).map(|mut value| {
+            for callable in &mut value.callables {
+              if let Callable::Closure { symbol: slot @ None, .. } = callable {
+                *slot = Some(symbol);
+              }
+            }
+            value
+          })
+        }
+      },
+    };
+    self.defs.values.borrow_mut().insert(symbol, value.clone());
+    value
+  }
+
+  /// `makePrimitive({ op })`, `makeExit({ op })` or `makePrimitiveProto({ op })`.
+  fn primitive_declaration(
+    &self,
+    module: ModuleIdx,
+    expr: &Expression<'_>,
+  ) -> Option<Value<'s, 'a>> {
+    let Expression::CallExpression(call) = strip(expr) else { return None };
+    let api = self.shared().api_of(module, &call.callee)?;
+    let proto = match api {
+      "internal/core.makePrimitive" | "internal/core.makeExit" => false,
+      "internal/core.makePrimitiveProto" => true,
+      _ => return None,
+    };
+    let Some(Expression::ObjectExpression(options)) =
+      call.arguments.first().and_then(Argument::as_expression).map(strip)
+    else {
+      return None;
+    };
+    let op = options.properties.iter().find_map(|property| match property {
+      ObjectPropertyKind::ObjectProperty(property)
+        if !property.computed && key_name(&property.key).as_deref() == Some("op") =>
+      {
+        match strip(&property.value) {
+          Expression::StringLiteral(op) => op.value.as_str().map(String::from),
+          _ => None,
+        }
+      }
+      _ => None,
+    })?;
+    let primitive = match op.as_str() {
+      "Success" => Primitive::Success,
+      "Failure" => Primitive::Failure,
+      "WithFiber" => Primitive::WithFiber,
+      "WithFiberSucceed" => Primitive::WithFiberSucceed,
+      "Sync" => Primitive::Sync,
+      "Suspend" => Primitive::Suspend,
+      "OnSuccess" => Primitive::OnSuccess,
+      _ => return None,
+    };
+    Some(if proto {
+      Value { primitive_proto: Some(primitive), ..Value::default() }
+    } else {
+      Value { callables: vec![Callable::Primitive(primitive)], ..Value::default() }
+    })
+  }
+
+  fn closure(
+    ctx: &Ctx<'s, 'a>,
+    params: &'s FormalParameters<'a>,
+    body: ClosureBody<'s, 'a>,
+    arrow: bool,
+  ) -> Value<'s, 'a> {
+    Value {
+      callables: vec![Callable::Closure {
+        module: ctx.module,
+        params,
+        body,
+        frame: Rc::clone(&ctx.frame),
+        symbol: None,
+        lexical: arrow.then(|| (Box::new(ctx.this.clone()), Rc::clone(&ctx.arguments))),
+      }],
+      ..Value::default()
+    }
+  }
+
+  #[expect(clippy::too_many_lines, reason = "one arm per expression kind")]
+  fn eval_def(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    expr: &'s Expression<'a>,
+    depth: usize,
+  ) -> Option<Value<'s, 'a>> {
+    if depth > DEFINITION_DEPTH {
+      return None;
+    }
+    let depth = depth + 1;
+    Some(match expr {
+      Expression::ParenthesizedExpression(paren) => {
+        return self.eval_def(ctx, &paren.expression, depth);
+      }
+      Expression::TSAsExpression(e) => return self.eval_def(ctx, &e.expression, depth),
+      Expression::TSNonNullExpression(e) => return self.eval_def(ctx, &e.expression, depth),
+      Expression::StringLiteral(literal) => {
+        Value::constant(Constant::Str(literal.value.as_str().unwrap_or_default().to_string()))
+      }
+      Expression::NumericLiteral(literal) => Value::constant(Constant::Number(literal.value)),
+      Expression::BooleanLiteral(literal) => Value::constant(Constant::Bool(literal.value)),
+      Expression::NullLiteral(_) => Value::constant(Constant::Null),
+      Expression::BigIntLiteral(_) | Expression::RegExpLiteral(_) => Value::default(),
+      Expression::TemplateLiteral(template) => {
+        let mut text = Some(String::new());
+        for (index, quasi) in template.quasis.iter().enumerate() {
+          if let (Some(out), Some(cooked)) = (text.as_mut(), quasi.value.cooked.as_ref()) {
+            out.push_str(cooked.as_str().unwrap_or_default());
+          }
+          if let Some(expression) = template.expressions.get(index) {
+            let value = self.eval_def(ctx, expression, depth)?;
+            if value.carries_program() {
+              self.observe_all(
+                Reach::TOP,
+                expression.span(),
+                "converted to a string in Effect's code",
+              );
+            }
+            match (&mut text, value.constant.as_ref().and_then(Constant::key)) {
+              (Some(out), Some(part)) => out.push_str(&part),
+              _ => text = None,
+            }
+          }
+        }
+        text.map_or_else(Value::unknown, |text| Value::constant(Constant::Str(text)))
+      }
+      Expression::Identifier(ident) => return self.eval_def_identifier(ctx, ident, depth),
+      Expression::ThisExpression(_) => ctx.this.clone(),
+      Expression::StaticMemberExpression(member) => {
+        if matches!(
+          self.shared().resolve_expr(ctx.module, &member.object),
+          Some(Resolved::Namespace(_))
+        ) {
+          let Some(Resolved::Symbol(symbol)) = self.shared().resolve_expr(ctx.module, expr) else {
+            return None;
+          };
+          return self.def_value(symbol, depth);
+        }
+        let object = self.eval_def(ctx, &member.object, depth)?;
+        self.member_def(&object, Some(member.property.name.as_str()), member.span)
+      }
+      Expression::ComputedMemberExpression(member) => {
+        let object = self.eval_def(ctx, &member.object, depth)?;
+        let key = self.eval_def(ctx, &member.expression, depth)?;
+        let key = key.constant.as_ref().and_then(Constant::key);
+        self.member_def(&object, key.as_deref(), member.span)
+      }
+      Expression::ChainExpression(chain) => match &chain.expression {
+        ChainElement::CallExpression(call) => return self.eval_def_call(ctx, call, depth),
+        ChainElement::StaticMemberExpression(member) => {
+          let object = self.eval_def(ctx, &member.object, depth)?;
+          self.member_def(&object, Some(member.property.name.as_str()), member.span)
+        }
+        ChainElement::ComputedMemberExpression(member) => {
+          let object = self.eval_def(ctx, &member.object, depth)?;
+          let key = self.eval_def(ctx, &member.expression, depth)?;
+          let key = key.constant.as_ref().and_then(Constant::key);
+          self.member_def(&object, key.as_deref(), member.span)
+        }
+        _ => return None,
+      },
+      Expression::ArrowFunctionExpression(arrow) => {
+        let body = match arrow.get_expression() {
+          Some(expression) => ClosureBody::Expr(expression),
+          None => match &arrow.body {
+            ArrowFunctionBody::FunctionBody(body) => ClosureBody::Block(body),
+            _ => return None,
+          },
+        };
+        Self::closure(ctx, &arrow.params, body, true)
+      }
+      Expression::FunctionExpression(function) => {
+        let body = function.body.as_deref()?;
+        Self::closure(ctx, &function.params, ClosureBody::Block(body), false)
+      }
+      Expression::ObjectExpression(object) => {
+        let mut data = Object::default();
+        for property in &object.properties {
+          let ObjectPropertyKind::ObjectProperty(property) = property else { return None };
+          let key = if property.computed {
+            let key = self.eval_def(ctx, property.key.as_expression()?, depth)?;
+            key.constant.as_ref().and_then(Constant::key)
+          } else {
+            key_name(&property.key)
+          };
+          let value = self.eval_def(ctx, &property.value, depth)?;
+          match key {
+            Some(key) => {
+              data.fields.insert(key, value);
+            }
+            None => data.other = std::mem::take(&mut data.other).join(value),
+          }
+        }
+        Value { objects: vec![Rc::new(std::cell::RefCell::new(data))], ..Value::default() }
+      }
+      Expression::ArrayExpression(array) => {
+        let mut data = Object::default();
+        for element in &array.elements {
+          let value = match element {
+            ArrayExpressionElement::SpreadElement(spread) => {
+              let value = self.eval_def(ctx, &spread.argument, depth)?;
+              self.element_def(&value)
+            }
+            ArrayExpressionElement::Elision(_) => Value::constant(Constant::Undefined),
+            element => self.eval_def(ctx, element.to_expression(), depth)?,
+          };
+          data.other = std::mem::take(&mut data.other).join(value);
+        }
+        Value { objects: vec![Rc::new(std::cell::RefCell::new(data))], ..Value::default() }
+      }
+      Expression::ConditionalExpression(conditional) => {
+        match self.eval_test(ctx, &conditional.test, depth) {
+          Some(true) => return self.eval_def(ctx, &conditional.consequent, depth),
+          Some(false) => return self.eval_def(ctx, &conditional.alternate, depth),
+          None => {
+            let consequent = self.eval_def(ctx, &conditional.consequent, depth)?;
+            let alternate = self.eval_def(ctx, &conditional.alternate, depth)?;
+            consequent.join(alternate)
+          }
+        }
+      }
+      Expression::LogicalExpression(logical) => {
+        let left = self.eval_def(ctx, &logical.left, depth).unwrap_or_else(Value::unknown);
+        let decided = left.constant.as_ref().map(Constant::truthy);
+        let right_needed = match (logical.operator, decided) {
+          (oxc::ast::ast::LogicalOperator::And, Some(false))
+          | (oxc::ast::ast::LogicalOperator::Or, Some(true)) => false,
+          (oxc::ast::ast::LogicalOperator::Coalesce, _) => {
+            !matches!(left.constant, Some(ref c) if !matches!(c, Constant::Undefined | Constant::Null))
+          }
+          _ => true,
+        };
+        if !right_needed {
+          return Some(left);
+        }
+        let right = self.eval_def(ctx, &logical.right, depth)?;
+        match (logical.operator, decided) {
+          (oxc::ast::ast::LogicalOperator::And, Some(true))
+          | (oxc::ast::ast::LogicalOperator::Or, Some(false)) => right,
+          _ => {
+            if left.unknown && left.carries_program() {
+              return None;
+            }
+            Value { unknown: false, ..left }.join(right)
+          }
+        }
+      }
+      Expression::BinaryExpression(binary) => self.eval_def_binary(ctx, binary, depth),
+      Expression::UnaryExpression(unary) => {
+        let value = self.eval_def(ctx, &unary.argument, depth).unwrap_or_else(Value::unknown);
+        match unary.operator {
+          UnaryOperator::Typeof => {
+            match (&value.constant, value.callables.is_empty(), value.objects.is_empty()) {
+              (Some(constant), _, _) => {
+                Value::constant(Constant::Str(constant.type_name().to_string()))
+              }
+              (None, false, true) if !value.unknown && !value.reach.any() => {
+                Value::constant(Constant::Str("function".to_string()))
+              }
+              _ => Value::unknown(),
+            }
+          }
+          UnaryOperator::LogicalNot => match &value.constant {
+            Some(constant) => Value::constant(Constant::Bool(!constant.truthy())),
+            None => Value::unknown(),
+          },
+          UnaryOperator::Void => Value::constant(Constant::Undefined),
+          _ => {
+            if value.carries_program() {
+              self.observe_all(Reach::TOP, unary.span, "converted in Effect's code");
+            }
+            Value::unknown()
+          }
+        }
+      }
+      Expression::SequenceExpression(sequence) => {
+        let mut last = Value::default();
+        for expression in &sequence.expressions {
+          last = self.eval_def(ctx, expression, depth)?;
+        }
+        last
+      }
+      Expression::AssignmentExpression(assign) => {
+        let value = self.eval_def(ctx, &assign.right, depth)?;
+        if !assign.operator.is_assign() {
+          return None;
+        }
+        self.assign_def(ctx, &assign.left, &value, depth)?;
+        value
+      }
+      Expression::CallExpression(call) => return self.eval_def_call(ctx, call, depth),
+      Expression::NewExpression(new) => return self.eval_def_new(ctx, new, depth),
+      _ => return None,
+    })
+  }
+
+  fn eval_def_identifier(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    ident: &oxc::ast::ast::IdentifierReference<'a>,
+    depth: usize,
+  ) -> Option<Value<'s, 'a>> {
+    let scoping = self.shared().scoping(ctx.module);
+    let symbol = scoping.get_reference(ident.reference_id.get()?).symbol_id();
+    match symbol {
+      Some(symbol) => {
+        if let Some(value) = ctx.frame.get((ctx.module, symbol)) {
+          return Some(value);
+        }
+        let canonical = self.shared().symbols.canonical_ref_for((ctx.module, symbol).into());
+        if let Some(text) = self.shared().const_strings.get(&canonical) {
+          return Some(Value::constant(Constant::Str(text.clone())));
+        }
+        self.def_value(canonical, depth)
+      }
+      None => Some(match ident.name.as_str() {
+        "undefined" => Value::constant(Constant::Undefined),
+        "arguments" => Value { arguments: Some(Rc::clone(&ctx.arguments)), ..Value::default() },
+        // Builtins: usable to choose a branch, not to carry the program's values.
+        _ => Value::unknown(),
+      }),
+    }
+  }
+
+  /// `value.key`, or `value[unknown]` when `key` is `None`.
+  fn member_def(&mut self, object: &Value<'s, 'a>, key: Option<&str>, span: Span) -> Value<'s, 'a> {
+    let mut out = Value::default();
+    let mut found = false;
+    if object.fiber {
+      found = true;
+      match key {
+        // The fiber's Context holds every service.
+        Some("context") => out = out.join(Value::reach(Reach::TOP)),
+        Some(name) => {
+          out = out.join(Value {
+            callables: vec![Callable::FiberMethod(name.to_string())],
+            unknown: true,
+            ..Value::default()
+          });
+        }
+        None => out = out.join(Value::unknown()),
+      }
+    }
+    if let Some(arguments) = &object.arguments {
+      found = true;
+      match key {
+        Some("length") => {
+          #[expect(clippy::cast_precision_loss, reason = "argument counts are small")]
+          let length = arguments.len() as f64;
+          out = out.join(Value::constant(Constant::Number(length)));
+        }
+        Some(index) if index.parse::<usize>().is_ok() => {
+          let index: usize = index.parse().unwrap_or_default();
+          out = out.join(
+            arguments.get(index).cloned().unwrap_or_else(|| Value::constant(Constant::Undefined)),
+          );
+        }
+        _ => {
+          for argument in arguments.iter() {
+            out = out.join(argument.clone());
+          }
+        }
+      }
+    }
+    for object in &object.objects {
+      found = true;
+      let object = object.borrow();
+      let value = match key {
+        Some(key) => object.fields.get(key).cloned().unwrap_or_default().join(object.other.clone()),
+        None => {
+          object.fields.values().fold(object.other.clone(), |acc, value| acc.join(value.clone()))
+        }
+      };
+      out = out.join(value);
+    }
+    if object.reach.any() || object.callables.iter().any(|c| matches!(c, Callable::Program(_))) {
+      found = true;
+      // A value of the program, read by Effect's code.
+      if object.reach.value() {
+        match key {
+          Some(name) => self.event(ReachEvent::Name(name.to_string()), span),
+          None => self.event(ReachEvent::All("read by a computed name in Effect's code"), span),
+        }
+      }
+      out = out.join(Value {
+        reach: object.reach.member(),
+        callables: object
+          .callables
+          .iter()
+          .filter(|c| matches!(c, Callable::Program(_)))
+          .cloned()
+          .collect(),
+        ..Value::default()
+      });
+    }
+    if object.opaque_callee {
+      found = true;
+      out =
+        out.join(Value { reach: object.reach.member(), opaque_callee: true, ..Value::default() });
+    }
+    if object.constant.is_some() || object.unknown || !found {
+      out = out.join(Value::unknown());
+    }
+    out
+  }
+
+  /// An element of an iterable value.
+  fn element_def(&self, value: &Value<'s, 'a>) -> Value<'s, 'a> {
+    let mut out = Value { reach: value.reach.element(), ..Value::default() };
+    if let Some(arguments) = &value.arguments {
+      for argument in arguments.iter() {
+        out = out.join(argument.clone());
+      }
+    }
+    for object in &value.objects {
+      let object = object.borrow();
+      out = out.join(object.other.clone());
+      for field in object.fields.values() {
+        out = out.join(field.clone());
+      }
+    }
+    if value.unknown || value.constant.is_some() {
+      out = out.join(Value::unknown());
+    }
+    out
+  }
+
+  /// A condition: `Some` when it is decided.
+  fn eval_test(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    expr: &'s Expression<'a>,
+    depth: usize,
+  ) -> Option<bool> {
+    let value = self.eval_def(ctx, expr, depth)?;
+    value.constant.as_ref().map(Constant::truthy)
+  }
+
+  fn eval_def_binary(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    binary: &'s oxc::ast::ast::BinaryExpression<'a>,
+    depth: usize,
+  ) -> Value<'s, 'a> {
+    let left = self.eval_def(ctx, &binary.left, depth).unwrap_or_else(Value::unknown);
+    let right = self.eval_def(ctx, &binary.right, depth).unwrap_or_else(Value::unknown);
+    let both = |f: &dyn Fn(&Constant, &Constant) -> Option<Constant>| match (
+      &left.constant,
+      &right.constant,
+    ) {
+      (Some(a), Some(b)) => f(a, b).map(Value::constant).unwrap_or_else(Value::unknown),
+      _ => Value::unknown(),
+    };
+    let number = |c: &Constant| match c {
+      Constant::Number(n) => Some(*n),
+      _ => None,
+    };
+    match binary.operator {
+      BinaryOperator::StrictEquality => both(&|a, b| Some(Constant::Bool(a == b))),
+      BinaryOperator::StrictInequality => both(&|a, b| Some(Constant::Bool(a != b))),
+      BinaryOperator::GreaterEqualThan => {
+        both(&|a, b| Some(Constant::Bool(number(a)? >= number(b)?)))
+      }
+      BinaryOperator::GreaterThan => both(&|a, b| Some(Constant::Bool(number(a)? > number(b)?))),
+      BinaryOperator::LessEqualThan => both(&|a, b| Some(Constant::Bool(number(a)? <= number(b)?))),
+      BinaryOperator::LessThan => both(&|a, b| Some(Constant::Bool(number(a)? < number(b)?))),
+      BinaryOperator::In | BinaryOperator::Instanceof => {
+        if right.reach.value() {
+          match left.constant.as_ref().and_then(Constant::key) {
+            Some(name) => self.event(ReachEvent::Name(name), binary.span),
+            None => {
+              self
+                .event(ReachEvent::All("`in` with a computed name in Effect's code"), binary.span);
+            }
+          }
+        }
+        Value::unknown()
+      }
+      _ => {
+        // Arithmetic, concatenation and loose comparisons convert their
+        // operands.
+        if left.carries_program() || right.carries_program() {
+          self.observe_all(Reach::TOP, binary.span, "converted by an operator in Effect's code");
+        }
+        Value::unknown()
+      }
+    }
+  }
+
+  fn assign_def(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    target: &'s AssignmentTarget<'a>,
+    value: &Value<'s, 'a>,
+    depth: usize,
+  ) -> Option<()> {
+    match target {
+      AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+        let scoping = self.shared().scoping(ctx.module);
+        let symbol = scoping.get_reference(ident.reference_id.get()?).symbol_id();
+        if symbol.is_some_and(|symbol| ctx.frame.assign((ctx.module, symbol), value.clone())) {
+          return Some(());
+        }
+        // Module state of Effect's modules is not modelled: only Effect's own
+        // values may be stored there.
+        (!value.carries_program()).then_some(())
+      }
+      AssignmentTarget::StaticMemberExpression(member) => {
+        let object = self.eval_def(ctx, &member.object, depth)?;
+        self.store_def(&object, Some(member.property.name.as_str()), value)
+      }
+      AssignmentTarget::ComputedMemberExpression(member) => {
+        let object = self.eval_def(ctx, &member.object, depth)?;
+        let key = self.eval_def(ctx, &member.expression, depth)?;
+        self.store_def(&object, key.constant.as_ref().and_then(Constant::key).as_deref(), value)
+      }
+      _ => None,
+    }
+  }
+
+  /// Stores `value` in the objects `object` may be.
+  fn store_def(
+    &self,
+    object: &Value<'s, 'a>,
+    key: Option<&str>,
+    value: &Value<'s, 'a>,
+  ) -> Option<()> {
+    // Into objects Effect's code built here. Anything else (the program's
+    // values, the fiber, builtins) is not modelled, so only Effect's own
+    // values may be stored there.
+    if object.objects.is_empty() || object.fiber || object.reach.any() || object.unknown {
+      return (!value.carries_program() && !object.carries_program_shallow_target()).then_some(());
+    }
+    for target in &object.objects {
+      let mut target = target.borrow_mut();
+      match key {
+        Some(key) => {
+          let current = target.fields.remove(key).unwrap_or_default();
+          target.fields.insert(key.to_string(), current.join(value.clone()));
+        }
+        None => target.other = std::mem::take(&mut target.other).join(value.clone()),
+      }
+    }
+    Some(())
+  }
+
+  fn eval_def_args(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    arguments: &'s ArenaVec<'a, Argument<'a>>,
+    depth: usize,
+  ) -> Option<Vec<Value<'s, 'a>>> {
+    let mut out = vec![];
+    for argument in arguments {
+      match argument {
+        Argument::SpreadElement(spread) => {
+          let value = self.eval_def(ctx, &spread.argument, depth)?;
+          match &value.arguments {
+            Some(arguments) if value.objects.is_empty() => out.extend(arguments.iter().cloned()),
+            _ => return None,
+          }
+        }
+        argument => out.push(self.eval_def(ctx, argument.to_expression(), depth)?),
+      }
+    }
+    Some(out)
+  }
+
+  fn eval_def_call(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    call: &'s CallExpression<'a>,
+    depth: usize,
+  ) -> Option<Value<'s, 'a>> {
+    // `f.call(thisArg, ...)` and `f.apply(thisArg, arguments)`.
+    if let Expression::StaticMemberExpression(member) = strip(&call.callee) {
+      let name = member.property.name.as_str();
+      if matches!(name, "call" | "apply") {
+        let function = self.eval_def(ctx, &member.object, depth)?;
+        if !function.callables.is_empty() && function.objects.is_empty() && !function.fiber {
+          let mut args = self.eval_def_args(ctx, &call.arguments, depth)?;
+          let this = if args.is_empty() { Value::default() } else { args.remove(0) };
+          if name == "apply" {
+            let list = args.into_iter().next().unwrap_or_default();
+            args = {
+              let arguments = &list.arguments?;
+              arguments.to_vec()
+            };
+          }
+          return self.call_value_def(&function, &this, &args, depth);
+        }
+      }
+    }
+    let (callee, this) = match strip(&call.callee) {
+      Expression::StaticMemberExpression(member)
+        if !matches!(
+          self.shared().resolve_expr(ctx.module, &member.object),
+          Some(Resolved::Namespace(_))
+        ) =>
+      {
+        let object = self.eval_def(ctx, &member.object, depth)?;
+        (self.member_def(&object, Some(member.property.name.as_str()), member.span), object)
+      }
+      Expression::ComputedMemberExpression(member) => {
+        let object = self.eval_def(ctx, &member.object, depth)?;
+        let key = self.eval_def(ctx, &member.expression, depth)?;
+        let key = key.constant.as_ref().and_then(Constant::key);
+        (self.member_def(&object, key.as_deref(), member.span), object)
+      }
+      callee => (self.eval_def(ctx, callee, depth)?, Value::default()),
+    };
+    let args = self.eval_def_args(ctx, &call.arguments, depth)?;
+    self.call_value_def(&callee, &this, &args, depth)
+  }
+
+  fn eval_def_new(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    new: &'s oxc::ast::ast::NewExpression<'a>,
+    depth: usize,
+  ) -> Option<Value<'s, 'a>> {
+    let callee = self.eval_def(ctx, &new.callee, depth)?;
+    let args = self.eval_def_args(ctx, &new.arguments, depth)?;
+    if callee.callables.is_empty() {
+      // A builtin constructor (`Error`, `Map`, ...): it may only see Effect's
+      // own values.
+      if callee.unknown && !args.iter().any(Value::carries_program) {
+        return Some(Value::unknown());
+      }
+      return None;
+    }
+    let mut out = Value::default();
+    for callable in callee.callables.clone() {
+      let Callable::Closure { symbol, .. } = &callable else { return None };
+      let primitive = match symbol.and_then(|symbol| self.defs.prototypes.get(&symbol).copied()) {
+        Some((module, proto)) => {
+          let ctx =
+            Ctx { module, frame: Rc::default(), this: Value::default(), arguments: Rc::default() };
+          self.eval_def(&ctx, proto, depth)?.primitive_proto
+        }
+        None => None,
+      };
+      let object = Rc::new(std::cell::RefCell::new(Object { primitive, ..Object::default() }));
+      let this = Value { objects: vec![object], ..Value::default() };
+      let single = Value { callables: vec![callable], ..Value::default() };
+      self.call_value_def(&single, &this, &args, depth)?;
+      out = out.join(this);
+    }
+    Some(out)
+  }
+
+  /// Calls every function `callee` may be.
+  fn call_value_def(
+    &mut self,
+    callee: &Value<'s, 'a>,
+    this: &Value<'s, 'a>,
+    args: &[Value<'s, 'a>],
+    depth: usize,
+  ) -> Option<Value<'s, 'a>> {
+    if depth > DEFINITION_DEPTH || callee.opaque_callee {
+      return None;
+    }
+    if callee.callables.is_empty() {
+      // A builtin or an unknown function, called with Effect's own values
+      // only: its result can choose a branch.
+      if callee.unknown && !args.iter().any(Value::carries_program) && !this.carries_program() {
+        return Some(Value::unknown());
+      }
+      return None;
+    }
+    let mut result = Value::default();
+    for callable in callee.callables.clone() {
+      let value = match callable {
+        Callable::Program(function) => self.call_program_from_def(function, args)?,
+        Callable::Closure { module, params, body, frame, lexical, .. } => {
+          let frame = Frame::child(&frame);
+          let (this, arguments) = match lexical {
+            Some((this, arguments)) => (*this, arguments),
+            None => (this.clone(), Rc::from(args.to_vec())),
+          };
+          for (index, param) in params.items.iter().enumerate() {
+            let BindingPattern::BindingIdentifier(id) = &param.pattern else { return None };
+            let mut value =
+              args.get(index).cloned().unwrap_or_else(|| Value::constant(Constant::Undefined));
+            if let Some(initializer) = &param.initializer {
+              let ctx = Ctx {
+                module,
+                frame: Rc::clone(&frame),
+                this: this.clone(),
+                arguments: Rc::clone(&arguments),
+              };
+              value = value.join(self.eval_def(&ctx, initializer, depth + 1)?);
+            }
+            frame.declare((module, id.symbol_id.get()?), value);
+          }
+          if let Some(rest) = &params.rest {
+            let BindingPattern::BindingIdentifier(id) = &rest.rest.argument else { return None };
+            let mut data = Object::default();
+            for arg in args.iter().skip(params.items.len()) {
+              data.other = std::mem::take(&mut data.other).join(arg.clone());
+            }
+            frame.declare(
+              (module, id.symbol_id.get()?),
+              Value { objects: vec![Rc::new(std::cell::RefCell::new(data))], ..Value::default() },
+            );
+          }
+          let ctx = Ctx { module, frame, this: this.clone(), arguments };
+          match body {
+            ClosureBody::Expr(expression) => self.eval_def(&ctx, expression, depth + 1)?,
+            ClosureBody::Block(body) => {
+              let flow = self.exec_def(&ctx, &body.statements, depth + 1)?;
+              if flow.falls_through {
+                flow.returns.join(Value::constant(Constant::Undefined))
+              } else {
+                flow.returns
+              }
+            }
+          }
+        }
+        Callable::Primitive(primitive) => self.primitive(primitive, args, depth)?,
+        Callable::FiberMethod(name) => match name.as_str() {
+          // The current Effect succeeds with the value, or with the Exit.
+          "succeedWith" => Value::reach(self.to_reach(args.first()?, depth)?.effect_of()),
+          "yieldWith" => args.first()?.clone(),
+          _ => return None,
+        },
+      };
+      result = result.join(value);
+    }
+    Some(result)
+  }
+
+  /// Calls a function of the program from Effect's code.
+  fn call_program_from_def(
+    &mut self,
+    function: FnId,
+    args: &[Value<'s, 'a>],
+  ) -> Option<Value<'s, 'a>> {
+    let mut program_args = vec![];
+    for arg in args {
+      // Effect's own functions handed to the program are not followed. The
+      // fiber is a runtime object: what the program reads from it is
+      // analysed like any other read.
+      if arg.callables.iter().any(|c| !matches!(c, Callable::Program(_))) {
+        return None;
+      }
+      let value = self.to_reach(arg, 0)?;
+      let mut functions: Vec<FnId> = arg
+        .callables
+        .iter()
+        .filter_map(|c| match c {
+          Callable::Program(function) => Some(*function),
+          _ => None,
+        })
+        .collect();
+      for object in &arg.objects {
+        let object = object.borrow();
+        for field in object.fields.values().chain(std::iter::once(&object.other)) {
+          if field.callables.iter().any(|c| !matches!(c, Callable::Program(_))) {
+            return None;
+          }
+          functions.extend(field.callables.iter().filter_map(|c| match c {
+            Callable::Program(function) => Some(*function),
+            _ => None,
+          }));
+        }
+      }
+      program_args.push(Arg { value, spread: false, functions, kind: ArgKind::Known });
+    }
+    let effect_fn = self.info.effect_generators.contains(&function);
+    let ret = self.call_function(function, effect_fn, &program_args, Reach::NONE);
+    // Functions the program returns are not followed back into Effect's code.
+    Some(Value::reach(ret))
+  }
+
+  /// What a value of Effect's code means to the program: its reach, with
+  /// Effects built from primitives read as the success they run to.
+  fn to_reach(&mut self, value: &Value<'s, 'a>, depth: usize) -> Option<Reach> {
+    if value.unknown || depth > DEFINITION_DEPTH {
+      return None;
+    }
+    let mut reach = value.reach;
+    if value.fiber {
+      reach = Reach::TOP;
+    }
+    if let Some(arguments) = &value.arguments {
+      for argument in arguments.iter() {
+        reach = reach.join(self.to_reach(argument, depth + 1)?);
+      }
+    }
+    for object in &value.objects {
+      let (primitive, fields, other) = {
+        let object = object.borrow();
+        (object.primitive, object.fields.clone(), object.other.clone())
+      };
+      match primitive {
+        Some(Primitive::OnSuccess) => {
+          let input = fields.get(self.defs.args_key.as_deref()?)?.clone();
+          let cont = fields.get(self.defs.cont_key.as_deref()?)?.clone();
+          let input_success = self.to_reach(&input, depth + 1)?.success();
+          let this = Value { objects: vec![Rc::clone(object)], ..Value::default() };
+          let fiber = Value { fiber: true, ..Value::default() };
+          let ret =
+            self.call_value_def(&cont, &this, &[Value::reach(input_success), fiber], depth + 1)?;
+          reach = reach.join(self.to_reach(&ret, depth + 1)?.success().effect_of());
+        }
+        Some(_) => return None,
+        None => {
+          for field in fields.values().chain(std::iter::once(&other)) {
+            if !field.callables.is_empty() && !field.reach.any() {
+              continue;
+            }
+            reach = reach.join(self.to_reach(field, depth + 1)?);
+          }
+        }
+      }
+    }
+    Some(reach)
+  }
+
+  fn exec_def(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    statements: &'s ArenaVec<'a, Statement<'a>>,
+    depth: usize,
+  ) -> Option<Flow<'s, 'a>> {
+    let mut flow = Flow { falls_through: true, ..Flow::default() };
+    for statement in statements {
+      if !flow.falls_through {
+        break;
+      }
+      let next = self.exec_statement(ctx, statement, depth)?;
+      flow.returns = std::mem::take(&mut flow.returns).join(next.returns);
+      flow.falls_through = next.falls_through;
+      flow.broke |= next.broke;
+    }
+    Some(flow)
+  }
+
+  fn exec_statement(
+    &mut self,
+    ctx: &Ctx<'s, 'a>,
+    statement: &'s Statement<'a>,
+    depth: usize,
+  ) -> Option<Flow<'s, 'a>> {
+    let through = || Flow { falls_through: true, ..Flow::default() };
+    Some(match statement {
+      Statement::EmptyStatement(_) | Statement::DebuggerStatement(_) => through(),
+      Statement::ExpressionStatement(expression) => {
+        self.eval_def(ctx, &expression.expression, depth)?;
+        through()
+      }
+      Statement::ReturnStatement(statement) => {
+        let returns = match &statement.argument {
+          Some(argument) => self.eval_def(ctx, argument, depth)?,
+          None => Value::constant(Constant::Undefined),
+        };
+        Flow { returns, falls_through: false, broke: false }
+      }
+      Statement::ThrowStatement(statement) => {
+        let value = self.eval_def(ctx, &statement.argument, depth)?;
+        let thrown = self.thrown_reach(&value, depth);
+        let mut changed = self.state.changed;
+        ReachState::join_field(&mut self.state.thrown, thrown, &mut changed);
+        self.state.changed = changed;
+        Flow::default()
+      }
+      Statement::BreakStatement(statement) if statement.label.is_none() => {
+        Flow { broke: true, ..Flow::default() }
+      }
+      Statement::VariableDeclaration(declaration) => {
+        for declarator in &declaration.declarations {
+          let BindingPattern::BindingIdentifier(id) = &declarator.id else { return None };
+          let value = match &declarator.init {
+            Some(init) => self.eval_def(ctx, init, depth)?,
+            None => Value::constant(Constant::Undefined),
+          };
+          ctx.frame.declare((ctx.module, id.symbol_id.get()?), value);
+        }
+        through()
+      }
+      Statement::FunctionDeclaration(function) => {
+        let body = function.body.as_deref()?;
+        let id = function.id.as_ref()?.symbol_id.get()?;
+        ctx.frame.declare(
+          (ctx.module, id),
+          Self::closure(ctx, &function.params, ClosureBody::Block(body), false),
+        );
+        through()
+      }
+      Statement::BlockStatement(block) => self.exec_def(ctx, &block.body, depth)?,
+      Statement::IfStatement(statement) => match self.eval_test(ctx, &statement.test, depth) {
+        Some(true) => self.exec_statement(ctx, &statement.consequent, depth)?,
+        Some(false) => match &statement.alternate {
+          Some(alternate) => self.exec_statement(ctx, alternate, depth)?,
+          None => through(),
+        },
+        None => {
+          let consequent = self.exec_statement(ctx, &statement.consequent, depth)?;
+          let alternate = match &statement.alternate {
+            Some(alternate) => self.exec_statement(ctx, alternate, depth)?,
+            None => through(),
+          };
+          Flow {
+            returns: consequent.returns.join(alternate.returns),
+            falls_through: consequent.falls_through || alternate.falls_through,
+            broke: consequent.broke || alternate.broke,
+          }
+        }
+      },
+      Statement::SwitchStatement(switch) => {
+        let discriminant =
+          self.eval_def(ctx, &switch.discriminant, depth).unwrap_or_else(Value::unknown);
+        // The case to start from, when the discriminant and every test before
+        // the match are constants.
+        let mut start = None;
+        if let Some(constant) = &discriminant.constant {
+          for (index, case) in switch.cases.iter().enumerate() {
+            let Some(test) = &case.test else { continue };
+            let test = self.eval_def(ctx, test, depth).unwrap_or_else(Value::unknown);
+            match &test.constant {
+              Some(value) if value == constant => {
+                start = Some(index);
+                break;
+              }
+              Some(_) => {}
+              None => break,
+            }
+          }
+          if start.is_none() {
+            start = switch.cases.iter().position(|case| case.test.is_none());
+          }
+        }
+        let starts: Vec<usize> = match start {
+          Some(start) => vec![start],
+          None => (0..switch.cases.len()).collect(),
+        };
+        let mut flow = Flow::default();
+        for start in starts {
+          let mut run = Flow { falls_through: true, ..Flow::default() };
+          for case in switch.cases.iter().skip(start) {
+            let next = self.exec_def(ctx, &case.consequent, depth)?;
+            run.returns = std::mem::take(&mut run.returns).join(next.returns);
+            run.falls_through = next.falls_through;
+            if next.broke {
+              run.falls_through = true;
+              break;
+            }
+            if !next.falls_through {
+              break;
+            }
+          }
+          flow.returns = std::mem::take(&mut flow.returns).join(run.returns);
+          flow.falls_through |= run.falls_through;
+        }
+        flow
+      }
+      Statement::TryStatement(statement) => {
+        let block = self.exec_def(ctx, &statement.block.body, depth)?;
+        let mut flow = block;
+        if let Some(handler) = &statement.handler {
+          if let Some(param) = &handler.param {
+            let BindingPattern::BindingIdentifier(id) = &param.pattern else { return None };
+            ctx.frame.declare(
+              (ctx.module, id.symbol_id.get()?),
+              Value::reach(self.state.thrown.collapse()),
+            );
+          }
+          let caught = self.exec_def(ctx, &handler.body.body, depth)?;
+          flow.returns = flow.returns.join(caught.returns);
+          flow.falls_through |= caught.falls_through;
+        }
+        if let Some(finalizer) = &statement.finalizer {
+          let finalizer = self.exec_def(ctx, &finalizer.body, depth)?;
+          flow.returns = flow.returns.join(finalizer.returns);
+          if !finalizer.falls_through {
+            flow.falls_through = false;
+          }
+        }
+        flow
+      }
+      _ => return None,
+    })
+  }
+
+  /// What a thrown value or failure cause may reach. A value Effect's code
+  /// built without the program's values carries none of them.
+  fn thrown_reach(&mut self, value: &Value<'s, 'a>, depth: usize) -> Reach {
+    if !value.carries_program() {
+      return Reach::NONE;
+    }
+    self.to_reach(value, depth).unwrap_or(Reach::TOP).collapse()
+  }
+
+  /// What the fiber does with a primitive built with `args`.
+  fn primitive(
+    &mut self,
+    primitive: Primitive,
+    args: &[Value<'s, 'a>],
+    depth: usize,
+  ) -> Option<Value<'s, 'a>> {
+    let first = args.first().cloned().unwrap_or_default();
+    let fiber = Value { fiber: true, ..Value::default() };
+    Some(match primitive {
+      // `exitSucceed(value)`: succeeds with `value`.
+      Primitive::Success => Value::reach(self.to_reach(&first, depth + 1)?.effect_of()),
+      // `exitFailCause(cause)`: fails; error handlers may receive the cause.
+      Primitive::Failure => {
+        let thrown = self.thrown_reach(&first, depth + 1);
+        let mut changed = self.state.changed;
+        ReachState::join_field(&mut self.state.thrown, thrown, &mut changed);
+        self.state.changed = changed;
+        Value::default()
+      }
+      // `withFiber(f)`: runs the Effect `f(fiber)` returns.
+      Primitive::WithFiber => {
+        let ret = self.call_value_def(&first, &Value::default(), &[fiber], depth + 1)?;
+        Value::reach(self.to_reach(&ret, depth + 1)?.success().effect_of())
+      }
+      // `withFiberSucceed(f)`: succeeds with `f(fiber)`.
+      Primitive::WithFiberSucceed => {
+        let ret = self.call_value_def(&first, &Value::default(), &[fiber], depth + 1)?;
+        Value::reach(self.to_reach(&ret, depth + 1)?.effect_of())
+      }
+      // `sync(f)`: succeeds with `f()`.
+      Primitive::Sync => {
+        let ret = self.call_value_def(&first, &Value::default(), &[], depth + 1)?;
+        Value::reach(self.to_reach(&ret, depth + 1)?.effect_of())
+      }
+      // `suspend(f)`: runs the Effect `f()` returns.
+      Primitive::Suspend => {
+        let ret = self.call_value_def(&first, &Value::default(), &[], depth + 1)?;
+        Value::reach(self.to_reach(&ret, depth + 1)?.success().effect_of())
+      }
+      // Built with `new` from its prototype, never called.
+      Primitive::OnSuccess => return None,
+    })
   }
 }
