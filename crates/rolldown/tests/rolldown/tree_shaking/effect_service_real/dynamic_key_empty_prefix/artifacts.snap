@@ -6,7 +6,7 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## EFFECT_SERVICE_SHAKING
 
 ```text
-[EFFECT_SERVICE_SHAKING] [bailout] service key with a dynamic key string at 1:1 in main.js
+[EFFECT_SERVICE_SHAKING] [bailout] service key with a dynamic key string at 11:17 in main.js
 
 ```
 

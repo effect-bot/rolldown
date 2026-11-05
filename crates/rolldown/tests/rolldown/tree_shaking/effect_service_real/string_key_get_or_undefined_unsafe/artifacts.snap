@@ -1,15 +1,6 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
 ---
-# warnings
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Context.getOrUndefinedUnsafe` reads Context internals at 23:28 in main.js
-
-```
-
 # Assets
 
 ## main.js

@@ -1,15 +1,6 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
 ---
-# warnings
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Context.makeUnsafe` reads Context internals at 22:35 in main.js
-
-```
-
 # Assets
 
 ## main.js
@@ -4607,14 +4598,9 @@ const provide = provide$1;
 const runPromise = runPromise$1;
 // main.js
 const Store = Service("test/RealMakeUnsafe");
-const unusedHelper = () => "unused";
 const StoreLayer = effect(Store, gen(function* () {
 	const readOne = () => "read";
-	const unused = () => unusedHelper();
-	return Store.of({
-		readOne,
-		unused
-	});
+	return Store.of({ readOne });
 }));
 const program = gen(function* () {
 	return [(yield* Store).readOne(), typeof makeUnsafe$2(/* @__PURE__ */ new Map())];

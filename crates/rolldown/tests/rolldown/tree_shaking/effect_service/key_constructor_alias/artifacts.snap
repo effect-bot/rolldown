@@ -1,15 +1,6 @@
 ---
 source: crates/rolldown_testing/src/integration_test.rs
 ---
-# warnings
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Context.Service` used other than to declare a service key at 8:17 in main.js
-
-```
-
 # Assets
 
 ## main.js
@@ -67,10 +58,7 @@ function effect(service, effect_) {
 }
 const Hidden = Service("test/Aliased");
 const layer = effect(Service("test/Aliased"), gen(function* () {
-	return {
-		read: () => 1,
-		unused: () => 2
-	};
+	return { read: () => 1 };
 }));
 const program = gen(function* () {
 	return (yield* Hidden).read();
