@@ -1,8 +1,8 @@
 use super::BuildEvent;
 use crate::{types::diagnostic_options::DiagnosticOptions, types::event_kind::EventKind};
 
-/// Why `experimental.effectServiceShaking` kept methods: a reason that turned the pass
-/// off, or one that marked every object in user code as possibly holding a runtime value.
+/// A reason that turned `experimental.effectServiceShaking` off for the whole build, so
+/// no service method was removed. Reported once per site.
 #[derive(Debug)]
 pub struct EffectServiceShaking {
   pub module_id: Option<String>,
