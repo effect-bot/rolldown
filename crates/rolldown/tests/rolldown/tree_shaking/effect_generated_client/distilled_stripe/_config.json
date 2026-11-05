@@ -1,0 +1,9 @@
+{
+  "_comment": "Measurement fixture: the real @distilled.cloud/stripe generated client. Its core compiles operation specs with `Function`, so the pass turns itself off (A2). Not snapshotted, and outside the effect_service filter.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false
+}

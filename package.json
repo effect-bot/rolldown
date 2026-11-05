@@ -18,6 +18,7 @@
     "docs:preview": "pnpm --filter rolldown-docs run preview"
   },
   "devDependencies": {
+    "@distilled.cloud/stripe": "1.0.0-rc.18",
     "@effect/ai-openai": "4.1.2",
     "@oxc-node/core": "catalog:",
     "@oxc-project/runtime": "catalog:",

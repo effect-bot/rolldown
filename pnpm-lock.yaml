@@ -431,6 +431,9 @@ importers:
 
   .:
     devDependencies:
+      '@distilled.cloud/stripe':
+        specifier: 1.0.0-rc.18
+        version: 1.0.0-rc.18(effect@4.1.2)
       '@effect/ai-openai':
         specifier: 4.1.2
         version: 4.1.2(effect@4.1.2)
@@ -2096,6 +2099,16 @@ packages:
   '@cspotcode/source-map-support@0.8.1':
     resolution: {integrity: sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==}
     engines: {node: '>=12'}
+
+  '@distilled.cloud/core@1.0.0-rc.18':
+    resolution: {integrity: sha512-Iui60+sNl1CwUu7NKGLuFf3VC4H9xYzfm0Fc8ZQvd87qwf1sDMB3EAWZrq/QFgrwzSY16z2mJ0PNHaBUnGet8A==}
+    peerDependencies:
+      effect: ^4.0.5
+
+  '@distilled.cloud/stripe@1.0.0-rc.18':
+    resolution: {integrity: sha512-BkD6bkYShbnSvy8uJbJ6iNVQZmaH+SFFym/UO0ycWdt8q4f9xGxIng65bqHDdOtO/RqMo4ZcuRih6cs+TCbB8Q==}
+    peerDependencies:
+      effect: ^4.0.5
 
   '@docsearch/css@4.7.0':
     resolution: {integrity: sha512-Sk5xkdRFeE7PeWjG9l4AfTwdvMfr9wHiwNNCpHXT4v4SNyNMKdHGvEILc31BgaVFGDDNbv5u/a73tofRiwbEZw==}
@@ -10328,6 +10341,15 @@ snapshots:
   '@cspotcode/source-map-support@0.8.1':
     dependencies:
       '@jridgewell/trace-mapping': 0.3.9
+
+  '@distilled.cloud/core@1.0.0-rc.18(effect@4.1.2)':
+    dependencies:
+      effect: 4.1.2
+
+  '@distilled.cloud/stripe@1.0.0-rc.18(effect@4.1.2)':
+    dependencies:
+      '@distilled.cloud/core': 1.0.0-rc.18(effect@4.1.2)
+      effect: 4.1.2
 
   '@docsearch/css@4.7.0': {}
 
