@@ -1,0 +1,9 @@
+{
+  "_comment": "Measurement fixture: @distilled.cloud/stripe consumed as an application service (Alchemy's pattern). Distilled core loads code at run time, so the pass turns itself off (A2). Not snapshotted, and outside the effect_service filter.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false
+}
