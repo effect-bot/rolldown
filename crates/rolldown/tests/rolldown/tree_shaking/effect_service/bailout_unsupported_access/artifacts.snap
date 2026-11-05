@@ -6,13 +6,6 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## EFFECT_SERVICE_SHAKING
 
 ```text
-[EFFECT_SERVICE_SHAKING] [bailout] `Context.get` looks a service up other than by `yield*` at 56:81 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
 [EFFECT_SERVICE_SHAKING] [bailout] service key `test/A` used in CallExpression at 44:12 in main.js
 
 ```
@@ -28,13 +21,6 @@ source: crates/rolldown_testing/src/integration_test.rs
 
 ```text
 [EFFECT_SERVICE_SHAKING] [bailout] service key `test/B` used in CallExpression at 45:12 in main.js
-
-```
-
-## EFFECT_SERVICE_SHAKING
-
-```text
-[EFFECT_SERVICE_SHAKING] [bailout] service key `test/B` used in CallExpression at 56:102 in main.js
 
 ```
 

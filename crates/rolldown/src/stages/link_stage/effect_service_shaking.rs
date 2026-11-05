@@ -6,13 +6,17 @@
 //!
 //! Base case only:
 //! - Service keys are module-level `const K = Context.Service(...)` declarations
-//!   with a literal key string.
+//!   with a literal key string, or `class K extends Context.Service<..>()("key")`
+//!   whose body never mentions `this`.
 //! - Consumers are `const s = yield* K` (or `const { a } = yield* K`) inside an
 //!   `Effect.gen` / `Effect.fn` generator, where `s` is only read with static
 //!   member access.
 //! - Providers are `Layer.succeed(K, {...})` and `Layer.effect(K, e)` where `e` is
 //!   built from `Effect.gen`, `Effect.sync`, `Effect.succeed` and
-//!   `Effect.acquireRelease`, and returns `K.of({...})` or `{...}`.
+//!   `Effect.acquireRelease`, and returns `K.of({...})` or `{...}`. Outside the
+//!   trusted packages, `e` may also be `make(args)` for a module-level
+//!   `Effect.fn` constructor returning the object built by a module-level
+//!   function, when every reference to both is such a followed call.
 //!
 //! Demand is attached to the key string. Reads inside a removed method, or
 //! inside a constructor-local function only that method used, do not count:
@@ -28,8 +32,8 @@
 //! on Effect runtime objects (A1), the program is closed (A2), Effect reads
 //! services only by key (A3), and there is one bundled `effect` (A4). The
 //! cheap syntactic breaches (code loading, entry exports, external imports,
-//! string-keyed Context APIs, keyed lookups other than `yield*`, builtin
-//! prototype writes) turn the pass off.
+//! string-keyed Context APIs, keyed lookups other than `yield*` by an untracked
+//! key, builtin prototype writes) turn the pass off.
 
 use oxc::{
   allocator::Vec as ArenaVec,
@@ -37,10 +41,11 @@ use oxc::{
     AstKind,
     ast::{
       Argument, AssignmentTargetPropertyIdentifier, AssignmentTargetPropertyProperty,
-      BinaryOperator, BindingPattern, BindingProperty, CallExpression, ComputedMemberExpression,
-      Expression, Function, FunctionType, IdentifierReference, ImportExpression, ObjectExpression,
-      ObjectPropertyKind, PropertyKey, PropertyKind, Statement, StaticMemberExpression,
-      UnaryOperator, VariableDeclarationKind, VariableDeclarator, YieldExpression,
+      BinaryOperator, BindingPattern, BindingProperty, CallExpression, Class, ClassElement,
+      ComputedMemberExpression, Declaration, Expression, Function, FunctionBody, FunctionType,
+      IdentifierReference, ImportExpression, ObjectExpression, ObjectPropertyKind, PropertyKey,
+      PropertyKind, Statement, StaticMemberExpression, UnaryOperator, VariableDeclarationKind,
+      VariableDeclarator, YieldExpression,
     },
   },
   ast_visit::{VisitJs, VisitJsMut, walk_js, walk_js_mut},
@@ -79,6 +84,46 @@ const KEYED_LOOKUPS: &[&str] = &[
   "Stream.updateService",
   "Channel.updateService",
 ];
+// Data-last pipeables of `Effect.fn` constructors that only change the context
+// or tracing of the constructor, never handing its result to user code.
+const CONTEXT_PIPEABLES: &[&str] =
+  &["Effect.updateService", "Effect.provideService", "Effect.withSpan", "Effect.annotateLogs"];
+// Layer combinators that may be applied with `.pipe(...)`, curried.
+const PIPED_LAYER_COMBINATORS: &[&str] = &["Layer.provide", "Layer.provideMerge", "Layer.merge"];
+
+/// Arguments of a keyed lookup or `provideService` call that are keys, by API
+/// and argument count; `None` when the shape is not recognised.
+fn key_arguments(api: &str, argc: usize) -> Option<Vec<usize>> {
+  let index = match (api, argc) {
+    ("Context.pick" | "Context.omit", _) => return Some((0..argc).collect()),
+    ("Context.get" | "Context.getUnsafe" | "Context.getOption" | "Context.getOrUndefined", 2)
+    | (
+      "Context.getOrElse"
+      | "Effect.updateService"
+      | "Layer.updateService"
+      | "Stream.updateService"
+      | "Channel.updateService"
+      | "Effect.provideService"
+      | "Effect.provideServiceEffect",
+      3,
+    ) => 1,
+    ("Context.get" | "Context.getUnsafe" | "Context.getOption" | "Context.getOrUndefined", 1)
+    | (
+      "Context.getOrElse"
+      | "Effect.updateService"
+      | "Layer.updateService"
+      | "Stream.updateService"
+      | "Channel.updateService"
+      | "Effect.provideServiceEffect",
+      2,
+    )
+    | ("Effect.provideService", 1 | 2)
+    | ("Effect.updateServiceScoped" | "Effect.service" | "Effect.serviceOption", 1..) => 0,
+    _ => return None,
+  };
+  Some(vec![index])
+}
+
 // Ways to run code that is not part of the module graph (A2), by global name,
 // member name (`globalThis.eval`, `fn.constructor`, `process.getBuiltinModule`)
 // or imported name.
@@ -251,17 +296,22 @@ enum Container {
   Terminal,
   /// Stored in a `const`, whose uses are checked in turn.
   Binding(SymbolRef),
+  /// Returned from a module-level function, whose calls are checked in turn.
+  Factory(SymbolRef),
   Escape,
 }
 
 #[derive(Debug)]
 struct RefInfo {
+  module: ModuleIdx,
   span: Span,
   top_stmt: usize,
   chain: Vec<Guard>,
   /// Static member read on the reference: (name, is a write target).
   member: Option<(String, bool)>,
   container: Container,
+  /// Where the result flows when the reference is called directly.
+  call_result: Option<Container>,
   /// The root-scope symbol referenced, for statement bookkeeping.
   root_symbol: Option<SymbolId>,
 }
@@ -271,6 +321,9 @@ struct Prop {
   name: Option<String>,
   span: Span,
   prunable: bool,
+  /// May read other properties through `this` when called as a method, so
+  /// keeping it keeps every property.
+  this_risk: bool,
 }
 
 #[derive(Debug)]
@@ -283,11 +336,15 @@ struct Site {
   /// Locals bound to the provider object before it reaches a Context, such as
   /// an `acquireRelease` release callback parameter.
   bindings: Vec<SymbolRef>,
+  /// Constructor and builder functions the object is returned through. Every
+  /// reference to them must be a call the pass followed into a provider.
+  via: Vec<SymbolRef>,
 }
 
-/// A provider object literal found in an Effect expression: (span start,
-/// locals bound to it before it reaches a Context, keep every property).
-type FoundSite = (u32, Vec<SymbolRef>, bool);
+/// A provider object literal found in an Effect expression: (module, span
+/// start, locals bound to it before it reaches a Context, keep every property,
+/// functions it is returned through).
+type FoundSite = (ModuleIdx, u32, Vec<SymbolRef>, bool, Vec<SymbolRef>);
 
 /// Reads of a provider object through locals bound before it reaches a
 /// Context: (site, (name, guards) list, escaped).
@@ -399,6 +456,11 @@ struct Shared<'l> {
   capabilities: FxHashSet<SymbolRef>,
   /// `const` bindings holding a constant string.
   const_strings: FxHashMap<SymbolRef, String>,
+  /// Static member names of class-form keys.
+  key_statics: FxHashMap<SymbolRef, FxHashSet<String>>,
+  /// Module-level functions that return only object literals: their module
+  /// and the literals' span starts.
+  builders: FxHashMap<SymbolRef, (ModuleIdx, Vec<u32>)>,
 }
 
 impl Shared<'_> {
@@ -570,6 +632,59 @@ fn reads_arguments(function_body: &oxc::ast::ast::FunctionBody<'_>) -> bool {
   finder.0
 }
 
+/// Whether a class body mentions `this` or `super` anywhere, nested functions
+/// included.
+fn class_body_reads_this(class: &Class<'_>) -> bool {
+  struct Finder(bool);
+  impl VisitJs<'_> for Finder {
+    fn visit_this_expression(&mut self, _it: &oxc::ast::ast::ThisExpression) {
+      self.0 = true;
+    }
+    fn visit_super(&mut self, _it: &oxc::ast::ast::Super) {
+      self.0 = true;
+    }
+  }
+  let mut finder = Finder(false);
+  finder.visit_class_body(&class.body);
+  finder.0
+}
+
+/// Span starts of the object literals a function body returns, when every
+/// return is an object literal.
+fn object_returns(body: &FunctionBody<'_>) -> Option<Vec<u32>> {
+  let mut returns = Returns(vec![], true);
+  returns.statements(&body.statements);
+  if !returns.1 || returns.0.is_empty() {
+    return None;
+  }
+  returns
+    .0
+    .iter()
+    .map(|value| match strip(value) {
+      Expression::ObjectExpression(object) => Some(object.span.start),
+      _ => None,
+    })
+    .collect()
+}
+
+/// Span starts of the object literals a function expression returns, when it
+/// is a plain function or arrow and every return is an object literal.
+fn builder_returns(function: &Expression<'_>) -> Option<Vec<u32>> {
+  match strip(function) {
+    Expression::ArrowFunctionExpression(f) if !f.r#async => match f.get_expression() {
+      Some(value) => match strip(value) {
+        Expression::ObjectExpression(object) => Some(vec![object.span.start]),
+        _ => None,
+      },
+      None => f.body.as_function_body().and_then(object_returns),
+    },
+    Expression::FunctionExpression(f) if !f.r#async && !f.generator => {
+      f.body.as_ref().and_then(|body| object_returns(body))
+    }
+    _ => None,
+  }
+}
+
 /// Return values of a function body, and whether every return was followed.
 struct Returns<'b, 'a>(Vec<&'b Expression<'a>>, bool);
 impl<'b, 'a> Returns<'b, 'a> {
@@ -623,6 +738,8 @@ struct KeyCollector<'s, 'l> {
   shared: &'s Shared<'l>,
   module: ModuleIdx,
   keys: Vec<(SymbolRef, KeyCreation, u32)>,
+  key_statics: Vec<(SymbolRef, FxHashSet<String>)>,
+  builders: Vec<(SymbolRef, Vec<u32>)>,
   this_free: Vec<SymbolRef>,
   const_strings: Vec<(SymbolRef, Vec<StringPart>)>,
   depth: usize,
@@ -632,11 +749,18 @@ struct KeyCollector<'s, 'l> {
 impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
   fn visit_function(&mut self, it: &Function<'a>, flags: oxc::semantic::ScopeFlags) {
     if let Some(id) = &it.id {
-      if matches!(it.r#type, FunctionType::FunctionDeclaration) && !reads_this(it) {
+      if matches!(it.r#type, FunctionType::FunctionDeclaration) {
         // A reassigned declaration may hold any function at runtime.
         let scoping = self.shared.scoping(self.module);
         if let Some(symbol) = id.symbol_id.get().filter(|s| !scoping.symbol_is_mutated(*s)) {
-          self.this_free.push((self.module, symbol).into());
+          if !reads_this(it) {
+            self.this_free.push((self.module, symbol).into());
+          }
+          if self.depth == 0 && !it.r#async && !it.generator {
+            if let Some(starts) = it.body.as_ref().and_then(|body| object_returns(body)) {
+              self.builders.push(((self.module, symbol).into(), starts));
+            }
+          }
         }
       }
     }
@@ -677,11 +801,53 @@ impl<'a> VisitJs<'a> for KeyCollector<'_, '_> {
             if let Some((key, callee_start)) = self.shared.key_creation(self.module, init) {
               self.keys.push((symbol_ref, key, callee_start));
             }
+            if let Some(starts) = builder_returns(init) {
+              self.builders.push((symbol_ref, starts));
+            }
           }
         }
       }
     }
     walk_js::walk_variable_declarator(self, it);
+  }
+
+  /// A module-level `class K extends Context.Service<..>()("key") { ... }` is a
+  /// key declaration when its body never mentions `this` or `super`: static
+  /// members then reach the key only by name, which is checked like any use.
+  fn visit_class(&mut self, it: &Class<'a>) {
+    let super_class = it.heritage.as_ref().map(|heritage| &heritage.expression);
+    if let (0, Some(id), Some(super_class)) = (self.depth, &it.id, super_class) {
+      let scoping = self.shared.scoping(self.module);
+      let symbol = id.symbol_id.get().filter(|symbol| !scoping.symbol_is_mutated(*symbol));
+      if let (Some(symbol), Some((key, callee_start))) =
+        (symbol, self.shared.key_creation(self.module, super_class))
+      {
+        if it.r#type == oxc::ast::ast::ClassType::ClassDeclaration && !class_body_reads_this(it) {
+          let symbol_ref: SymbolRef = (self.module, symbol).into();
+          let statics = it
+            .body
+            .body
+            .iter()
+            .filter_map(|element| match element {
+              ClassElement::MethodDefinition(method) if method.r#static && !method.computed => {
+                method.key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
+              }
+              ClassElement::PropertyDefinition(property)
+                if property.r#static && !property.computed =>
+              {
+                property.key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
+              }
+              _ => None,
+            })
+            .collect();
+          self.keys.push((symbol_ref, key, callee_start));
+          self.key_statics.push((symbol_ref, statics));
+        }
+      }
+    }
+    self.depth += 1;
+    walk_js::walk_class(self, it);
+    self.depth -= 1;
   }
 }
 
@@ -698,9 +864,15 @@ struct UseCollector<'s, 'l, 'a> {
   namespace_refs: Vec<(SymbolRef, RefInfo)>,
   /// Use-expression spans of key references already classified.
   classified: FxHashSet<u32>,
-  /// Object literal spans recognised as provider sites -> site index.
-  site_spans: FxHashMap<u32, usize>,
+  /// Object literal (module, span start) recognised as provider sites -> site index.
+  site_spans: &'s mut FxHashMap<(ModuleIdx, u32), usize>,
   sites: &'s mut Vec<Site>,
+  /// Initializers of this module's module-level `const` bindings.
+  module_consts: FxHashMap<SymbolId, &'a Expression<'a>>,
+  /// Callee spans of constructor and builder calls followed into a provider.
+  accounted: Vec<(ModuleIdx, u32)>,
+  /// Callee span starts of keyed lookups whose keys were all resolved.
+  handled_lookups: FxHashSet<u32>,
   consumers: Vec<Consumer>,
   providers: Vec<(String, Container)>,
   guard_bindings: Vec<GuardBinding>,
@@ -993,6 +1165,55 @@ impl<'a> UseCollector<'_, '_, 'a> {
             _ => return Container::Escape,
           }
         }
+        // `layer.pipe(Layer.provide(a), ...)` with curried Layer combinators.
+        AstKind::StaticMemberExpression(member)
+          if member.object.span() == current && member.property.name == "pipe" =>
+        {
+          let Some(AstKind::CallExpression(call)) =
+            index.checked_sub(1).and_then(|i| self.path.get(i))
+          else {
+            return Container::Escape;
+          };
+          let combinators = !call.arguments.is_empty()
+            && call.arguments.iter().all(|argument| {
+              matches!(argument.as_expression().map(strip), Some(Expression::CallExpression(inner))
+                if inner.arguments.len() == 1
+                  && self.shared.api_of(self.module, &inner.callee)
+                    .is_some_and(|api| PIPED_LAYER_COMBINATORS.contains(&api)))
+            });
+          if call.callee.span() != member.span || !combinators {
+            return Container::Escape;
+          }
+          current = call.span;
+          index -= 1;
+        }
+        // The body of `const f = (..) => value`, or `return value` directly in
+        // a module-level function.
+        AstKind::ArrowFunctionExpression(arrow)
+          if arrow.get_expression().is_some_and(|body| body.span() == current) =>
+        {
+          return if arrow.r#async { Container::Escape } else { self.factory(arrow.span, index) };
+        }
+        AstKind::ReturnStatement(statement)
+          if statement.argument.as_ref().is_some_and(|argument| argument.span() == current) =>
+        {
+          return match (
+            index.checked_sub(1).and_then(|i| self.path.get(i)),
+            index.checked_sub(2).and_then(|i| self.path.get(i)),
+          ) {
+            (Some(AstKind::FunctionBody(_)), Some(AstKind::ArrowFunctionExpression(arrow)))
+              if !arrow.r#async =>
+            {
+              self.factory(arrow.span, index - 2)
+            }
+            (Some(AstKind::FunctionBody(_)), Some(AstKind::Function(function)))
+              if !function.r#async && !function.generator =>
+            {
+              self.factory(function.span, index - 2)
+            }
+            _ => Container::Escape,
+          };
+        }
         AstKind::VariableDeclarator(declarator) => {
           let is_init = declarator.init.as_ref().is_some_and(|init| init.span() == current);
           let kind = match index.checked_sub(1).and_then(|i| self.path.get(i)) {
@@ -1017,9 +1238,68 @@ impl<'a> UseCollector<'_, '_, 'a> {
     }
   }
 
+  /// The function at ancestor `index`, with span `function`, as a container:
+  /// a module-level `const` or function declaration, never reassigned, in an
+  /// untrusted module.
+  fn factory(&self, function: Span, index: usize) -> Container {
+    // Only outside the trusted packages: A3 does not cover how Effect's own
+    // modules read Effect's own services.
+    if self.trusted {
+      return Container::Escape;
+    }
+    let module_level = |i: usize| match self.path.get(i) {
+      Some(AstKind::Program(_)) => true,
+      Some(AstKind::ExportDeclaration(_)) => {
+        matches!(i.checked_sub(1).and_then(|j| self.path.get(j)), Some(AstKind::Program(_)))
+      }
+      _ => false,
+    };
+    let scoping = self.shared.scoping(self.module);
+    let symbol = match self.path.get(index) {
+      Some(AstKind::Function(f)) if f.r#type == FunctionType::FunctionDeclaration => f
+        .id
+        .as_ref()
+        .and_then(|id| id.symbol_id.get())
+        .filter(|_| index.checked_sub(1).is_some_and(module_level)),
+      _ => match (
+        index.checked_sub(1).and_then(|i| self.path.get(i)),
+        index.checked_sub(2).and_then(|i| self.path.get(i)),
+      ) {
+        (Some(AstKind::VariableDeclarator(declarator)), Some(AstKind::VariableDeclaration(d)))
+          if d.kind == VariableDeclarationKind::Const
+            && declarator.init.as_ref().is_some_and(|init| strip(init).span() == function)
+            && index.checked_sub(3).is_some_and(module_level) =>
+        {
+          match &declarator.id {
+            BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
+            _ => None,
+          }
+        }
+        _ => None,
+      },
+    };
+    match symbol.filter(|symbol| !scoping.symbol_is_mutated(*symbol)) {
+      Some(symbol) => {
+        Container::Factory(self.shared.symbols.canonical_ref_for((self.module, symbol).into()))
+      }
+      None => Container::Escape,
+    }
+  }
+
+  /// Where the result of calling the expression at `span`, whose parent is
+  /// `self.path[index]`, flows: `None` when it is not called directly.
+  fn call_result(&self, span: Span, index: usize) -> Option<Container> {
+    match self.path.get(index) {
+      Some(AstKind::CallExpression(call)) if call.callee.span() == span => {
+        Some(index.checked_sub(1).map_or(Container::Escape, |i| self.container_from(call.span, i)))
+      }
+      _ => None,
+    }
+  }
+
   /// Provider objects reachable from an Effect expression in the base case.
   /// Returns false when some source is not a recognised object literal.
-  fn effect_sites(&self, expr: &Expression<'a>, found: &mut Vec<FoundSite>) -> bool {
+  fn effect_sites(&mut self, expr: &Expression<'a>, found: &mut Vec<FoundSite>) -> bool {
     let Expression::CallExpression(call) = strip(expr) else { return false };
     let args = &call.arguments;
     match self.shared.api_of(self.module, &call.callee) {
@@ -1064,18 +1344,77 @@ impl<'a> UseCollector<'_, '_, 'a> {
           _ => (None, true),
         };
         // Nested acquisitions keep the readers of every level.
-        for (span, mut bindings, existing_top) in acquired {
+        for (module, span, mut bindings, existing_top, via) in acquired {
           bindings.extend(binding);
-          found.push((span, bindings, existing_top || top));
+          found.push((module, span, bindings, existing_top || top, via));
         }
         complete
       }
-      _ => false,
+      // `make(args)`, where `make` is a module-level `Effect.fn` constructor
+      // outside the trusted packages.
+      _ => {
+        if self.trusted {
+          return false;
+        }
+        let Some(Resolved::Symbol(symbol)) = self.shared.resolve_expr(self.module, &call.callee)
+        else {
+          return false;
+        };
+        let Some(generator) = self.constructor_generator(symbol) else { return false };
+        let mut returned = vec![];
+        let complete = self.return_sites(generator, true, &mut returned);
+        self.accounted.push((self.module, call.callee.span().start));
+        for (module, span, bindings, top, mut via) in returned {
+          via.push(symbol);
+          found.push((module, span, bindings, top, via));
+        }
+        complete
+      }
     }
   }
 
+  /// The generator of a module-level `const make = Effect.fn(function* () {..}, ...)`
+  /// in this module, when every pipeable only changes the constructor's context.
+  fn constructor_generator(&self, symbol: SymbolRef) -> Option<&'a Expression<'a>> {
+    if symbol.owner != self.module {
+      return None;
+    }
+    let Expression::CallExpression(call) = strip(self.module_consts.get(&symbol.symbol)?) else {
+      return None;
+    };
+    if !matches!(
+      self.shared.api_of(self.module, &call.callee),
+      Some("Effect.fn" | "Effect.fnUntraced")
+    ) {
+      return None;
+    }
+    let (first, pipeables) = call.arguments.split_first()?;
+    let generator = first.as_expression()?;
+    if !matches!(strip(generator), Expression::FunctionExpression(f) if f.generator) {
+      return None;
+    }
+    pipeables.iter().all(|pipeable| self.is_context_pipeable(pipeable)).then_some(generator)
+  }
+
+  /// `Effect.updateService(K, f)` and similar, directly or through a
+  /// module-level `const` of this module.
+  fn is_context_pipeable(&self, pipeable: &Argument<'a>) -> bool {
+    let Some(mut expr) = pipeable.as_expression() else { return false };
+    if let Expression::Identifier(ident) = strip(expr) {
+      let local = ident.reference_id.get().and_then(|reference| {
+        self.shared.scoping(self.module).get_reference(reference).symbol_id()
+      });
+      match local.and_then(|symbol| self.module_consts.get(&symbol)) {
+        Some(init) => expr = init,
+        None => return false,
+      }
+    }
+    matches!(strip(expr), Expression::CallExpression(call)
+      if self.shared.api_of(self.module, &call.callee).is_some_and(|api| CONTEXT_PIPEABLES.contains(&api)))
+  }
+
   fn return_sites(
-    &self,
+    &mut self,
     function: &Expression<'a>,
     generator: bool,
     found: &mut Vec<FoundSite>,
@@ -1097,18 +1436,36 @@ impl<'a> UseCollector<'_, '_, 'a> {
     returns.statements(&body.statements);
     let mut complete = returns.1 && !returns.0.is_empty();
     for value in returns.0 {
-      complete &= self.value_sites(value, found);
+      complete &= match strip(value) {
+        // `return yield* effect` in an Effect generator returns its result.
+        Expression::YieldExpression(yielded) if generator && yielded.delegate => {
+          yielded.argument.as_ref().is_some_and(|effect| self.effect_sites(effect, found))
+        }
+        _ => self.value_sites(value, found),
+      };
     }
     complete
   }
 
-  fn value_sites(&self, value: &Expression<'a>, found: &mut Vec<FoundSite>) -> bool {
+  fn value_sites(&mut self, value: &Expression<'a>, found: &mut Vec<FoundSite>) -> bool {
     match strip(value) {
       Expression::ObjectExpression(object) => {
-        found.push((object.span.start, vec![], false));
+        found.push((self.module, object.span.start, vec![], false, vec![]));
         true
       }
       Expression::CallExpression(call) => {
+        // `build(args)`, where `build` is a module-level function returning object literals.
+        let resolved =
+          self.shared.resolve_expr(self.module, &call.callee).filter(|_| !self.trusted);
+        if let Some(Resolved::Symbol(symbol)) = resolved {
+          if let Some((module, starts)) = self.shared.builders.get(&symbol) {
+            self.accounted.push((self.module, call.callee.span().start));
+            for start in starts {
+              found.push((*module, *start, vec![], false, vec![symbol]));
+            }
+            return true;
+          }
+        }
         // `Key.of(value)` is the identity.
         let Expression::StaticMemberExpression(member) = strip(&call.callee) else { return false };
         if member.property.name != "of" || self.shared.key_of(self.module, &member.object).is_none()
@@ -1134,14 +1491,15 @@ impl<'a> UseCollector<'_, '_, 'a> {
     } else {
       self.effect_sites(value, &mut found);
     }
-    for (start, bindings, top) in found {
-      let index = *self.site_spans.entry(start).or_insert_with(|| {
+    for (module, start, bindings, top, via) in found {
+      let index = *self.site_spans.entry((module, start)).or_insert_with(|| {
         self.sites.push(Site {
-          module: self.module,
+          module,
           keys: FxHashSet::default(),
           props: vec![],
           top: false,
           bindings: vec![],
+          via: vec![],
         });
         self.sites.len() - 1
       });
@@ -1149,6 +1507,11 @@ impl<'a> UseCollector<'_, '_, 'a> {
       site.keys.insert(key.to_string());
       site.top |= top;
       site.bindings.extend(bindings);
+      for symbol in via {
+        if !site.via.contains(&symbol) {
+          site.via.push(symbol);
+        }
+      }
     }
     self.providers.push((key.to_string(), container));
   }
@@ -1196,6 +1559,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
       _ => None,
     };
     let container = self.container_from(ident.span, self.path.len() - 1);
+    let call_result = self.call_result(ident.span, self.path.len() - 1);
     // `ns.binding` is a use of the exported binding, from the member's position.
     if let Some(symbol) = symbol {
       let canonical = self.shared.symbols.canonical_ref_for((self.module, symbol).into());
@@ -1203,18 +1567,20 @@ impl<'a> UseCollector<'_, '_, 'a> {
         if let NamespaceChain::Export { symbol: export, span, depth } =
           self.namespace_chain(ident.span, target)
         {
-          let container = match self.path.len().checked_sub(2 + depth) {
-            Some(index) => self.container_from(span, index),
-            None => Container::Escape,
+          let (container, call_result) = match self.path.len().checked_sub(2 + depth) {
+            Some(index) => (self.container_from(span, index), self.call_result(span, index)),
+            None => (Container::Escape, None),
           };
           self.namespace_refs.push((
             export,
             RefInfo {
+              module: self.module,
               span,
               top_stmt: self.top_stmt,
               chain: self.guards.clone(),
               member: None,
               container,
+              call_result,
               root_symbol: None,
             },
           ));
@@ -1224,11 +1590,13 @@ impl<'a> UseCollector<'_, '_, 'a> {
     self.refs.insert(
       reference_id,
       RefInfo {
+        module: self.module,
         span: ident.span,
         top_stmt: self.top_stmt,
         chain: self.guards.clone(),
         member,
         container,
+        call_result,
         root_symbol,
       },
     );
@@ -1334,7 +1702,8 @@ impl<'a> UseCollector<'_, '_, 'a> {
       self.bail_global(span, &format!("`{name}` used other than to declare a service key"));
     } else if CONTEXT_INTERNAL_APIS.contains(&name.as_str()) {
       self.bail_global(span, &format!("`{name}` reads Context internals"));
-    } else if KEYED_LOOKUPS.contains(&name.as_str()) {
+    } else if KEYED_LOOKUPS.contains(&name.as_str()) && !self.handled_lookups.contains(&span.start)
+    {
       // A lookup the pass does not model, possibly by a key it does not track.
       self.bail_global(span, &format!("`{name}` looks a service up other than by `yield*`"));
     }
@@ -1460,6 +1829,26 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       }
     }
     let api = self.shared.api_of(self.module, callee);
+    // A keyed lookup or `provideService` whose key arguments are all tracked
+    // keys reaches only those services: each keeps every method. Otherwise a
+    // lookup turns the pass off (`check_api`).
+    if let Some(positions) = api.and_then(|api| key_arguments(api, it.arguments.len())) {
+      let keys: Option<Vec<(String, u32)>> = positions
+        .iter()
+        .map(|&position| {
+          let argument = it.arguments.get(position)?.as_expression()?;
+          let key = self.shared.key_of(self.module, argument)?;
+          Some((key.clone(), strip(argument).span().start))
+        })
+        .collect();
+      if let (Some(api), Some(keys)) = (api.map(str::to_string), keys) {
+        for (key, start) in keys {
+          self.classified.insert(start);
+          self.bail_key(&key, it.span, &format!("service handed to `{api}`"));
+        }
+        self.handled_lookups.insert(it.callee.span().start);
+      }
+    }
     if let Some(kind @ ("Layer.succeed" | "Layer.effect")) = api {
       let key = it.arguments.first().and_then(Argument::as_expression).and_then(|first| {
         self.shared.key_of(self.module, first).cloned().map(|key| (key, strip(first).span()))
@@ -1505,7 +1894,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
   }
 
   fn visit_object_expression(&mut self, it: &ObjectExpression<'a>) {
-    let Some(&site) = self.site_spans.get(&it.span.start) else {
+    let Some(&site) = self.site_spans.get(&(self.module, it.span.start)) else {
       walk_js::walk_object_expression(self, it);
       return;
     };
@@ -1516,7 +1905,12 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
         ObjectPropertyKind::SpreadProperty(spread) => {
           // Spread-in methods may read any property through `this`.
           self.sites[site].top = true;
-          self.sites[site].props.push(Prop { name: None, span: spread.span, prunable: false });
+          self.sites[site].props.push(Prop {
+            name: None,
+            span: spread.span,
+            prunable: false,
+            this_risk: false,
+          });
           self.visit_spread_element(spread);
         }
         ObjectPropertyKind::ObjectProperty(property) => {
@@ -1550,10 +1944,12 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
           // prototype, whose inherited methods may read any own property
           // through `this`. Prototypes are not modelled, so keep the object.
           let sets_prototype = name.as_deref() == Some("__proto__");
-          if this_risk || sets_prototype || property.kind != PropertyKind::Init {
+          if sets_prototype || property.kind != PropertyKind::Init {
             self.sites[site].top = true;
           }
-          self.sites[site].props.push(Prop { name, span: property.span, prunable });
+          // A value that may read `this` keeps every property only if it is
+          // kept itself: a removed property cannot be called.
+          self.sites[site].props.push(Prop { name, span: property.span, prunable, this_risk });
           self.guards.push(Guard::Property(site, index));
           self.visit_object_property(property);
           self.guards.pop();
@@ -1623,14 +2019,23 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     };
     if let Some(key) = key_symbol.and_then(|symbol| self.shared.keys.get(&symbol)).cloned() {
       // Writes to a key's members can change what other keys resolve to.
-      let member_written = match self.parent(use_depth) {
+      let (member_written, static_read) = match self.parent(use_depth) {
         Some(AstKind::StaticMemberExpression(member)) if member.object.span() == use_span => {
-          self.is_write_target(use_depth + 1)
+          let written = self.is_write_target(use_depth + 1);
+          // A static member a class-form key declares itself; its body never
+          // mentions `this`, so the value reaches the key only by name.
+          let declared = key_symbol
+            .and_then(|symbol| self.shared.key_statics.get(&symbol))
+            .is_some_and(|statics| statics.contains(member.property.name.as_str()));
+          (written, declared && !written)
         }
-        _ => false,
+        _ => (false, false),
       };
       if member_written {
         self.bail_global(use_span, "service key member written");
+      }
+      if static_read {
+        self.classified.insert(use_span.start);
       }
       self.classify_key_reference(&key, use_span, use_depth);
     }
@@ -1845,12 +2250,16 @@ impl LinkStage<'_> {
       code_loaders,
       capabilities,
       const_strings: FxHashMap::default(),
+      key_statics: FxHashMap::default(),
+      builders: FxHashMap::default(),
     };
 
     // == pass A: keys
     let normal_modules: Vec<ModuleIdx> =
       self.module_table.modules.iter().filter_map(|m| m.as_normal().map(|n| n.idx)).collect();
     let mut key_creations = vec![];
+    let mut key_statics = vec![];
+    let mut builders = vec![];
     let mut this_free = vec![];
     let mut const_strings: Vec<(SymbolRef, Vec<StringPart>)> = vec![];
     for module in &normal_modules {
@@ -1860,6 +2269,8 @@ impl LinkStage<'_> {
           shared: &shared,
           module: *module,
           keys: vec![],
+          key_statics: vec![],
+          builders: vec![],
           this_free: vec![],
           const_strings: vec![],
           depth: 0,
@@ -1867,12 +2278,24 @@ impl LinkStage<'_> {
         };
         collector.visit_program(&dep.program);
         key_creations.extend(collector.keys.into_iter().map(|key| (*module, key)));
+        key_statics.extend(collector.key_statics);
+        builders.extend(collector.builders.into_iter().map(|builder| (*module, builder)));
         this_free.extend(collector.this_free);
         const_strings.extend(collector.const_strings);
       });
     }
     for symbol in this_free {
       shared.this_free.insert(shared.symbols.canonical_ref_for(symbol));
+    }
+    for (symbol, statics) in key_statics {
+      shared.key_statics.insert(shared.symbols.canonical_ref_for(symbol), statics);
+    }
+    // Only outside the trusted packages: A3 does not cover how Effect's own
+    // modules read Effect's own services.
+    for (module, (symbol, starts)) in builders {
+      if shared.prefixes[module.index()].is_none() {
+        shared.builders.insert(shared.symbols.canonical_ref_for(symbol), (module, starts));
+      }
     }
     // `const` strings may be built from other `const` strings, in any module order.
     let mut changed = true;
@@ -1917,7 +2340,24 @@ impl LinkStage<'_> {
     }
 
     // == pass B: uses
+    // Object literals returned by builder functions are visited as provider
+    // sites in their own module, before any provider that calls them is seen.
     let mut sites: Vec<Site> = vec![];
+    let mut site_spans: FxHashMap<(ModuleIdx, u32), usize> = FxHashMap::default();
+    for (symbol, (module, starts)) in &shared.builders {
+      for start in starts {
+        site_spans.insert((*module, *start), sites.len());
+        sites.push(Site {
+          module: *module,
+          keys: FxHashSet::default(),
+          props: vec![],
+          top: false,
+          bindings: vec![],
+          via: vec![*symbol],
+        });
+      }
+    }
+    let mut accounted: FxHashSet<(ModuleIdx, u32)> = FxHashSet::default();
     let mut consumers = vec![];
     let mut providers = vec![];
     let mut guard_bindings = vec![];
@@ -1929,6 +2369,29 @@ impl LinkStage<'_> {
       // Rolldown's own runtime module is trusted like the effect package.
       let trusted = shared.prefixes[module.index()].is_some() || *module == self.runtime.id();
       ast.program.with_dependent(|_owner, dep| {
+        let mut module_consts = FxHashMap::default();
+        for statement in &dep.program.body {
+          let declaration = match statement {
+            Statement::VariableDeclaration(declaration) => declaration,
+            Statement::ExportDeclaration(export) => match &export.declaration {
+              Declaration::VariableDeclaration(declaration) => declaration,
+              _ => continue,
+            },
+            _ => continue,
+          };
+          if declaration.kind != VariableDeclarationKind::Const {
+            continue;
+          }
+          for declarator in &declaration.declarations {
+            if let (BindingPattern::BindingIdentifier(id), Some(init)) =
+              (&declarator.id, &declarator.init)
+            {
+              if let Some(symbol) = id.symbol_id.get() {
+                module_consts.insert(symbol, init);
+              }
+            }
+          }
+        }
         let mut collector = UseCollector {
           shared: &shared,
           module: *module,
@@ -1939,8 +2402,11 @@ impl LinkStage<'_> {
           refs: FxHashMap::default(),
           namespace_refs: vec![],
           classified: FxHashSet::default(),
-          site_spans: FxHashMap::default(),
+          site_spans: &mut site_spans,
           sites: &mut sites,
+          module_consts,
+          accounted: vec![],
+          handled_lookups: FxHashSet::default(),
           consumers: vec![],
           providers: vec![],
           guard_bindings: vec![],
@@ -1948,6 +2414,7 @@ impl LinkStage<'_> {
           key_bailouts: vec![],
         };
         collector.visit_program(&dep.program);
+        accounted.extend(collector.accounted);
         consumers.extend(collector.consumers.into_iter().map(|c| (*module, c)));
         providers.extend(collector.providers.into_iter().map(|p| (*module, p)));
         guard_bindings.extend(collector.guard_bindings);
@@ -2011,7 +2478,31 @@ impl LinkStage<'_> {
               pending.push(info.container);
             }
           }
+          // Every use of a function returning the Layer must be a call.
+          Container::Factory(symbol) => {
+            if !seen.insert(symbol) {
+              continue;
+            }
+            for info in references_of(symbol) {
+              pending.push(info.call_result.unwrap_or(Container::Escape));
+            }
+          }
         }
+      }
+    }
+
+    // An object returned through constructor or builder functions is a site
+    // only when it is provided and every reference to those functions is a
+    // call the pass followed into a provider: another caller would get the
+    // same pruned object.
+    for site in &mut sites {
+      let followed = |symbol: &SymbolRef| {
+        references_of(*symbol)
+          .iter()
+          .all(|info| accounted.contains(&(info.module, info.span.start)))
+      };
+      if !site.via.is_empty() && (site.keys.is_empty() || !site.via.iter().all(followed)) {
+        site.top = true;
       }
     }
 
@@ -2115,6 +2606,14 @@ impl LinkStage<'_> {
         for (name, chain) in reads {
           if live(&site_demand, &live_bindings, chain) {
             changed |= site_demand[*index].add(name);
+          }
+        }
+      }
+      // A kept property that may read `this` keeps every property.
+      for (index, site) in sites.iter().enumerate() {
+        for (prop_index, prop) in site.props.iter().enumerate() {
+          if prop.this_risk && retained(&site_demand, index, prop_index) {
+            changed |= site_demand[index].set_all();
           }
         }
       }
