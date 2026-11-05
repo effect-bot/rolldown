@@ -1110,8 +1110,8 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// the source with no hoisted function declaration between, which could run
   /// the site first, and not in another case of a switch the site is in, since
   /// jumping to a case skips the cases before it, and not around the site: inside
-  /// its own declaration, parameter list or loop head (while the loop's
-  /// right-hand side runs) a binding is uninitialised. An import may be
+  /// its own declaration, parameter list, catch parameter or loop head (while
+  /// the loop's right-hand side runs) a binding is uninitialised. An import may be
   /// uninitialised through a module cycle, even one back to its own module.
   fn initialized_at(&self, value: &Expression<'a>, site: u32) -> bool {
     let Expression::Identifier(ident) = value else { return false };
@@ -1148,6 +1148,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
         AstKind::Class(class) => {
           class.id.as_ref().is_none_or(|id| id.symbol_id.get() != Some(symbol))
         }
+        // A catch binding is uninitialised while its own pattern (defaults
+        // included) is evaluated.
+        AstKind::CatchParameter(param) => !param.pattern.span().contains_inclusive(declared),
         // A lexical loop-head binding is uninitialised while the loop's
         // right-hand side runs.
         AstKind::ForOfStatement(stmt) => {
