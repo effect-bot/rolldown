@@ -356,10 +356,9 @@ struct Report {
   removed: Vec<String>,
 }
 
-/// A reason reported as an `EFFECT_SERVICE_SHAKING` warning.
+/// A reason the pass was turned off, reported as an `EFFECT_SERVICE_SHAKING` warning.
 #[derive(Debug, Clone)]
 struct Bailout {
-  tag: &'static str,
   reason: String,
   /// Module and span start of the site.
   site: Option<(ModuleIdx, u32)>,
@@ -367,8 +366,17 @@ struct Bailout {
 
 impl Bailout {
   fn global(reason: String) -> Self {
-    Bailout { tag: "bailout", reason, site: None }
+    Bailout { reason, site: None }
   }
+
+  fn at(module: ModuleIdx, offset: u32, reason: String) -> Self {
+    Bailout { reason, site: Some((module, offset)) }
+  }
+}
+
+/// A Node builtin's name without the `node:` scheme.
+fn bare_module_name(name: &str) -> &str {
+  name.strip_prefix("node:").unwrap_or(name)
 }
 
 /// Facts shared by every module visit.
@@ -478,22 +486,6 @@ impl Shared<'_> {
     })
   }
 
-  /// The property name a computed key evaluates to, if it is constant. Numbers
-  /// and well-known symbols never name a Context internal.
-  fn member_key(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<String> {
-    if is_numeric(expr) {
-      return Some(String::new());
-    }
-    if let Expression::StaticMemberExpression(member) = strip(expr) {
-      if matches!(&member.object, Expression::Identifier(ident) if ident.name == "Symbol" && self.resolve_ident(module, ident).is_none())
-        && matches!(member.property.name.as_str(), "iterator" | "asyncIterator")
-      {
-        return Some(String::new());
-      }
-    }
-    self.const_string(module, expr)
-  }
-
   fn key_of(&self, module: ModuleIdx, expr: &Expression<'_>) -> Option<&String> {
     match self.resolve_expr(module, expr)? {
       Resolved::Symbol(symbol) => self.keys.get(&symbol),
@@ -525,35 +517,6 @@ impl Shared<'_> {
 enum StringPart {
   Literal(String),
   Binding(SymbolRef),
-}
-
-/// Whether an expression always evaluates to a number.
-fn is_numeric(expr: &Expression<'_>) -> bool {
-  match strip(expr) {
-    Expression::NumericLiteral(_) | Expression::UpdateExpression(_) => true,
-    Expression::UnaryExpression(unary) => {
-      matches!(
-        unary.operator,
-        UnaryOperator::UnaryNegation | UnaryOperator::UnaryPlus | UnaryOperator::BitwiseNot
-      ) && is_numeric(&unary.argument)
-    }
-    // Every arithmetic and bitwise operator but `+` yields a number or BigInt.
-    Expression::BinaryExpression(binary) => matches!(
-      binary.operator,
-      BinaryOperator::Subtraction
-        | BinaryOperator::Multiplication
-        | BinaryOperator::Division
-        | BinaryOperator::Remainder
-        | BinaryOperator::Exponential
-        | BinaryOperator::ShiftLeft
-        | BinaryOperator::ShiftRight
-        | BinaryOperator::ShiftRightZeroFill
-        | BinaryOperator::BitwiseOR
-        | BinaryOperator::BitwiseXOR
-        | BinaryOperator::BitwiseAnd
-    ),
-    _ => false,
-  }
 }
 
 /// The literal key string of a key creation call, if it has one.
@@ -745,14 +708,12 @@ struct UseCollector<'s, 'l, 'a> {
 
 impl<'a> UseCollector<'_, '_, 'a> {
   fn bail_global(&mut self, span: Span, reason: &str) {
-    self.global_bailouts.push(Bailout {
-      tag: "bailout",
-      reason: reason.to_string(),
-      site: Some((self.module, span.start)),
-    });
+    self.global_bailouts.push(Bailout::at(self.module, span.start, reason.to_string()));
   }
 
   /// A property read or written by `name`, `None` when the name is not constant.
+  /// Only constant string names can spell a code loader, so numbers and
+  /// well-known symbols need no case of their own.
   fn check_member_name(&mut self, name: Option<&str>, span: Span) {
     if let Some(name) = name.filter(|name| CODE_LOADERS.contains(name)) {
       self.bail_global(span, &format!("`{name}` may run code outside the bundle"));
@@ -762,7 +723,7 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// A destructured property key.
   fn check_property_key(&mut self, key: &PropertyKey<'a>, computed: bool, span: Span) {
     let name = if computed {
-      key.as_expression().and_then(|expr| self.shared.member_key(self.module, expr))
+      key.as_expression().and_then(|expr| self.shared.const_string(self.module, expr))
     } else {
       key.static_name().and_then(|n| n.as_js_str().as_str().map(String::from))
     };
@@ -1592,7 +1553,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
 
   fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
     if !self.trusted {
-      let name = self.shared.member_key(self.module, &it.expression);
+      let name = self.shared.const_string(self.module, &it.expression);
       self.check_member_name(name.as_deref(), it.span);
     }
     walk_js::walk_computed_member_expression(self, it);
@@ -1697,8 +1658,7 @@ impl LinkStage<'_> {
       }
     }
     for name in externals {
-      let bare = name.strip_prefix("node:").unwrap_or(name);
-      let builtin = NODE_BUILTINS.contains(&bare) || name.starts_with("bun:");
+      let builtin = NODE_BUILTINS.contains(&bare_module_name(name)) || name.starts_with("bun:");
       if !builtin {
         report.global_bailouts.push(Bailout::global(format!("external import `{name}`")));
       }
@@ -1716,7 +1676,6 @@ impl LinkStage<'_> {
     // canonical binding (A2).
     let mut code_loaders: FxHashSet<SymbolRef> = FxHashSet::default();
     let mut capabilities: FxHashSet<SymbolRef> = FxHashSet::default();
-    let bare = |name: &str| name.strip_prefix("node:").unwrap_or(name).to_string();
     for module in &self.module_table.modules {
       match module {
         Module::Normal(normal) => {
@@ -1726,12 +1685,12 @@ impl LinkStage<'_> {
               continue;
             };
             let Some(external) = self.module_table[target].as_external() else { continue };
-            let module_name = bare(external.name.as_str());
+            let module_name = bare_module_name(external.name.as_str());
             let imported = match &named_import.imported {
               Specifier::Star => None,
               Specifier::Literal(name) => Some(name.as_str()),
             };
-            if CODE_LOADING_MODULES.contains(&module_name.as_str())
+            if CODE_LOADING_MODULES.contains(&module_name)
               || imported.is_some_and(|name| CODE_LOADERS.contains(&name))
             {
               code_loaders.insert(*symbol);
@@ -1742,8 +1701,8 @@ impl LinkStage<'_> {
           }
         }
         Module::External(external) => {
-          let module_name = bare(external.name.as_str());
-          if CODE_LOADING_MODULES.contains(&module_name.as_str()) {
+          let module_name = bare_module_name(external.name.as_str());
+          if CODE_LOADING_MODULES.contains(&module_name) {
             code_loaders.insert(external.namespace_ref);
           }
           if module_name == "process" {
@@ -1837,11 +1796,11 @@ impl LinkStage<'_> {
     }
     for module in dynamic_keys {
       if shared.prefixes[module.index()].is_none() {
-        report.global_bailouts.push(Bailout {
-          tag: "bailout",
-          reason: "service key with a dynamic key string".to_string(),
-          site: Some((module, 0)),
-        });
+        report.global_bailouts.push(Bailout::at(
+          module,
+          0,
+          "service key with a dynamic key string".to_string(),
+        ));
       }
     }
 
@@ -2158,29 +2117,7 @@ impl LinkStage<'_> {
       });
     }
 
-    // Every reason the pass was turned off, deduplicated by tag and site, as a warning.
-    let mut reported: FxHashSet<(&'static str, Option<(ModuleIdx, u32)>)> = FxHashSet::default();
-    for reason in &report.global_bailouts {
-      if !reported.insert((reason.tag, reason.site)) {
-        continue;
-      }
-      let site = reason
-        .site
-        .and_then(|(module, offset)| self.module_table[module].as_normal().map(|n| (n, offset)));
-      let (id, position) = match site {
-        Some((normal, offset)) => {
-          let before = normal.source.get(..offset as usize).unwrap_or_default();
-          let line = before.matches('\n').count() + 1;
-          let column = before.len() - before.rfind('\n').map_or(0, |newline| newline + 1) + 1;
-          (Some(normal.id.to_string()), Some((line, column)))
-        }
-        None => (None, None),
-      };
-      self.diagnostics.push(
-        BuildDiagnostic::effect_service_shaking(id, reason.tag, reason.reason.clone(), position)
-          .with_severity_warning(),
-      );
-    }
+    self.report_effect_service_bailouts(&report.global_bailouts);
     tracing::debug!(?report, "effect service shaking");
     #[expect(clippy::print_stderr, reason = "opt-in report for measuring the experimental pass")]
     if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some() {
@@ -2197,6 +2134,33 @@ impl LinkStage<'_> {
         .collect();
       demand.sort();
       eprintln!("[effect-service-shaking] demand: {demand:#?}");
+    }
+  }
+
+  /// Every reason the pass was turned off, one `EFFECT_SERVICE_SHAKING` warning
+  /// per site, with the site's 1-based line and column.
+  fn report_effect_service_bailouts(&mut self, bailouts: &[Bailout]) {
+    let mut reported: FxHashSet<Option<(ModuleIdx, u32)>> = FxHashSet::default();
+    for bailout in bailouts {
+      if !reported.insert(bailout.site) {
+        continue;
+      }
+      let site = bailout
+        .site
+        .and_then(|(module, offset)| self.module_table[module].as_normal().map(|n| (n, offset)));
+      let (id, position) = match site {
+        Some((normal, offset)) => {
+          let before = normal.source.get(..offset as usize).unwrap_or_default();
+          let line = before.matches('\n').count() + 1;
+          let column = before.len() - before.rfind('\n').map_or(0, |newline| newline + 1) + 1;
+          (Some(normal.id.to_string()), Some((line, column)))
+        }
+        None => (None, None),
+      };
+      self.diagnostics.push(
+        BuildDiagnostic::effect_service_shaking(id, "bailout", bailout.reason.clone(), position)
+          .with_severity_warning(),
+      );
     }
   }
 }
