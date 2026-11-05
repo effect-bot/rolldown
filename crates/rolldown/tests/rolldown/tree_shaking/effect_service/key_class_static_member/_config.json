@@ -1,0 +1,10 @@
+{
+  "_comment": "A class-form key whose static method reads the service through `this` with Effect.map: an ordinary read, the method it names stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

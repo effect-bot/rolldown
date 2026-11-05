@@ -1,0 +1,10 @@
+{
+  "_comment": "A method named `eval` on a local object is not the global eval: nothing is handed over and the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

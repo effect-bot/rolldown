@@ -1,0 +1,10 @@
+{
+  "_comment": "Key, provider and helpers live in other modules and are reached through namespaces: the unread method and its helper are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

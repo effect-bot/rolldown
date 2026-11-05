@@ -1,0 +1,10 @@
+{
+  "_comment": "A provider built as `{ ...impl, extra }` from an impl literal and a consumer using a rest pattern: demand flows through the spread to the impl literal, so impl methods nothing reaches are removed; a second key whose rest is enumerated keeps every method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

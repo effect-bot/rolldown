@@ -1,0 +1,10 @@
+{
+  "_comment": "TDZ control: a destructured catch binding read in the catch body is initialised, so the unread property goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

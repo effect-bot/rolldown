@@ -1,0 +1,10 @@
+{
+  "_comment": "A key built at run time with no constant prefix may alias any key, so every provided key keeps every method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

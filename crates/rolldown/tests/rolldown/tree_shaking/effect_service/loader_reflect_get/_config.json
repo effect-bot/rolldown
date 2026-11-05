@@ -1,0 +1,10 @@
+{
+  "_comment": "The Function constructor read through Reflect.get (bare, on globalThis.Reflect, through an alias, with a spread): the compiled code receives nothing, so the unread method goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

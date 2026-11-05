@@ -1,0 +1,10 @@
+{
+  "_comment": "A var holding a class-expression key is reassigned to another key, so lookups through it read both keys: the method it calls stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

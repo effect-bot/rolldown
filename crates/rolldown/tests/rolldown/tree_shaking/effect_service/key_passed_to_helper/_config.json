@@ -1,0 +1,10 @@
+{
+  "_comment": "A key passed to a function that only reads its key string: the key is not handed to opaque code, so both keys prune.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,12 @@
+{
+  "keep": ["readFile"],
+  "remove": [
+    "readFileString",
+    "writeFileString",
+    "makeTempDirectoryScoped",
+    "readDirectoryEntries",
+    "copyFile",
+    "symlink",
+    "utimes"
+  ]
+}

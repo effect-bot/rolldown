@@ -1,0 +1,10 @@
+{
+  "_comment": "A named class-expression key whose static method reads a method through its inner name: that is an ordinary read, the method it reads stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

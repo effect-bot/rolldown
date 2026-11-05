@@ -1,0 +1,10 @@
+{
+  "_comment": "A key made through an alias of Context.Service shares the key string, so yielding it finds the service; the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

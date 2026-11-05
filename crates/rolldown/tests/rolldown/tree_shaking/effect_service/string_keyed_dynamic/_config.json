@@ -1,0 +1,10 @@
+{
+  "_comment": "The key string of a string-keyed lookup comes from the environment at run time, so it aliases every key: every method of both services stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

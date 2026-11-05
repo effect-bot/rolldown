@@ -1,0 +1,10 @@
+{
+  "_comment": "Retention: named provider callbacks hand themselves out through their inner names and the program reads the otherwise-unread methods on the objects they return. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

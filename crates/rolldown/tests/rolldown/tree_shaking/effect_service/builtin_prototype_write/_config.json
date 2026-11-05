@@ -1,0 +1,10 @@
+{
+  "_comment": "Replacing Map.prototype.get captures the Context's service map inside Effect's own lookup, then calls a method by key string: every method of that key stays (miscompile regression).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

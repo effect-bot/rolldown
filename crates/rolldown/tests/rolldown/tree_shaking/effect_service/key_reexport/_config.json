@@ -1,0 +1,10 @@
+{
+  "_comment": "Keys re-exported under another name by a non-entry module: the export specifier only names the binding, the unread methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

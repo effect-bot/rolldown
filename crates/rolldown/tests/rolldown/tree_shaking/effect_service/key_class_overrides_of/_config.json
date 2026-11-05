@@ -1,0 +1,10 @@
+{
+  "_comment": "A class-form key that overrides `of`; the override reads a method of its argument that no consumer reads directly, so that method stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "A hand-made key object with the same key string looks the service up: a key-shaped value in a lookup position reads that key (or any key), so every method stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,11 @@
+{
+  "_comment": "A service handed to an external module on disk keeps every method until externals are scanned (later increment); a key never handed over is still pruned. `./ext/reader.js` is next to main.js at build time and _test.mjs copies it next to the bundle.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./ext/reader.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

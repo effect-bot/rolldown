@@ -1,0 +1,10 @@
+{
+  "_comment": "An application service read by an HttpRouter route handler: the router, middleware and web handler are Effect code analysed generically, so the route's read is the whole demand.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

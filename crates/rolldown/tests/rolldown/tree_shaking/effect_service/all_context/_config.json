@@ -1,0 +1,10 @@
+{
+  "_comment": "A Context collected by Effect.all reaches the program, which enumerates it and reads a method named at run time: every method of its entries stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

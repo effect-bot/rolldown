@@ -1,0 +1,10 @@
+{
+  "_comment": "Promise resolution of a service (returned from an async function and from Effect.runPromise) reads `then`, which the program observes being called: `then` stays, the uncalled method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

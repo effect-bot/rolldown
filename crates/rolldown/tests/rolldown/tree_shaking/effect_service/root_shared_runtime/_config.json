@@ -1,0 +1,10 @@
+{
+  "_comment": "Two runs on one ManagedRuntime share a service; one run reads it by a runtime name, so that key bails; a key provided only to one run still loses its unread method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

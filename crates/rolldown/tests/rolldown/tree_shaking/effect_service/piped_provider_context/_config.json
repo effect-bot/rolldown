@@ -1,0 +1,10 @@
+{
+  "_comment": "Retention: a provider applied through pipe (effect.pipe(Layer.effect(Box))) builds a service holding the ambient Context, which is enumerated. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

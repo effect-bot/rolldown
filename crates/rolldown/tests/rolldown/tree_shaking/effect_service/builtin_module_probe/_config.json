@@ -1,0 +1,10 @@
+{
+  "_comment": "process.getBuiltinModule with a constant specifier is a builtin that is handed no service: the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

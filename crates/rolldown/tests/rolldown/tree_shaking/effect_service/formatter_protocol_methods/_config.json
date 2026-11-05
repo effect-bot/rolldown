@@ -1,0 +1,10 @@
+{
+  "_comment": "Formatting builtins read only the protocol methods (toJSON, toString/valueOf/Symbol.toPrimitive, [util.inspect.custom]); data properties and getters always stay; the uncalled ordinary method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

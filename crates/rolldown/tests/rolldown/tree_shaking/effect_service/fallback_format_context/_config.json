@@ -1,0 +1,10 @@
+{
+  "_comment": "A Context handed to Formatter.format, Effect code the pass analyses generically; it enumerates the services, so every method stays and the printed output does not change.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

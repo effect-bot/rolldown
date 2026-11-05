@@ -1,0 +1,5 @@
+{
+  "external": ["effect", "effect/Context", "effect/Effect", "effect/Layer"],
+  "keep": ["configGetHelper", "countHelper"],
+  "expectDiagnostic": true
+}

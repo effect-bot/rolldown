@@ -1,0 +1,10 @@
+{
+  "_comment": "A class instance (`new FsImpl()`) provided as the service, one method called. Class methods are a later increment: behaviour must be unchanged and the called method kept; no removal is asserted.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

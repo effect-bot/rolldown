@@ -1,0 +1,10 @@
+{
+  "_comment": "Retention: a plain object handed to runtime-compiled code gets a getter that later reads a service stored into that object, so the service keeps every method. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

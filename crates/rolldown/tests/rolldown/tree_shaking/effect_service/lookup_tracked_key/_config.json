@@ -1,0 +1,10 @@
+{
+  "_comment": "Effect.updateService callbacks and Context.getOrUndefined (both dual forms) are keyed reads: the methods they read stay, Other's unread method goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

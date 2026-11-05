@@ -1,0 +1,10 @@
+{
+  "_comment": "writeOne is the only reader of dependency.write; once writeOne is removed, write is no longer demanded of the Dependency provider either (least fixpoint).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

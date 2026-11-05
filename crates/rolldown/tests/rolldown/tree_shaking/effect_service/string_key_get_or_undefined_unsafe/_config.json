@@ -1,0 +1,10 @@
+{
+  "_comment": "Context.getOrUndefinedUnsafe with a literal key string is a precise lookup of that key: the method it calls is kept, and an unrelated key's unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,4 @@
+{
+  "keep": ["createCustomer", "CreateCustomerRequest"],
+  "remove": ["retrieveCustomer", "createCheckout", "CreateCheckoutSessionRequest"]
+}

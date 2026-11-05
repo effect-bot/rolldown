@@ -1,0 +1,10 @@
+{
+  "_comment": "A constructor pipeable reads a method by a name folded from constants: that read is static, so only the method nobody names goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

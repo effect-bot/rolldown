@@ -1,0 +1,10 @@
+{
+  "_comment": "Keys whose strings are a template without substitutions and a concatenation of literals are constant: the unread methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

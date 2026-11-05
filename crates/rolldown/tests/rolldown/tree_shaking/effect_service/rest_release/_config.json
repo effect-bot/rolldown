@@ -1,0 +1,10 @@
+{
+  "_comment": "A release callback reaches the acquired object through a rest parameter: that read is kept; the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

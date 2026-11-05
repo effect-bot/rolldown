@@ -1,0 +1,10 @@
+{
+  "_comment": "Importing a Node module without calling it hands nothing to it: writeOne is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

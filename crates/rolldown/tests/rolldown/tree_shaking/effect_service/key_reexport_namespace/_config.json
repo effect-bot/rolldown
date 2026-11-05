@@ -1,0 +1,10 @@
+{
+  "_comment": "A key module also reachable as a namespace through a barrel whose namespace object is never read: the unread methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

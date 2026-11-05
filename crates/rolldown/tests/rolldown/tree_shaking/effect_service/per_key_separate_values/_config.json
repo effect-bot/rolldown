@@ -1,0 +1,10 @@
+{
+  "_comment": "One key's service holds the Context but only compares it, another holds plain data that is enumerated: no Context is enumerated, so the unread method goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

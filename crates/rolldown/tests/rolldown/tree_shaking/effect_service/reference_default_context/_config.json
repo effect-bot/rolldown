@@ -1,0 +1,10 @@
+{
+  "_comment": "A Reference default holds an object the program fills with its Context and then enumerates: the entries bail, so Store keeps every method. References themselves are never pruned.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "A withFiber closure formats fiber.context with util.inspect: formatting reads only [inspect.custom]/toJSON on the entries (Tim's decision), so the unread ordinary method is removed. The printed method list may shrink; the program asserts only on the key string.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

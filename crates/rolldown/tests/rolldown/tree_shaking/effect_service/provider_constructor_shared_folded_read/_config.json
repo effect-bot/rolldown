@@ -1,0 +1,10 @@
+{
+  "_comment": "The provider's builder is also called directly and read by a folded name: that method stays on the shared literal, the method nobody names goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

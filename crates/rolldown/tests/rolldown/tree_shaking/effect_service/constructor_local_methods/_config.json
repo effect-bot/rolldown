@@ -1,0 +1,10 @@
+{
+  "_comment": "Base case: a Layer.effect + Effect.gen provider whose methods are constructor-local consts, consumed with yield*; only readOne is read.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

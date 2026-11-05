@@ -1,0 +1,10 @@
+{
+  "_comment": "Run A stores its service in module state and run B reads a method of it by a runtime name: that key bails (per key, not per run); B's own unread method is still removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

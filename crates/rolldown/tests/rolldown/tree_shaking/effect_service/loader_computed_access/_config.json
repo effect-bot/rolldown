@@ -1,0 +1,10 @@
+{
+  "_comment": "A code loader reached through computed names on `process` compiles code that receives no service: the unread method goes. Loaders are not bailouts by themselves. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

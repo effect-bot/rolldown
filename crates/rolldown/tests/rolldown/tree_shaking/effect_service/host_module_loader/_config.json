@@ -1,0 +1,10 @@
+{
+  "_comment": "A Context handed to code compiled by vm.compileFunction (host code the pass cannot see): its entries bail, so every method stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

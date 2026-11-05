@@ -1,0 +1,10 @@
+{
+  "_comment": "Context.makeUnsafe builds a Context from a map keyed by literal strings; a Context holding only values the program already holds exposes no provider object, so the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

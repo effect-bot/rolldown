@@ -1,0 +1,10 @@
+{
+  "_comment": "A builtin callback (Array.prototype.map) over plain data and Object.keys of its result touch no service: writeOne is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

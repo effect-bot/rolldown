@@ -1,0 +1,10 @@
+{
+  "_comment": "runPromise resolves with the Context the Effect succeeds with; the program enumerates it: every method of its entries stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

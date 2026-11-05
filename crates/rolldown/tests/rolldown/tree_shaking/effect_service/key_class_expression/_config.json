@@ -1,0 +1,10 @@
+{
+  "_comment": "Keys declared as class expressions bound to var and const bindings that are never reassigned: the unread methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

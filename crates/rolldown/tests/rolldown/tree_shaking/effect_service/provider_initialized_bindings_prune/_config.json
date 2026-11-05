@@ -1,0 +1,10 @@
+{
+  "_comment": "TDZ controls: each provider property reads a binding that is initialised where the provider is built, so the unread property goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

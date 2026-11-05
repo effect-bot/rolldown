@@ -1,0 +1,10 @@
+{
+  "_comment": "Generated-client shape: Layer.effect(Key, make(options)) with an Effect.fnUntraced constructor returning a literal built in another module; the unread method goes, the `http` data property stays. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

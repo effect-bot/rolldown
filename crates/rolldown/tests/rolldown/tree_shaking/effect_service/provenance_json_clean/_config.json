@@ -1,0 +1,10 @@
+{
+  "_comment": "JSON.stringify of nested user data reads only toJSON: writeOne is still removed. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

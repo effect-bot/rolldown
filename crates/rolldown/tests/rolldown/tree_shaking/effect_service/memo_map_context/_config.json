@@ -1,0 +1,10 @@
+{
+  "_comment": "Retention: the Contexts held by Layer.CurrentMemoMap are enumerated and called by a computed name, so every method stays (CurrentMemoMap itself is never pruned). Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

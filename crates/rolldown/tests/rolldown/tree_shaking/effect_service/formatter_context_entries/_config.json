@@ -1,0 +1,10 @@
+{
+  "_comment": "console.log and JSON.stringify of a Context format its entries, which reads only toJSON/[inspect.custom] on each service: a service toJSON is kept, the uncalled ordinary methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

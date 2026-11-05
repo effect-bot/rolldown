@@ -1,0 +1,10 @@
+{
+  "_comment": "A class heritage expression inside a kept method runs with the method's receiver, so `this.classReceiverBase()` is a read on the service; a method nothing reads is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "A class-expression key that redeclares `of`; the override reads a method of its argument, so that method stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

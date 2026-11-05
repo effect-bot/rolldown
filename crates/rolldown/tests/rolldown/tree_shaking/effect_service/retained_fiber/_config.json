@@ -1,0 +1,10 @@
+{
+  "_comment": "A forked and joined Fiber kept in module state bails nothing (Fiber escapes bail nothing): writeOne is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

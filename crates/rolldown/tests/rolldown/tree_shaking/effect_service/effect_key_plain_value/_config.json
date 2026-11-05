@@ -1,0 +1,10 @@
+{
+  "_comment": "A Reference declared by Effect (MinimumLogLevel) is read and converted to a string: References are never pruned and no service is read, so the user key's unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

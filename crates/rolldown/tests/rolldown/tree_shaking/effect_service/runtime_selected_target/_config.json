@@ -1,0 +1,10 @@
+{
+  "_comment": "The callee is chosen at run time from the two functions of a literal nothing else writes: their reads are the whole demand, selectedUnused is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

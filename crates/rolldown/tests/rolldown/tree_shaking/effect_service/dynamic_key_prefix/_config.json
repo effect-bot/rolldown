@@ -1,0 +1,10 @@
+{
+  "_comment": "A key built at run time with a constant prefix can only alias keys with that prefix: those keep every method, other keys are still pruned (prefix narrowing is a later increment; red until then).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

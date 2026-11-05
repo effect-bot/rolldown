@@ -1,0 +1,10 @@
+{
+  "_comment": "A release callback reads the acquired object through `arguments` in a later parameter's default: that read is kept; the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

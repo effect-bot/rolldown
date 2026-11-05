@@ -1,0 +1,10 @@
+{
+  "_comment": "Effect.updateService replaces a service with one holding the Context; the program enumerates it, so Store's entries bail and updateUnused stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

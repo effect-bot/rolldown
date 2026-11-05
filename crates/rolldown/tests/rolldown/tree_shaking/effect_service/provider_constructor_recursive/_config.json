@@ -1,0 +1,10 @@
+{
+  "_comment": "A constructor returning its own result for a smaller argument: following returns stops at the cycle, the unread method goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

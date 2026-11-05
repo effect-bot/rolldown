@@ -1,0 +1,10 @@
+{
+  "_comment": "new Function on a constant string that is handed no service and whose result is not run as an Effect bails nothing: the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

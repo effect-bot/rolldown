@@ -1,0 +1,10 @@
+{
+  "_comment": "Library build: the exported function hands the Store service to the importer's callback, so Store keeps every method; the unexported Internal service loses its unread one. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

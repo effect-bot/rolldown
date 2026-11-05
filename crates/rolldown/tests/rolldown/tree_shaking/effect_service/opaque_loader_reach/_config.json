@@ -1,0 +1,10 @@
+{
+  "_comment": "Runtime-compiled code receives one service, so that key keeps every method; the keys provided alongside and elsewhere lose their unread methods. No build-wide bailout. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

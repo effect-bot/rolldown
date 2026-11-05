@@ -1,0 +1,10 @@
+{
+  "_comment": "Enumerating a Reference default that holds plain data reads no service: Store's unread method is removed. The Reference value itself is never pruned.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

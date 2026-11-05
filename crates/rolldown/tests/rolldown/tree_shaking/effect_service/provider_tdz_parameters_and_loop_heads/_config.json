@@ -1,0 +1,10 @@
+{
+  "_comment": "Properties reading parameters inside their defaults and lexical loop-head bindings in the loop's right-hand side are in a temporal dead zone: they stay. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

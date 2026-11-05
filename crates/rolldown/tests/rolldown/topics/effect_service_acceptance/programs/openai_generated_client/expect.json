@@ -1,0 +1,5 @@
+{
+  "keep": ["retrieveModel", "RetrieveModel200"],
+  "remove": ["listAssistants", "ListAssistants200", "createAssistant"],
+  "minReductionPercent": 74
+}

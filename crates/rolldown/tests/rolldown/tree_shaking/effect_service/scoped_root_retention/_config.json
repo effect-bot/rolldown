@@ -1,0 +1,10 @@
+{
+  "_comment": "Run A reads its service by a runtime name (that key bails); run B reads statically and its unread method is removed. Retention is per key, not per run.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

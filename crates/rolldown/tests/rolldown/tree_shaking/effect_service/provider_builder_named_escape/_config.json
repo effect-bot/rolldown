@@ -1,0 +1,10 @@
+{
+  "_comment": "Retention: a named builder exposed through its inner name returns the same literal to a second caller that reads the method. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

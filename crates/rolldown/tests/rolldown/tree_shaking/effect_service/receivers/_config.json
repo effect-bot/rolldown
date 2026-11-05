@@ -1,0 +1,10 @@
+{
+  "_comment": "Methods that read their receiver outside their body: a parameter default reading `this`, and a function binding reassigned to one that reads `this`; those reads are kept and the unread methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

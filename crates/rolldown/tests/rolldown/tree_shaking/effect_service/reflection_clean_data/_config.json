@@ -1,0 +1,10 @@
+{
+  "_comment": "User code enumerates, indexes by runtime names, clones and serializes its own data, never a service: writeOne is still removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

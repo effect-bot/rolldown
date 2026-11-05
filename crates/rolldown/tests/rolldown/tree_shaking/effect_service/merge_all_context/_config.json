@@ -1,0 +1,10 @@
+{
+  "_comment": "Retention: a Layer.mergeAll over spread arguments builds a service holding the ambient Context, which is enumerated and called by a computed name. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

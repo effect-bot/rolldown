@@ -1,0 +1,10 @@
+{
+  "_comment": "Keys reached by enumerating a re-exported namespace, with the service enumerated too: both keys keep every method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

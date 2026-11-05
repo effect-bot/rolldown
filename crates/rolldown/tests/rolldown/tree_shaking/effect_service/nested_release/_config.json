@@ -1,0 +1,10 @@
+{
+  "_comment": "Two nested acquireRelease wrappers of one object, each release reading a different method: both reads count; the method no release or consumer reads is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

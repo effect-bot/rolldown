@@ -1,0 +1,10 @@
+{
+  "_comment": "Context.Service called through a wrapper with a string built at run time aliases any key: every method stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

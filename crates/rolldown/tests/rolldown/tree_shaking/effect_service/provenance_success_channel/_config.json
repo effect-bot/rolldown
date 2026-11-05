@@ -1,0 +1,10 @@
+{
+  "_comment": "Enumerating user data that came through JSON.parse, Effect.map and yield* is not an enumeration of a service: writeOne is still removed. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

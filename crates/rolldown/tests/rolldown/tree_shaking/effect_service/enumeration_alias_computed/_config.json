@@ -1,0 +1,10 @@
+{
+  "_comment": "Services enumerated from a Context and read by a name built at run time: the unknown name bails that key, every method stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "Retention: the provided value is plain data, but the program later stores the ambient Context into the same allocation and enumerates it through the service. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

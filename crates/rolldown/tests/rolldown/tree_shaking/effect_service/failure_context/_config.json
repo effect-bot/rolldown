@@ -1,0 +1,10 @@
+{
+  "_comment": "A Context in the failure channel reaches a catch handler that enumerates it: every method of its entries stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

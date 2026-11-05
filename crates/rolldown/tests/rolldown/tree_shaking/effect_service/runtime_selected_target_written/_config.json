@@ -1,0 +1,10 @@
+{
+  "_comment": "A handler stored under a folded constant name is a candidate too: its read keeps writtenUnused.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

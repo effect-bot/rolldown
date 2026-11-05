@@ -1,0 +1,10 @@
+{
+  "_comment": "A code loader in a function nothing calls: Rolldown removes it, it is handed nothing, and the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

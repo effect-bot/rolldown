@@ -1,0 +1,10 @@
+{
+  "_comment": "The provider literal sets __proto__ explicitly; `read` is inherited and reads this.protoBase from the service, so protoBase stays; __proto__ itself is never removed; the unread own method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

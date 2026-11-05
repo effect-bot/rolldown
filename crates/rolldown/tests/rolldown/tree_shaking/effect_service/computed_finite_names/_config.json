@@ -1,0 +1,10 @@
+{
+  "_comment": "Computed member names from finite constant sets (a conditional of literals, a loop over a literal array, a folded join) resolve statically: those methods stay, the unrelated one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

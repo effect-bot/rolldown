@@ -1,0 +1,10 @@
+{
+  "_comment": "Retention: Context.get yields a service holding the ambient Context, which the program enumerates and calls by a computed name, so every method of every provided key stays. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

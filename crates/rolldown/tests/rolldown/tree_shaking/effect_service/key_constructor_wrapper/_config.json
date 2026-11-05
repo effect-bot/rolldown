@@ -1,0 +1,10 @@
+{
+  "_comment": "Keys created through a wrapper function and through an alias of Context.Service, each with a constant string: the unread methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "Effect.updateServiceScoped by a hand-made key with a constant string is a keyed read: the method its callback reads stays, the unread one goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

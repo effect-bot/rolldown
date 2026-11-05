@@ -1,0 +1,10 @@
+{
+  "_comment": "A property whose initialiser reads an import that is still in its temporal dead zone (through a barrel cycle) stays, so the ReferenceError is preserved. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

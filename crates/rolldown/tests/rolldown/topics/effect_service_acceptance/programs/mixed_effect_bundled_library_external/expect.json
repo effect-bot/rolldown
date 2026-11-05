@@ -1,0 +1,4 @@
+{
+  "external": ["effect-fixture-lib"],
+  "keep": ["configGetHelper"]
+}

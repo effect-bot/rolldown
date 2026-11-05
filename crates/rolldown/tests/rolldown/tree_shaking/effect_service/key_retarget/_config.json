@@ -1,0 +1,10 @@
+{
+  "_comment": "A key's `key` string is overwritten (directly and under a folded constant name) so it names another key's service: the read through it is kept on the targets, and the targets' unread methods are removed since nothing reads them under any alias.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

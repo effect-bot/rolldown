@@ -1,0 +1,10 @@
+{
+  "_comment": "A string-keyed lookup with a constant key string reaches only the service with that key: it keeps the method read, other keys are still pruned.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

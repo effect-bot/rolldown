@@ -1,0 +1,11 @@
+{
+  "_comment": "A service handed to an external module that does not exist at build time keeps every method; a key never handed over is still pruned.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./late.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

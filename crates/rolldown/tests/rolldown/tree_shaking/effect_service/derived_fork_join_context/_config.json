@@ -1,0 +1,10 @@
+{
+  "_comment": "A child fiber succeeds with its Context and Fiber.join hands it to the program, which enumerates it: every method of its entries stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

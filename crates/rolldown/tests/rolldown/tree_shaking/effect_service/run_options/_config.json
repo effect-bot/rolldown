@@ -1,0 +1,10 @@
+{
+  "_comment": "A RunOptions.onFiberStart callback receives the Fiber but reads nothing from it: writeOne is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

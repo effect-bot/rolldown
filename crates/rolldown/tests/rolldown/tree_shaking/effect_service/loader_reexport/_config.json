@@ -1,0 +1,10 @@
+{
+  "_comment": "A code loader reached through a renamed re-export of node:vm compiles code that receives no service: the unread method goes. Uses the real effect package from the repository devDependencies.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
