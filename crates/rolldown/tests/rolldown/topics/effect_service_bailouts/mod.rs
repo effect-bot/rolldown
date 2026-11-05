@@ -124,13 +124,15 @@ async fn reflect_get_with_a_loader_name_loads_code() {
 }
 
 /// `Reflect.get` with a literal loader name, through `globalThis.Reflect`, an
-/// alias of it, or a spread before the key.
+/// alias of it, or a spread before the key. Rolldown inlines the
+/// `const reflect = globalThis.Reflect` alias before the pass runs, so that
+/// path reports at the inlined `reflect.get(` call.
 #[tokio::test(flavor = "multi_thread")]
 async fn qualified_or_spread_reflect_get_loads_code() {
   let mut errors = Vec::new();
   for (dir, needle) in [
     ("loader_reflect_get_global", "globalThis.Reflect.get("),
-    ("loader_reflect_get_global", "globalThis.Reflect\n"),
+    ("loader_reflect_get_global", "reflect.get("),
     ("loader_reflect_get_spread", "Reflect.get(...[]"),
   ] {
     errors.extend(missing_bailout(dir, needle).await);
