@@ -98,6 +98,8 @@ const CODE_LOADERS: &[&str] = &[
 const CODE_LOADING_MODULES: &[&str] = &["vm", "module", "inspector", "repl"];
 // Host values that lead to code loaders (`process.getBuiltinModule`, the global
 // `eval`): usable only through constant member names, calls and `typeof`.
+// Names of the global object; `globalThis.Reflect` is the global `Reflect`.
+const GLOBAL_OBJECTS: &[&str] = &["globalThis", "global", "self", "window"];
 const CAPABILITY_GLOBALS: &[&str] =
   &["process", "globalThis", "global", "self", "window", "module"];
 // Reading one of these on a service observes the whole object.
@@ -739,17 +741,24 @@ impl<'a> UseCollector<'_, '_, 'a> {
 
   /// `Reflect.get` and `getOwnPropertyDescriptor` read the property named by
   /// their second argument, so a constant loader name there is checked like a
-  /// member name. Used any other way, the name they will read is unknown.
+  /// member name. `Reflect.get` is recognised on the global `Reflect`, bare or
+  /// qualified (`globalThis.Reflect`). `getOwnPropertyDescriptor` is matched on
+  /// any receiver: a conservative fallback that covers aliases of `Object` the
+  /// pass cannot track, and also matches user methods with that name. Used
+  /// other than by a call, or with a spread before the key, the name they will
+  /// read is unknown.
   fn check_reflective_read(&mut self, object: &Expression<'a>, name: &str, span: Span) {
-    let reflect_get = name == "get"
-      && matches!(strip(object), Expression::Identifier(ident) if ident.name == "Reflect")
-      && self.is_global_value(object);
-    if name != "getOwnPropertyDescriptor" && !reflect_get {
+    if name != "getOwnPropertyDescriptor" && !(name == "get" && self.is_global_reflect(object)) {
       return;
     }
     let call = match self.parent(0) {
       Some(AstKind::CallExpression(call)) if call.callee.span() == span => Some((
         call.span,
+        call
+          .arguments
+          .iter()
+          .take(2)
+          .any(|argument| matches!(argument, Argument::SpreadElement(_))),
         call
           .arguments
           .get(1)
@@ -759,23 +768,64 @@ impl<'a> UseCollector<'_, '_, 'a> {
       _ => None,
     };
     match call {
-      Some((call_span, key)) => self.check_member_name(key.as_deref(), call_span),
+      Some((call_span, true, _)) => {
+        self.bail_global(call_span, &format!("`{name}` called with a spread before the key"));
+      }
+      Some((call_span, false, key)) => self.check_member_name(key.as_deref(), call_span),
       None => self.bail_global(span, &format!("`{name}` used as a value")),
+    }
+  }
+
+  /// The global `Reflect`: the unresolved identifier, or a constant member
+  /// named `Reflect` on a global object (`globalThis.Reflect`).
+  fn is_global_reflect(&self, expr: &Expression<'a>) -> bool {
+    match strip(expr) {
+      Expression::Identifier(ident) => ident.name == "Reflect" && self.is_global_value(expr),
+      Expression::StaticMemberExpression(member) => {
+        member.property.name == "Reflect" && self.on_global_object(&member.object)
+      }
+      Expression::ComputedMemberExpression(member) => {
+        self.shared.const_string(self.module, &member.expression).as_deref() == Some("Reflect")
+          && self.on_global_object(&member.object)
+      }
+      _ => false,
+    }
+  }
+
+  /// Whether `expr` is the global object, such as `globalThis` or
+  /// `globalThis.self`, through constant names.
+  fn on_global_object(&self, expr: &Expression<'a>) -> bool {
+    match strip(expr) {
+      Expression::Identifier(ident) => {
+        GLOBAL_OBJECTS.contains(&ident.name.as_str()) && self.is_global_value(expr)
+      }
+      Expression::StaticMemberExpression(member) => {
+        GLOBAL_OBJECTS.contains(&member.property.name.as_str())
+          && self.on_global_object(&member.object)
+      }
+      Expression::ComputedMemberExpression(member) => {
+        self
+          .shared
+          .const_string(self.module, &member.expression)
+          .is_some_and(|name| GLOBAL_OBJECTS.contains(&name.as_str()))
+          && self.on_global_object(&member.object)
+      }
+      _ => false,
     }
   }
 
   /// The global `Reflect` other than as the object of a member read or a
   /// `typeof` operand, such as `const { get } = Reflect`, hides which name
   /// `Reflect.get` will read.
-  fn check_reflect_reference(&mut self, it: &IdentifierReference<'a>) {
+  fn check_reflect_value(&mut self, span: Span) {
     let allowed = match self.parent(0) {
-      Some(AstKind::StaticMemberExpression(member)) => member.object.span() == it.span,
-      Some(AstKind::ComputedMemberExpression(member)) => member.object.span() == it.span,
+      Some(AstKind::StaticMemberExpression(member)) => member.object.span() == span,
+      Some(AstKind::ComputedMemberExpression(member)) => member.object.span() == span,
       Some(AstKind::UnaryExpression(unary)) => unary.operator == UnaryOperator::Typeof,
       _ => false,
     };
     if !allowed {
-      self.bail_global(it.span, "`Reflect` used as a value");
+      self.bail_global(span, "`Reflect` used as a value");
     }
   }
 
@@ -1558,7 +1608,7 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       self.check_untrusted_reference(it, resolved);
       self.check_host_reference(it);
       if it.name == "Reflect" && it.reference_id.get().is_some() && resolved.is_none() {
-        self.check_reflect_reference(it);
+        self.check_reflect_value(it.span);
       }
     }
     // The use expression of a key: the identifier, or `ns.Key` through any
@@ -1592,6 +1642,9 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
     {
       self.check_member_name(Some(it.property.name.as_str()), it.span);
       self.check_reflective_read(&it.object, it.property.name.as_str(), it.span);
+      if it.property.name == "Reflect" && self.on_global_object(&it.object) {
+        self.check_reflect_value(it.span);
+      }
       // A1 assumes builtins are not modified; writes to their prototypes are
       // cheap to see, so they turn the pass off instead.
       if it.property.name == "prototype"
@@ -1610,6 +1663,9 @@ impl<'a> VisitJs<'a> for UseCollector<'_, '_, 'a> {
       self.check_member_name(name.as_deref(), it.span);
       if let Some(name) = name {
         self.check_reflective_read(&it.object, &name, it.span);
+        if name == "Reflect" && self.on_global_object(&it.object) {
+          self.check_reflect_value(it.span);
+        }
       }
     }
     walk_js::walk_computed_member_expression(self, it);
