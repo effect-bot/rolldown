@@ -834,7 +834,9 @@ impl<'a> UseCollector<'_, '_, 'a> {
   /// provider object is built, so reading it cannot throw. Function declarations
   /// and `var` always are; a `const`, `let` or class must be declared earlier in
   /// the source with no hoisted function declaration between, which could run
-  /// the site first. An import may be uninitialised through a module cycle.
+  /// the site first, and not in another case of a switch the site is in, since
+  /// jumping to a case skips the cases before it. An import may be
+  /// uninitialised through a module cycle.
   fn initialized_at(&self, value: &Expression<'a>, site: u32) -> bool {
     let Expression::Identifier(ident) = value else { return false };
     let Some(reference) = ident.reference_id.get() else { return false };
@@ -854,6 +856,12 @@ impl<'a> UseCollector<'_, '_, 'a> {
         AstKind::Function(function) => {
           function.r#type != FunctionType::FunctionDeclaration
             || function.span.contains_inclusive(declared)
+        }
+        _ => true,
+      })
+      && self.path.windows(2).all(|pair| match pair {
+        [AstKind::SwitchStatement(switch), AstKind::SwitchCase(case)] => {
+          !switch.span.contains_inclusive(declared) || case.span.contains_inclusive(declared)
         }
         _ => true,
       })
