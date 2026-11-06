@@ -39,6 +39,10 @@ const WRAP_CLONE_SITE: Site = Site { module: ModuleIdx::from_raw_unchecked(0), s
 
 /// Tag of the sub-sites rules make (bit 31 marks the end-tagged sites the generator makes).
 const RULE_SUB: u32 = 0x4000_0000;
+
+/// The model slots of a Fiber: what its effect succeeds and fails with.
+pub const FIBER_SUCCESS: &str = "~success";
+pub const FIBER_FAILURE: &str = "~failure";
 /// Tag of the call sites inside a function clone (both bits); the low bits index `clone_sites`.
 const CLONE_SUB: u32 = 0xC000_0000;
 
@@ -544,6 +548,9 @@ pub struct Analysis {
   pub effect_key_strings: VarId,
   /// Rule id of `effect:default`, once registered.
   pub default_rule: Option<u16>,
+  /// The bundled `Schedule.toStep` (stable public API), which the `Effect.repeat` rule uses to
+  /// step a Schedule. `None` when `effect/Schedule` is not bundled.
+  pub schedule_to_step: Option<VarId>,
   worklist: Vec<VarId>,
   /// Constraints registered since the last solver step, to be applied to the objects their
   /// variable already holds. Kept out of the call stack so constraint cycles cannot recurse.
@@ -614,6 +621,7 @@ impl Analysis {
       effect_key_values,
       effect_key_strings,
       default_rule: None,
+      schedule_to_step: None,
       worklist: vec![],
       new_constraints: vec![],
       activation_queue: vec![],

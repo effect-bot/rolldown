@@ -7,15 +7,19 @@
 //! modules are the public ones listed here and the internal modules their ruled
 //! exports resolve into. Their exports without an explicit rule get
 //! `effect:default`, which is sound by construction: callbacks receive every
-//! argument-derived value plus the runtime objects Effect hands out, and the
-//! result yields the same. Every other module, inside `effect` or not, is
-//! analysed as ordinary code (design section 3).
+//! argument-derived value, and the result yields the same. It never hands out a
+//! Fiber or Context: only the rules of the stable APIs that do produce them.
+//! Every other module, inside `effect` or not, is analysed as ordinary code
+//! (design section 3).
 
 #![expect(clippy::many_single_char_names, reason = "rules are small closures over `a` and `c`")]
 
 use arcstr::ArcStr;
 
-use super::heap::{Analysis, Arg, Call, Constraint, KeyUse, ObjId, ObjKind, Site, VarId};
+use super::heap::{
+  Analysis, Arg, Call, Constraint, FIBER_FAILURE, FIBER_SUCCESS, Flavour, KeyUse, ObjId, ObjKind,
+  Site, VarId,
+};
 use super::host::{
   arg, args_from, await_of, const_string_of, elem_of, host_var, invoke, invoke_args, load,
   new_array, new_object, new_promise, prim_var, this_of,
@@ -44,6 +48,10 @@ pub enum Spec {
   /// `Pipeable.Class`: a constructor that does nothing, with `Pipeable.Prototype` as prototype.
   PipeableClass,
 }
+
+/// The public Schedule module, and the stable export `Effect.repeat` steps a Schedule with.
+pub const SCHEDULE_MODULE: &str = "/dist/Schedule.js";
+pub const SCHEDULE_TO_STEP: &str = "toStep";
 
 /// The `effect` major version the model is written against.
 pub const SUPPORTED_MAJOR: &str = "4";
@@ -186,7 +194,7 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("onInterrupt", Spec::Rule("effect:Effect.passthrough")),
       ("retry", Spec::Rule("effect:Effect.passthrough")),
       ("retryOrElse", Spec::Rule("effect:Effect.orElseSucceed")),
-      ("repeat", Spec::Rule("effect:Effect.passthrough")),
+      ("repeat", Spec::Rule("effect:Effect.repeat")),
       ("forever", Spec::Rule("effect:Effect.passthrough")),
       ("timeout", Spec::Rule("effect:Effect.passthrough")),
       ("timeoutOption", Spec::Rule("effect:Effect.wrapSuccess")),
@@ -360,9 +368,66 @@ fn fiber(a: &mut Analysis) -> VarId {
     250,
     |_| ObjKind::Fiber,
   );
+  // The current fiber runs whatever effect was started: its result may hold any service.
+  for slot in [FIBER_SUCCESS, FIBER_FAILURE] {
+    let field = a.field(f, &ArcStr::from(slot));
+    a.copy(a.all_values, field);
+  }
   let v = a.var();
   a.seed(v, f);
   v
+}
+
+/// Steps the Schedules in `schedule` once with `input`, through the bundled stable
+/// `Schedule.toStep`: `(output, failure)`. A step is a Pull, which succeeds with
+/// `[output, delay]` or ends by failing with `Cause.Done(output)` (stable `Done.value`).
+/// Without a bundled `effect/Schedule`, a Schedule can only come from code the pass can't see:
+/// it is handed over, and its output is unknown.
+fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) -> (VarId, VarId) {
+  let output = a.var();
+  let failure = a.var();
+  if let Some(to_step) = a.schedule_to_step {
+    let eff = invoke(a, site, to_step, None, vec![schedule]);
+    let step = success_of(a, eff);
+    let now = prim_var(a);
+    let pull = invoke(a, site, step, None, vec![now, input]);
+    let ps = success_of(a, pull);
+    let out = elem_of(a, ps);
+    a.copy(out, output);
+    let pf = failure_of(a, pull);
+    a.copy(pf, failure);
+    let done = load(a, pf, "value");
+    a.copy(done, output);
+    let ef = failure_of(a, eff);
+    a.copy(ef, failure);
+  } else {
+    a.constrain(schedule, Constraint::Escape(Flavour::Ext, Some(site)));
+    a.seed(output, a.top_ext);
+    a.seed(failure, a.top_ext);
+  }
+  (output, failure)
+}
+
+/// A fiber running `e`: its slots hold what `e` succeeds and fails with.
+fn forked_fiber(a: &mut Analysis, site: Site, e: VarId) -> ObjId {
+  let fb = a.site_obj(site, 11, |_| ObjKind::Fiber);
+  let s = success_of(a, e);
+  let sf = a.field(fb, &ArcStr::from(FIBER_SUCCESS));
+  a.copy(s, sf);
+  let fl = failure_of(a, e);
+  let ff = a.field(fb, &ArcStr::from(FIBER_FAILURE));
+  a.copy(fl, ff);
+  fb
+}
+
+/// The Exit of the fibers in `fb`: an Effect with the fiber's success and failure.
+fn fiber_exit(a: &mut Analysis, site: Site, fb: VarId) -> VarId {
+  let s = load(a, fb, FIBER_SUCCESS);
+  let fl = load(a, fb, FIBER_FAILURE);
+  let (exit, es, ef) = new_effect(a, site, 23);
+  a.copy(s, es);
+  a.copy(fl, ef);
+  exit
 }
 
 fn ambient(a: &mut Analysis) -> VarId {
@@ -960,6 +1025,39 @@ pub fn register(a: &mut Analysis) {
     a.copy(rf, of);
     a.copy(out, c.ret);
   });
+  dual!(a, "effect:Effect.repeat", 2, |a, c| {
+    // `repeat(self, options | schedule | ($) => schedule)`. With a schedule, or a builder
+    // called with `identity`, it succeeds with the schedule's output; with options, with
+    // `self`'s success. Which form a call uses is not known statically, so the result takes
+    // both. The schedule is stepped with `self`'s success as its input.
+    let e = self_effect(a, c);
+    let x = arg(a, c, 1);
+    let s = success_of(a, e);
+    let (out, os, of) = new_effect(a, c.site, 1);
+    a.copy(s, os);
+    let fl = failure_of(a, e);
+    a.copy(fl, of);
+    for name in ["while", "until"] {
+      let f = load(a, x, name);
+      let r = invoke(a, c.site, f, None, vec![s]);
+      let rf = failure_of(a, r);
+      a.copy(rf, of);
+    }
+    let schedule = a.var();
+    a.copy(x, schedule);
+    let opt = load(a, x, "schedule");
+    a.copy(opt, schedule);
+    let id = a.rule_id("effect:identity").unwrap();
+    let identity = a.builtin(id, None, None);
+    let identity_var = a.var();
+    a.seed(identity_var, identity);
+    let built = invoke(a, c.site, x, None, vec![identity_var]);
+    a.copy(built, schedule);
+    let (output, failure) = step_schedule(a, c.site, schedule, s);
+    a.copy(output, os);
+    a.copy(failure, of);
+    a.copy(out, c.ret);
+  });
   a.rule("effect:Effect.wrapSuccess", |a, c| {
     let e = self_effect(a, c);
     let s = success_of(a, e);
@@ -1185,8 +1283,41 @@ pub fn register(a: &mut Analysis) {
   });
   a.rule("Fiber.join", |a, c| {
     let fb = this_of(a, c);
-    let v = load(a, fb, "~success");
+    let v = load(a, fb, FIBER_SUCCESS);
     a.copy(v, c.ret);
+  });
+  // Public members of `Fiber` (effect 4.x `Fiber` interface) that bundled code calls.
+  a.rule("Fiber.addObserver", |a, c| {
+    // `addObserver(cb)` calls `cb` with the fiber's Exit and returns a remover.
+    let fb = this_of(a, c);
+    let exit = fiber_exit(a, c.site, fb);
+    let cb = arg(a, c, 0);
+    invoke(a, c.site, cb, None, vec![exit]);
+    a.seed(c.ret, a.top_host);
+  });
+  a.rule("Fiber.pollUnsafe", |a, c| {
+    // The fiber's Exit, or `undefined`.
+    let fb = this_of(a, c);
+    let exit = fiber_exit(a, c.site, fb);
+    a.copy(exit, c.ret);
+    a.seed(c.ret, a.prim);
+  });
+  for name in ["Fiber.id:get", "Fiber.currentOpCount:get"] {
+    a.rule(name, |a, c| a.seed(c.ret, a.prim));
+  }
+  // The public `Exit` view of an Effect: `Effect.succeed(x)` and friends are Exits at run time.
+  // `value` is the success; `cause` is a Cause holding the failure.
+  a.rule("Effect._tag:get", |a, c| a.seed(c.ret, a.prim));
+  a.rule("Effect.value:get", |a, c| {
+    let e = this_of(a, c);
+    let s = success_of(a, e);
+    a.copy(s, c.ret);
+  });
+  a.rule("Effect.cause:get", |a, c| {
+    let e = this_of(a, c);
+    let fl = failure_of(a, e);
+    let cause = wrap(a, c.site, fl);
+    a.copy(cause, c.ret);
   });
   dual!(a, "effect:Effect.provide", 2, |a, c| {
     let e = self_effect(a, c);
@@ -1528,27 +1659,26 @@ pub fn register(a: &mut Analysis) {
   });
   a.rule("effect:Effect.fork", |a, c| {
     let e = self_effect(a, c);
-    let fb = a.site_obj(c.site, 11, |_| ObjKind::Fiber);
-    let s = success_of(a, e);
-    let sf = a.field(fb, &ArcStr::from("~success"));
-    a.copy(s, sf);
+    let fb = forked_fiber(a, c.site, e);
     let (out, os, _) = new_effect(a, c.site, 1);
     a.seed(os, fb);
     a.copy(out, c.ret);
   });
   a.rule("effect:Fiber.join", |a, c| {
     let fb = arg(a, c, 0);
-    let v = load(a, fb, "~success");
-    let (out, os, _) = new_effect(a, c.site, 1);
+    let v = load(a, fb, FIBER_SUCCESS);
+    let fl = load(a, fb, FIBER_FAILURE);
+    let (out, os, of) = new_effect(a, c.site, 1);
     a.copy(v, os);
+    a.copy(fl, of);
     a.copy(out, c.ret);
   });
   a.rule("effect:Fiber.await", |a, c| {
+    // Succeeds with the fiber's Exit.
     let fb = arg(a, c, 0);
-    let v = load(a, fb, "~success");
-    let w = wrap(a, c.site, v);
+    let exit = fiber_exit(a, c.site, fb);
     let (out, os, _) = new_effect(a, c.site, 1);
-    a.copy(w, os);
+    a.copy(exit, os);
     a.copy(out, c.ret);
   });
   a.rule("effect:Fiber.getCurrent", |a, c| {
@@ -1595,10 +1725,7 @@ pub fn register(a: &mut Analysis) {
   });
   a.rule("effect:Effect.runFork", |a, c| {
     let e = self_effect(a, c);
-    let fb = a.site_obj(c.site, 11, |_| ObjKind::Fiber);
-    let s = success_of(a, e);
-    let sf = a.field(fb, &ArcStr::from("~success"));
-    a.copy(s, sf);
+    let fb = forked_fiber(a, c.site, e);
     run_options(a, c, 1);
     a.seed(c.ret, fb);
   });
@@ -1904,10 +2031,7 @@ pub fn register(a: &mut Analysis) {
   });
   a.rule("Runtime.runFork", |a, c| {
     let e = arg(a, c, 0);
-    let fb = a.site_obj(c.site, 11, |_| ObjKind::Fiber);
-    let s = success_of(a, e);
-    let sf = a.field(fb, &ArcStr::from("~success"));
-    a.copy(s, sf);
+    let fb = forked_fiber(a, c.site, e);
     a.seed(c.ret, fb);
   });
   a.rule("Runtime.runCallback", |a, c| {
@@ -2140,14 +2264,18 @@ pub fn register(a: &mut Analysis) {
 
   a.rule("effect:default", |a, c| {
     // Sound by construction: the result yields every argument-derived value, and callbacks
-    // receive those values plus the runtime objects Effect hands out. Calling the result falls
-    // to the `Wrap` call path in the heap, so no per-result callable is minted here.
+    // receive those values at every parameter position. Calling the result falls to the `Wrap`
+    // call path in the heap, so no per-result callable is minted here.
+    //
+    // Callbacks get no Fiber and no ambient Context. A Fiber or Context reaches bundled code
+    // only through a stable API that hands one out (`Effect.withFiber`, `Effect.context`,
+    // `Fiber.getCurrent`, ...), and each of those has its own rule. Code the pass does not look
+    // inside is assumed not to reach services through Fibers (the issue's one assumption), so
+    // the default must not invent one (design section 3).
     let derived = a.var();
-    // Callbacks get the derived values and the current Fiber (whose `context` is the ambient
-    // Context when read); handing them a Context directly would turn every later call into
-    // an API without a model into a bail.
-    let fb = fiber(a);
     let w = wrap(a, c.site, derived);
+    let (_, every_arg, every_elem) = new_array(a, c.site, 22);
+    a.copy(w, every_elem);
     for x in args_from(a, c, 0) {
       let v = match x {
         Arg::Var(v) | Arg::Spread(v) => v,
@@ -2167,7 +2295,7 @@ pub fn register(a: &mut Analysis) {
       let callable = a.var();
       a.constrain(v, Constraint::Callables(callable));
       a.constrain(inner, Constraint::Callables(callable));
-      let r = invoke(a, c.site, callable, None, vec![w, fb]);
+      let r = invoke_args(a, c.site, callable, None, vec![Arg::Spread(every_arg)]);
       a.copy(r, derived);
       let rs = success_of(a, r);
       a.copy(rs, derived);

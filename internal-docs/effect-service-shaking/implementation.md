@@ -23,7 +23,7 @@ The diagnostic is `EventKind::EffectServiceShaking` (`crates/rolldown_error/src/
 
 ## Data flow
 
-1. **Find and bind.** For every `MODULES` entry, the pass resolves the public `effect/<Module>` module in the graph and its exports. If `effect` is external, or a ruled export is missing, or the major is not `SUPPORTED_MAJOR`, it warns and returns. The modelled set is the public modules plus the owners of their ruled exports' `alias_chain`s. The binding walks modules in execution order. An export takes its own declaration, and the declarations it aliases keep whatever claimed them first. So `internal/effect.js` is bound before `Effect.js`, and its `map` takes the default as that module's own export before `Effect.map`'s rule reaches it. User code that calls `Effect.map` hits the rule. Ordinary code that imports `internal/effect.js` directly, as Schema does, hits the default. Binding the explicit rules first would fix this, but in measurements it removed nothing more (see design.md, "Precision on Schema-heavy programs"). Every export of a modelled module is bound to one of three things, in `Shared::rule_symbols`: its `Spec` object, a declared Key, or `effect::default_object` (the `effect:default` rule). An export that aliases ordinary code is linked to that code instead.
+1. **Find and bind.** For every `MODULES` entry, the pass resolves the public `effect/<Module>` module in the graph and its exports. If `effect` is external, or a ruled export is missing, or the major is not `SUPPORTED_MAJOR`, it warns and returns. The modelled set is the public modules plus the owners of their ruled exports' `alias_chain`s. The binding walks modules in execution order, but precedence does not depend on it (`BindRank`): an explicit rule beats a declared Key, which beats the default. At equal rank an export's own declaration takes its spec and the declarations it aliases keep what claimed them first. So `internal/effect.js`'s `map`, walked before `Effect.js`, first takes the default as that module's own export, and `Effect.map`'s rule then replaces it. Ordinary code that imports `internal/effect.js` directly, as Schema does, hits the stable rule. Every export of a modelled module is bound to one of three things, in `Shared::rule_symbols`: its `Spec` object, a declared Key, or `effect::default_object` (the `effect:default` rule). An export that aliases ordinary code is linked to that code instead.
 2. **Generate.** Each non-modelled module's AST is walked once by `Gen`. Modelled modules are skipped entirely: their bodies sit behind rules.
 
    Every walk over modules (namespace objects, binding, generation, namespace exports) goes in execution order (`exec_order`, ties by `stable_id`), and every walk over a module's exports goes in name order (`sorted_exports`). `ModuleIdx` follows the order modules finished loading, which differs between builds of the same input, and `resolved_exports` is a hash map. The walk order matters because the solve is first-come: the first `MAX_CLONES_PER_FN` call sites to reach a function get clones and later ones share the body, and later calls of a builtin at one site merge into its first invocation (`rule_memo`). Another order gives another sound but differently precise constraint set, and can go over the budget where this one does not.
@@ -49,11 +49,23 @@ Environment variables, all opt-in:
 
 ## Current status
 
-- Fixtures: 115 of 122 pass. `dynamic_key_prefix` waits for prefix narrowing. `effect_internal_analysed` keeps every method, within the budget (about 310k variables, 3.7 s solve); see design.md, "Precision on Schema-heavy programs". Five regressions for the next binding increment are red:
-  - Three bundles throw. In `exit_view_of_effect` and `fiber_observer_exit`, a public member read on a model Effect or Fiber that has no rule records no demand. In `internal_combinator_caller`, `Effect.repeat` is modelled as a passthrough, but with a schedule it succeeds with the schedule's output.
-  - `schema_concurrency_no_fiber` and `schema_concurrency_context` keep the unread method, because the default rule on Schema's internal helpers hands Schema a Fiber.
-- Acceptance: `node_file_system`, the library and mixed builds pass. `openai_generated_client` and `distilled_stripe` keep every method. OpenAI goes over its budget on entries: 14.2M points-to entries plus 1.8M copy edges pass the 16M limit, in the example binary and in the suite alike, so its bundle is unchanged (0.0% smaller). Distilled stays within the budget but reads Schema fields on the ambient Context, and it is also 0.0% smaller. Both are also far over the time target: the solve takes about 4.6 s on OpenAI and 13 s on Distilled, against a 247 ms OpenAI build without the pass.
-- Determinism: `solve_is_deterministic` passes. Repeated builds give the same variables, objects, solver steps, budget verdict and bundle: `node_file_system` 87,452 / 7,797 / 183,023 steps, `effect_internal_analysed` 310,395 / 20,446 / 10.9M, `distilled_stripe` 310,613 / 21,351 / 25.5M, OpenAI 375,882 / 45,304 / 7.8M (over budget every time). Before the walks were ordered (see Data flow, step 2), `ModuleIdx` order differed in every build, the step count of `node_file_system` ranged from about 178,600 to 183,200, and the larger programs' variable counts and budget verdicts changed from build to build.
+- Fixtures: 117 of 122 pass.
+  - `dynamic_key_prefix` waits for prefix narrowing.
+  - `effect_internal_analysed`, `schema_concurrency_no_fiber` and `schema_concurrency_context` keep every method because the solve goes over the entries budget (see design.md, "Precision on Schema-heavy programs").
+  - `internal_combinator_caller` runs correctly, since `Effect.repeat` now succeeds with the Schedule's output (stepped with the stable `Schedule.toStep`), but keeps `writeOne`: the ambient Context merges into `Schedule`/`Duration` values and is read as reflection.
+  - `exit_view_of_effect` and `fiber_observer_exit` pass through the Exit (`_tag`, `value`, `cause`) and Fiber (`addObserver`, `pollUnsafe`) member rules.
+- Acceptance: `node_file_system`, the library and mixed builds pass. `openai_generated_client` and `distilled_stripe` keep every method; both go over the entries budget, and both are 0.0% smaller. Solve times on this host: about 10.5 s on OpenAI and 84 s on Distilled, against a 270 ms OpenAI build without the pass.
+- Determinism: `solve_is_deterministic` passes.
+- Measurements against `0bf641510` (example binary, one build, `MemoryMax=6G` and `ROLLDOWN_TEST_MAX_RSS_MB=4096`):
+
+  | program | `0bf641510` vars / entries / solve / verdict | now |
+  | --- | --- | --- |
+  | `node_file_system` | 87k / 0.17M / 67 ms / within, 31 removed | 86k / 0.16M / 66 ms / within, 31 removed |
+  | `effect_internal_analysed` | 310k / 16.0M / 4.8 s / within | 230k / 16.0M / 16.7 s / over |
+  | `distilled_stripe` | 311k / 16.0M / 31 s / within | 291k / 16.0M / 84 s / over |
+  | `openai_generated_client` | 376k / 16.0M / 7.0 s / over | 374k / 16.0M / 10.5 s / over |
+
+  Entries are points-to entries plus copy edges at the end of the solve; an over-budget solve stops at the limit.
 
 ## Related
 

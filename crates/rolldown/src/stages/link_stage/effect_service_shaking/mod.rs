@@ -127,6 +127,7 @@ impl LinkStage<'_> {
     let mut effect_external = false;
     let mut unsupported_version: Option<String> = None;
     let mut public_modules: Vec<(ModuleIdx, &'static [(&'static str, effect::Spec)])> = vec![];
+    let mut schedule_module: Option<ModuleIdx> = None;
     for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       match module {
         Module::Normal(normal) => {
@@ -141,6 +142,9 @@ impl LinkStage<'_> {
             }
           }
           let path = normal.id.as_ref().replace('\\', "/");
+          if path.ends_with(effect::SCHEDULE_MODULE) {
+            schedule_module = Some(normal.idx);
+          }
           if let Some((_, specs)) =
             effect::MODULES.iter().find(|(name, _)| path.ends_with(&format!("/dist/{name}.js")))
           {
@@ -204,6 +208,7 @@ impl LinkStage<'_> {
     }
     // Model-bound declarations that alias ordinary code, linked once every rule is bound.
     let mut links: Vec<(SymbolRef, SymbolRef)> = vec![];
+    let mut bind_rank: FxHashMap<SymbolRef, BindRank> = FxHashMap::default();
     for module in order.iter().copied().filter(|m| modelled.contains(m)).collect::<Vec<_>>() {
       let specs = public_modules.iter().find(|(m, _)| *m == module).map(|(_, s)| *s);
       let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(module);
@@ -216,30 +221,37 @@ impl LinkStage<'_> {
         let generic_target = chain.iter().copied().find(|sym| !modelled.contains(&sym.owner));
         let chain: Vec<SymbolRef> =
           chain.into_iter().take_while(|sym| modelled.contains(&sym.owner)).collect();
-        let obj = match spec {
-          Some(spec) => effect::spec_object(&mut a, spec),
+        let (obj, rank) = match spec {
+          Some(spec) => (effect::spec_object(&mut a, spec), BindRank::Rule),
           None => match chain.iter().find_map(|sym| self.key_declaration_of(*sym)) {
             Some((key_name, reference)) => {
-              effect::declared_key(&mut a, key_name.as_deref(), reference)
+              (effect::declared_key(&mut a, key_name.as_deref(), reference), BindRank::Key)
             }
             None => {
               if let Some(target) = generic_target {
                 links.extend(chain.iter().map(|sym| (target, *sym)));
                 continue;
               }
-              effect::default_object(&mut a)
+              (effect::default_object(&mut a), BindRank::Default)
             }
           },
         };
-        // The export's own declaration always gets its spec; the declarations it aliases
-        // take it only when nothing more specific claimed them (`Reference` aliases
+        // Precedence does not depend on the walk order: an explicit rule beats a Key, and a
+        // Key beats the default. `internal/effect.js` is walked before `Effect.js`, and its
+        // own `map` export must not keep the default once `Effect.map`'s rule reaches the
+        // same declaration. At equal rank the export's own declaration takes its spec, and
+        // the declarations it aliases keep what claimed them first (`Reference` aliases
         // `Service` in `Context.js`, and `Service` must keep its own rule).
-        let mut chain = chain.into_iter();
-        if let Some(own) = chain.next() {
-          sh.rule_symbols.insert(own, obj);
-        }
-        for sym in chain {
-          sh.rule_symbols.entry(sym).or_insert(obj);
+        for (i, sym) in chain.into_iter().enumerate() {
+          let claim = match bind_rank.get(&sym) {
+            None => true,
+            Some(held) if i == 0 => *held <= rank,
+            Some(held) => *held < rank,
+          };
+          if claim {
+            sh.rule_symbols.insert(sym, obj);
+            bind_rank.insert(sym, rank);
+          }
         }
       }
     }
@@ -250,6 +262,13 @@ impl LinkStage<'_> {
       let to = sh.symbol_var(&mut a, target);
       let from = sh.symbol_var(&mut a, sym);
       a.copy(to, from);
+    }
+
+    // `Effect.repeat` steps a Schedule through the bundled stable `Schedule.toStep`.
+    if let Some(module) = schedule_module {
+      if let Some(export) = self.metas[module].resolved_exports.get(effect::SCHEDULE_TO_STEP) {
+        a.schedule_to_step = Some(sh.symbol_var(&mut a, export.symbol_ref));
+      }
     }
 
     phase!("model bound, {} rule symbols", sh.rule_symbols.len());
@@ -559,6 +578,15 @@ impl LinkStage<'_> {
       _ => None,
     }
   }
+}
+
+/// What a model-bound declaration is bound to, by precedence: an explicit stable rule wins
+/// over a declared Key, which wins over `effect:default`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BindRank {
+  Default,
+  Key,
+  Rule,
 }
 
 trait PipeKind {
