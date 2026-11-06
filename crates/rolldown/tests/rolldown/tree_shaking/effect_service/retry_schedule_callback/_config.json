@@ -1,0 +1,10 @@
+{
+  "_comment": "Effect.retry with a Schedule runs the schedule's callbacks between attempts; a Schedule.map callback calls a service method: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

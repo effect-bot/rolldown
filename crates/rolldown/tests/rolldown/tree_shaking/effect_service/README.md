@@ -8,7 +8,7 @@ Run them with:
 cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service
 ```
 
-5 red, 117 green.
+6 red, 118 green.
 
 ### Memory cap
 
@@ -44,6 +44,7 @@ The analysis runs inside the test process, so a solve that never terminates woul
 | `external_unresolvable`                     | green | A service handed to an external module that does not exist at build time keeps every method; a key never handed over is still pruned.                                                                                                                                 |
 | `failure_context`                           | green | A Context in the failure channel reaches a catch handler that enumerates it: every method of its entries stays.                                                                                                                                                       |
 | `fallback_format_context`                   | green | A Context handed to Formatter.format, Effect code the pass analyses generically; it enumerates the services, so every method stays and the printed output does not change.                                                                                            |
+| `fiber_join_failure`                        | green | A forked fiber fails with the service; `Fiber.join` re-raises the failure and the `Effect.catch` handler calls a method on it: that method stays, the unread one is removed.                                                                                          |
 | `fiber_observer_exit`                       | green | An observer added with `fiber.addObserver` reads the service from the Exit it receives: that method stays, the unread one is removed. The bundle threw at 0bf641510 (miscompile).                                                                                     |
 | `forged_key`                                | green | A hand-made key object with the same key string looks the service up: a key-shaped value in a lookup position reads that key (or any key), so every method stays.                                                                                                     |
 | `formatter_context_entries`                 | green | console.log and JSON.stringify of a Context format its entries, which reads only toJSON/[inspect.custom] on each service: a service toJSON is kept, the uncalled ordinary methods are removed.                                                                        |
@@ -117,6 +118,7 @@ The analysis runs inside the test process, so a solve that never terminates woul
 | `release_param_default`                     | green | A release callback reads the acquired object through `arguments` in a later parameter's default: that read is kept; the unread method is removed.                                                                                                                     |
 | `rest_release`                              | green | A release callback reaches the acquired object through a rest parameter: that read is kept; the unread method is removed.                                                                                                                                             |
 | `retained_fiber`                            | green | A forked and joined Fiber kept in module state bails nothing (Fiber escapes bail nothing): writeOne is removed.                                                                                                                                                       |
+| `retry_schedule_callback`                   | red   | `Effect.retry` steps its Schedule after a failure, and a `Schedule.map` callback calls a service method: that method stays, the unread one goes. Throws at 109411ab8 (`retry` is modelled as a passthrough).                                                          |
 | `root_shared_allocation`                    | green | Run A stores its service in module state and run B reads a method of it by a runtime name: that key bails (per key, not per run); B's own unread method is still removed.                                                                                             |
 | `root_shared_runtime`                       | green | Two runs on one ManagedRuntime share a service; one run reads it by a runtime name, so that key bails; a key provided only to one run still loses its unread method.                                                                                                  |
 | `run_options`                               | green | A RunOptions.onFiberStart callback receives the Fiber but reads nothing from it: writeOne is removed.                                                                                                                                                                 |
