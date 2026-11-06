@@ -1,0 +1,10 @@
+{
+  "_comment": "A class getter or setter runs with the instance it is accessed on as `this`: directly, and through `super` from a derived method. The getters return a method of the service the instance holds, and the setter writes the service to the instance; the methods called stay, the unread one is removed. A getter that loses its receiver returns undefined, so the optional calls are checked by the program's output.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

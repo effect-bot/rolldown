@@ -1,0 +1,10 @@
+{
+  "_comment": "In a static method, `super.m()` looks `m` up on the parent class itself (not its prototype) and calls it with the current class as `this`: the parent's static method returns the service stored on the derived class, so the methods read on it stay and the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
