@@ -1,0 +1,10 @@
+{
+  "_comment": "Function.dual with arity 2 and 3: a data-last call captures the service and returns a partial, so the body never enumerates it and the unread methods are removed. A predicate-style dual takes both branches: a one-argument full call enumerates its service, so every method stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
