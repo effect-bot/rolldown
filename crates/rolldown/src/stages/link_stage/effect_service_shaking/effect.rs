@@ -430,8 +430,8 @@ fn context_keys(a: &mut Analysis, v: VarId, dst: VarId) {
   a.constrain(v, Constraint::ContextKeys(dst));
 }
 
-fn wrap(a: &mut Analysis, inner: VarId) -> VarId {
-  a.wrap_of(inner)
+fn wrap(a: &mut Analysis, site: Site, inner: VarId) -> VarId {
+  a.wrap_of(inner, site)
 }
 
 /// The effect `self` of a dual call: argument 0.
@@ -594,7 +594,7 @@ pub fn register(a: &mut Analysis) {
   dual!(a, "effect:Context.getOption", 2, |a, c| {
     let key = arg(a, c, 1);
     let v = lookup(a, key);
-    let w = wrap(a, v);
+    let w = wrap(a, c.site, v);
     a.copy(w, c.ret);
   });
   dual!(a, "effect:Context.getOrElse", 3, |a, c| {
@@ -951,7 +951,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     let r = call_callbacks(a, c, 1, &[w, w, w]);
     let (out, os, of) = new_effect(a, c.site, 1);
     a.copy(s, os);
@@ -964,7 +964,7 @@ pub fn register(a: &mut Analysis) {
     let e = self_effect(a, c);
     let s = success_of(a, e);
     let fl = failure_of(a, e);
-    let w = wrap(a, s);
+    let w = wrap(a, c.site, s);
     call_callbacks(a, c, 1, &[w]);
     let (out, os, of) = new_effect(a, c.site, 1);
     a.copy(w, os);
@@ -978,7 +978,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     let (out, os, _) = new_effect(a, c.site, 1);
     a.copy(w, os);
     a.copy(out, c.ret);
@@ -1031,7 +1031,7 @@ pub fn register(a: &mut Analysis) {
     let members = elem_of(a, items);
     let (out, os, of) = new_effect(a, c.site, 1);
     let s = success_of(a, members);
-    let w = wrap(a, s);
+    let w = wrap(a, c.site, s);
     a.copy(w, os);
     let fl = failure_of(a, members);
     a.copy(fl, of);
@@ -1128,7 +1128,7 @@ pub fn register(a: &mut Analysis) {
   a.rule("effect:Effect.serviceOption", |a, c| {
     let key = arg(a, c, 0);
     let v = lookup(a, key);
-    let w = wrap(a, v);
+    let w = wrap(a, c.site, v);
     let (e, s, _) = new_effect(a, c.site, 1);
     a.copy(w, s);
     a.copy(e, c.ret);
@@ -1499,7 +1499,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     call_callbacks(a, c, 1, &[w]);
     let (out, os, of) = new_effect(a, c.site, 1);
     a.copy(s, os);
@@ -1546,7 +1546,7 @@ pub fn register(a: &mut Analysis) {
   a.rule("effect:Fiber.await", |a, c| {
     let fb = arg(a, c, 0);
     let v = load(a, fb, "~success");
-    let w = wrap(a, v);
+    let w = wrap(a, c.site, v);
     let (out, os, _) = new_effect(a, c.site, 1);
     a.copy(w, os);
     a.copy(out, c.ret);
@@ -1571,7 +1571,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     a.copy(w, value);
     run_options(a, c, 1);
     a.copy(pv, c.ret);
@@ -1589,7 +1589,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     a.copy(w, c.ret);
     run_options(a, c, 1);
   });
@@ -1609,7 +1609,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     call_callbacks(a, c, 1, &[w]);
     run_options(a, c, 1);
     a.seed(c.ret, a.top_host);
@@ -1883,7 +1883,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     a.copy(w, value);
     a.copy(pv, c.ret);
   });
@@ -1899,7 +1899,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     a.copy(w, c.ret);
   });
   a.rule("Runtime.runFork", |a, c| {
@@ -1917,7 +1917,7 @@ pub fn register(a: &mut Analysis) {
     let both = a.var();
     a.copy(s, both);
     a.copy(fl, both);
-    let w = wrap(a, both);
+    let w = wrap(a, c.site, both);
     call_callbacks(a, c, 1, &[w]);
     a.seed(c.ret, a.top_host);
   });
@@ -2103,17 +2103,25 @@ pub fn register(a: &mut Analysis) {
     a.copy(v, c.ret);
   });
   a.rule("effect:Pipeable.pipe", |a, c| {
-    // `self.pipe(f, g)` is `g(f(self))`.
-    let acc = a.var();
-    let this = this_of(a, c);
-    a.copy(this, acc);
+    // `self.pipe(f, g)` is `g(f(self))`: each step gets only the previous step's result, so
+    // one step's input (say, an Effect's Context) does not reach the others. A spread runs
+    // its functions an unknown number of times, so its step loops on its own result.
+    let mut acc = this_of(a, c);
     for x in args_from(a, c, 0) {
-      let f = match x {
-        Arg::Var(v) => v,
-        Arg::Spread(v) => elem_of(a, v),
-      };
-      let r = invoke(a, c.site, f, None, vec![acc]);
-      a.copy(r, acc);
+      let next = a.var();
+      match x {
+        Arg::Var(f) => {
+          let r = invoke(a, c.site, f, None, vec![acc]);
+          a.copy(r, next);
+        }
+        Arg::Spread(v) => {
+          let f = elem_of(a, v);
+          a.copy(acc, next);
+          let r = invoke(a, c.site, f, None, vec![next]);
+          a.copy(r, next);
+        }
+      }
+      acc = next;
     }
     a.copy(acc, c.ret);
   });
@@ -2139,7 +2147,7 @@ pub fn register(a: &mut Analysis) {
     // Context when read); handing them a Context directly would turn every later call into
     // an API without a model into a bail.
     let fb = fiber(a);
-    let w = wrap(a, derived);
+    let w = wrap(a, c.site, derived);
     for x in args_from(a, c, 0) {
       let v = match x {
         Arg::Var(v) | Arg::Spread(v) => v,

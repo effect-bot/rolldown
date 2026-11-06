@@ -34,6 +34,9 @@ pub struct Site {
   pub sub: u32,
 }
 
+/// The clone key of every wrap callback call (see `clone_for`).
+const WRAP_CLONE_SITE: Site = Site { module: ModuleIdx::from_raw_unchecked(0), start: 0, sub: 0 };
+
 /// Tag of the sub-sites rules make (bit 31 marks the end-tagged sites the generator makes).
 const RULE_SUB: u32 = 0x4000_0000;
 /// Tag of the call sites inside a function clone (both bits); the low bits index `clone_sites`.
@@ -494,6 +497,8 @@ pub struct Analysis {
   /// Per `Wrap` object: the variable whose callables run with the wrapped values. Calling a
   /// wrap copies its arguments there, so one constraint per wrap serves every call site.
   wrap_callbacks: FxHashMap<ObjId, VarId>,
+  /// The sites wraps call their callbacks from (see `wrap_of`).
+  wrap_sites: FxHashSet<Site>,
   /// One variable holding exactly one object, reused by every constraint that needs it.
   holders: FxHashMap<ObjId, VarId>,
   /// Set when the analysis exceeded its allocation budget: everything is kept.
@@ -581,6 +586,7 @@ impl Analysis {
       site_cache: FxHashMap::default(),
       wraps: FxHashMap::default(),
       wrap_callbacks: FxHashMap::default(),
+      wrap_sites: FxHashSet::default(),
       holders: FxHashMap::default(),
       budget_exceeded: false,
       rule_calls: FxHashMap::default(),
@@ -1663,7 +1669,6 @@ impl Analysis {
       ObjKind::Wrap(inner) => {
         // Calling a wrapped value: arguments join the wrapped values, callbacks among them run
         // with those values (through the wrap's single callback variable).
-        let _ = self.wrap_of(inner);
         let cb = self.wrap_callbacks[&callee];
         for a in &call.args {
           let v = match a {
@@ -1721,7 +1726,15 @@ impl Analysis {
     } else {
       (call.site, 0)
     };
-    let key_site = if depth >= Self::MAX_CLONE_DEPTH { origin } else { call.site };
+    let key_site = if self.wrap_sites.contains(&call.site) {
+      // Closures handed to wraps share one clone per function: a clone per wrap repeats the
+      // same work for every wrap of a widely used callback and exhausts the budget.
+      WRAP_CLONE_SITE
+    } else if depth >= Self::MAX_CLONE_DEPTH {
+      origin
+    } else {
+      call.site
+    };
     if let Some(c) = self.clone_memo.get(&(f, key_site)) {
       return *c;
     }
@@ -1893,17 +1906,24 @@ impl Analysis {
     }
   }
 
-  pub fn wrap_of(&mut self, inner: VarId) -> VarId {
+  /// The wrap of `inner`, made by the rule call at `site` the first time.
+  pub fn wrap_of(&mut self, inner: VarId, site: Site) -> VarId {
     let w = match self.wraps.get(&inner) {
       Some(w) => *w,
       None => {
         let w = self.alloc(ObjKind::Wrap(inner), None);
         self.wraps.insert(inner, w);
-        // Callables handed to the wrap run with the wrapped values and feed them back.
+        // Callables handed to the wrap run with the wrapped values and feed them back. The
+        // calls are made on behalf of the rule call that made the wrap, so they sit on a
+        // sub-site of it: on one shared site, every builtin callback in the bundle would share
+        // one rule invocation (`rule_memo`) and so one result. Closures still share one clone
+        // per function (see `clone_for`).
         let cb = self.var();
         let wrapped = self.holder(w);
+        let site = site.sub(cb);
+        self.wrap_sites.insert(site);
         let call = Call {
-          site: Site { module: ModuleIdx::from_raw(0), start: 0, sub: 0 },
+          site,
           this: None,
           args: vec![Arg::Spread(wrapped)],
           ret: inner,
