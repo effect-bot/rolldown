@@ -1,5 +1,5 @@
 {
-  "_comment": "A key built at run time with a constant prefix can only alias keys with that prefix: those keep every method, other keys are still pruned (prefix narrowing is a later increment; red until then).",
+  "_comment": "A key whose string is a constant prefix followed by a suffix from the environment can only alias the keys with that prefix: the method read through it stays on each of them, the same-named method on a key without the prefix is removed, and methods nothing reads are removed (prefix narrowing is a later increment; red until then).",
   "config": {
     "experimental": {
       "effectServiceShaking": true
