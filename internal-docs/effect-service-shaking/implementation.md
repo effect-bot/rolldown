@@ -42,28 +42,29 @@ Environment variables, all opt-in:
 
 ## Tests
 
-- Fixtures: `crates/rolldown/tests/rolldown/tree_shaking/effect_service/` (126 real-`effect` programs). The README there has one row per fixture with its status. Run them with `cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service`.
+- Fixtures: `crates/rolldown/tests/rolldown/tree_shaking/effect_service/` (129 real-`effect` programs). The README there has one row per fixture with its status. Run them with `cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service`.
 - Acceptance: `crates/rolldown/tests/rolldown/topics/effect_service_acceptance/` builds each program in `programs/` with the pass off and on. It checks behaviour, removed names and the size reduction. `solve_is_deterministic` there builds `node_file_system` five times and requires the same bundle and the same solve (the variables, objects, solver steps and removals of the pass's `effect service shaking` debug event).
 - Timing: `cargo run --profile effect-verify -p rolldown --example effect_service_shaking -- <entry> <out-dir> 7` alternates off/on builds and prints medians.
 - Every run is under `rolldown_testing::memory_guard` (`ROLLDOWN_TEST_MAX_RSS_MB`).
 
 ## Current status
 
-- Fixtures: 118 of 126 pass.
+- Fixtures: 119 of 129 pass.
   - `dynamic_key_prefix` waits for prefix narrowing.
   - `effect_internal_analysed`, `schema_concurrency_no_fiber` and `schema_concurrency_context` keep every method because the solve goes over the entries budget (see design.md, "Precision on Schema-heavy programs").
-  - `internal_combinator_caller`, `retry_schedule_callback`, `retry_or_else_schedule_callback` and `retry_or_else_schedule_output` run correctly but keep the unread method. `Effect.repeat` succeeds with the Schedule's output; `Effect.retry` and `Effect.retryOrElse` step their Schedule with `self`'s failure, and `retryOrElse` calls `orElse` with that failure and the Schedule's last output; all three step through the stable `Schedule.toStep`. The ambient Context then merges into `Schedule`/`Duration` values and is read as reflection, or the solve goes over the entries budget.
+  - `internal_combinator_caller`, `retry_schedule_callback`, `retry_or_else_schedule_callback`, `retry_or_else_schedule_output` and `retry_metadata_output` run correctly but keep the unread method. `Effect.repeat` succeeds with the Schedule's output; `Effect.retry` and `Effect.retryOrElse` step their Schedule with `self`'s failure, and `retryOrElse` calls `orElse` with that failure and the Schedule's last output; all three step through the stable `Schedule.toStep` and provide `Schedule.CurrentMetadata` (`input`: the previous success or failure, `output`: the Schedule's output) to `self`. The ambient Context then merges into `Schedule`/`Duration` values and is read as reflection, or the solve goes over the entries budget.
+  - `retry_or_else_source_defect` runs correctly: `retryOrElse` passes `self`'s failure through, since defects are not retried. It keeps the unread method because the Schedule's own Pull failure values share the result's failure slot with the defect, and the `catchDefect` handler's argument then reads as reflection. `repeat_metadata_input` passes.
   - `exit_view_of_effect` and `fiber_observer_exit` pass through the Exit (`_tag`, `value`, `cause`) and Fiber (`addObserver`, `pollUnsafe`) member rules. `fiber_join_failure` passes through the failure a Fiber records for `Fiber.join`.
-- Acceptance: `node_file_system`, the library and mixed builds pass. `openai_generated_client` and `distilled_stripe` keep every method; both go over the entries budget, and both are 0.0% smaller. Solve times on this host: about 7.3 s on OpenAI and 26 s on Distilled, against a 301 ms OpenAI build without the pass.
+- Acceptance: `node_file_system`, the library and mixed builds pass. `openai_generated_client` and `distilled_stripe` keep every method; both go over the entries budget, and both are 0.0% smaller. Solve times on this host: about 7.0 s on OpenAI and 21.5 s on Distilled, against a 271 ms OpenAI build without the pass.
 - Determinism: `solve_is_deterministic` passes.
 - Measurements against `0bf641510` (example binary, one build, `MemoryMax=6G` and `ROLLDOWN_TEST_MAX_RSS_MB=4096`):
 
   | program                    | `0bf641510` vars / entries / solve / verdict | now                                      |
   | -------------------------- | -------------------------------------------- | ---------------------------------------- |
   | `node_file_system`         | 87k / 0.17M / 67 ms / within, 31 removed     | 86k / 0.16M / 62 ms / within, 31 removed |
-  | `effect_internal_analysed` | 310k / 16.0M / 4.8 s / within                | 233k / 16.0M / 8.8 s / over              |
-  | `distilled_stripe`         | 311k / 16.0M / 31 s / within                 | 289k / 16.0M / 26.3 s / over             |
-  | `openai_generated_client`  | 376k / 16.0M / 7.0 s / over                  | 374k / 16.0M / 7.3 s / over              |
+  | `effect_internal_analysed` | 310k / 16.0M / 4.8 s / within                | 233k / 16.0M / 8.2 s / over              |
+  | `distilled_stripe`         | 311k / 16.0M / 31 s / within                 | 289k / 16.0M / 21.5 s / over             |
+  | `openai_generated_client`  | 376k / 16.0M / 7.0 s / over                  | 374k / 16.0M / 7.0 s / over              |
 
   Entries are points-to entries plus copy edges at the end of the solve; an over-budget solve stops at the limit.
 

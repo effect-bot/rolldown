@@ -29,6 +29,8 @@ pub const SCOPE_KEY: &str = "effect/Scope";
 pub const MEMO_MAP_KEY: &str = "effect/Layer/CurrentMemoMap";
 pub const PARENT_SPAN_KEY: &str = "effect/Tracer/ParentSpan";
 pub const FIBER_METRICS_KEY: &str = "effect/Metric/FiberRuntimeMetrics";
+/// `Schedule.CurrentMetadata` (stable), which `repeat` and `retry` provide to each attempt.
+pub const SCHEDULE_METADATA_KEY: &str = "effect/Schedule/CurrentMetadata";
 
 /// How a public export of a modelled module is bound.
 #[derive(Clone, Copy, Debug)]
@@ -398,6 +400,20 @@ fn policy_schedule(a: &mut Analysis, site: Site, policy: VarId) -> VarId {
   let built = invoke(a, site, policy, None, vec![identity_var]);
   a.copy(built, schedule);
   schedule
+}
+
+/// `repeat`, `retry` and `retryOrElse` provide `Schedule.CurrentMetadata` to `self` before
+/// each attempt (stable API): its `input` is the previous attempt's success (repeat) or
+/// failure (retry), and its `output` the Schedule's output. Its other fields are numbers and
+/// a Duration, which the Reference's default value already supplies.
+fn provide_schedule_metadata(a: &mut Analysis, site: Site, input: VarId, output: VarId) {
+  let meta = a.site_obj(site, 24, |_| ObjKind::Object);
+  let fi = a.field(meta, &ArcStr::from("input"));
+  a.copy(input, fi);
+  let fo = a.field(meta, &ArcStr::from("output"));
+  a.copy(output, fo);
+  let v = a.key_value_var(&ArcStr::from(SCHEDULE_METADATA_KEY));
+  a.seed(v, meta);
 }
 
 fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) -> (VarId, VarId) {
@@ -1064,12 +1080,14 @@ pub fn register(a: &mut Analysis) {
     let (output, failure) = step_schedule(a, c.site, schedule, s);
     a.copy(output, os);
     a.copy(failure, of);
+    provide_schedule_metadata(a, c.site, s, output);
     a.copy(out, c.ret);
   });
   dual!(a, "effect:Effect.retry", 2, |a, c| {
     // `retry(self, options | schedule | ($) => schedule)` succeeds with `self`'s success and
     // fails with its failure or the policy's. The schedule is stepped, and `while`/`until`
-    // run, with `self`'s failure as their input; the schedule's output is discarded.
+    // run, with `self`'s failure as their input; the schedule's output reaches only the
+    // `Schedule.CurrentMetadata` provided to the next attempt.
     let e = self_effect(a, c);
     let x = arg(a, c, 1);
     let s = success_of(a, e);
@@ -1084,14 +1102,17 @@ pub fn register(a: &mut Analysis) {
       a.copy(rf, of);
     }
     let schedule = policy_schedule(a, c.site, x);
-    let (_, failure) = step_schedule(a, c.site, schedule, fl);
+    let (output, failure) = step_schedule(a, c.site, schedule, fl);
     a.copy(failure, of);
+    provide_schedule_metadata(a, c.site, fl, output);
     a.copy(out, c.ret);
   });
   dual!(a, "effect:Effect.retryOrElse", 3, |a, c| {
     // `retryOrElse(self, policy, orElse)` succeeds with `self`'s success, or, once the
     // policy's Schedule is exhausted, with what `orElse(error, out)` succeeds with, where
     // `out` is the Schedule's last output. The Schedule is stepped with `self`'s failure.
+    // Defects are not retried and share the failure slot with typed errors, so `self`'s
+    // failure also passes through.
     let e = self_effect(a, c);
     let policy = arg(a, c, 1);
     let or_else = arg(a, c, 2);
@@ -1099,8 +1120,10 @@ pub fn register(a: &mut Analysis) {
     let fl = failure_of(a, e);
     let (out, os, of) = new_effect(a, c.site, 1);
     a.copy(s, os);
+    a.copy(fl, of);
     let (output, failure) = step_schedule(a, c.site, policy, fl);
     a.copy(failure, of);
+    provide_schedule_metadata(a, c.site, fl, output);
     let r = invoke(a, c.site, or_else, None, vec![fl, output]);
     let rs = success_of(a, r);
     a.copy(rs, os);
