@@ -102,6 +102,12 @@ pub struct Shared<'l> {
   pub module_fns: IndexVec<ModuleIdx, Option<FnId>>,
   /// Modules whose exports are reached through CommonJS interop.
   pub cjs_modules: FxHashSet<ModuleIdx>,
+  /// Lazy top-level statements: the canonical symbol each declares -> its body.
+  pub lazy_decls: FxHashMap<SymbolRef, FnId>,
+  /// Every symbol reference: (the body it appears in, canonical symbol).
+  pub lazy_refs: Vec<(FnId, SymbolRef)>,
+  /// Each module's lazy top-level statements.
+  pub lazy_by_module: FxHashMap<ModuleIdx, Vec<FnId>>,
   /// Resolves an unresolved global name to a variable, via the host table.
   pub resolve_global: fn(&mut Analysis, &mut FxHashMap<ArcStr, VarId>, &str) -> VarId,
 }
@@ -136,6 +142,9 @@ pub struct ModuleFacts<'l> {
   /// Dynamic `import()` node ids -> resolved module (None: external or unresolvable).
   pub dynamic_imports: FxHashMap<usize, Option<ModuleIdx>>,
   pub default_export: SymbolRef,
+  /// Lazy top-level statements (by body index) and the symbols they declare (see
+  /// `Gen::program`).
+  pub lazy_stmts: FxHashMap<usize, Vec<SymbolRef>>,
 }
 
 pub struct Gen<'a, 'l, 's> {
@@ -147,6 +156,8 @@ pub struct Gen<'a, 'l, 's> {
   this_stack: Vec<VarId>,
   /// Enclosing class heritage variables, for `super`.
   class_stack: Vec<Option<VarId>>,
+  /// The lazy top-level statement being generated, if any.
+  lazy_owner: Option<FnId>,
   /// Whether the innermost class member being generated is static (for `super`).
   static_stack: Vec<bool>,
   generator_stack: Vec<bool>,
@@ -174,6 +185,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       cur: module_fn,
       this_stack: vec![this],
       class_stack: vec![],
+      lazy_owner: None,
       static_stack: vec![],
       generator_stack: vec![false],
       module_fn,
@@ -265,6 +277,11 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn symbol_var(&mut self, sym: SymbolRef) -> VarId {
+    // Recorded so that reaching this body activates the lazy statement declaring `sym`.
+    let owner =
+      if self.cur == self.module_fn { self.lazy_owner.unwrap_or(self.cur) } else { self.cur };
+    let canonical = self.sh.symbols.canonical_ref_for(sym);
+    self.sh.lazy_refs.push((owner, canonical));
     self.sh.symbol_var(self.a, sym)
   }
 
@@ -343,8 +360,27 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   // == program
 
   pub fn program(&mut self, program: &Program<'_>) {
-    for stmt in &program.body {
+    for (i, stmt) in program.body.iter().enumerate() {
+      let Some(declared) = self.m.lazy_stmts.get(&i).cloned() else {
+        self.statement(stmt);
+        continue;
+      };
+      // A lazy statement's constraints wait in a body of their own, like a function's, and are
+      // installed once reachable code references a symbol it declares (`LinkStage::
+      // effect_service_shaking` adds the activations once every module is generated).
+      let span = oxc::span::GetSpan::span(stmt);
+      let lazy = Self::new_fn(self.a, self.m.module, span.start, FnKind::Normal);
+      self.a.fns[lazy].leaf = false;
+      let before = self.a.fns[self.module_fn].pending.len();
+      self.lazy_owner = Some(lazy);
       self.statement(stmt);
+      self.lazy_owner = None;
+      let moved: Vec<Pending> = self.a.fns[self.module_fn].pending.drain(before..).collect();
+      self.a.fns[lazy].pending = moved;
+      for sym in declared {
+        self.sh.lazy_decls.insert(sym, lazy);
+      }
+      self.sh.lazy_by_module.entry(self.m.module).or_default().push(lazy);
     }
   }
 

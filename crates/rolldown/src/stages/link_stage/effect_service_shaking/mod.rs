@@ -29,7 +29,7 @@ use rolldown_error::{BuildDiagnostic, EventKindSwitcher};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::generate::{Gen, ModuleFacts, Shared};
-use self::heap::{Analysis, Constraint, Flavour, ObjKind};
+use self::heap::{Analysis, Constraint, Flavour, FnId, ObjKind, Pending};
 use super::LinkStage;
 
 impl LinkStage<'_> {
@@ -94,6 +94,9 @@ impl LinkStage<'_> {
       top_ext,
       module_fns: IndexVec::from_vec(vec![None; module_count]),
       cjs_modules: FxHashSet::default(),
+      lazy_decls: FxHashMap::default(),
+      lazy_refs: vec![],
+      lazy_by_module: FxHashMap::default(),
       resolve_global: host::resolve_global,
     };
 
@@ -208,6 +211,8 @@ impl LinkStage<'_> {
     }
     // Model-bound declarations that alias ordinary code, linked once every rule is bound.
     let mut links: Vec<(SymbolRef, SymbolRef)> = vec![];
+    // Symbols the model or the build reads outside generated code: their lazy statements run.
+    let mut lazy_roots: Vec<SymbolRef> = vec![];
     let mut bind_rank: FxHashMap<SymbolRef, BindRank> = FxHashMap::default();
     for module in order.iter().copied().filter(|m| modelled.contains(m)).collect::<Vec<_>>() {
       let specs = public_modules.iter().find(|(m, _)| *m == module).map(|(_, s)| *s);
@@ -259,6 +264,7 @@ impl LinkStage<'_> {
       if sh.rule_symbols.contains_key(&sym) {
         continue;
       }
+      lazy_roots.push(target);
       let to = sh.symbol_var(&mut a, target);
       let from = sh.symbol_var(&mut a, sym);
       a.copy(to, from);
@@ -268,6 +274,7 @@ impl LinkStage<'_> {
     // bundled stable `Schedule.toStep`.
     if let Some(module) = schedule_module {
       if let Some(export) = self.metas[module].resolved_exports.get(effect::SCHEDULE_TO_STEP) {
+        lazy_roots.push(export.symbol_ref);
         a.schedule_to_step = Some(sh.symbol_var(&mut a, export.symbol_ref));
       }
     }
@@ -333,6 +340,7 @@ impl LinkStage<'_> {
         cjs_imports,
         dynamic_imports,
         default_export: normal.ecma_view.default_export_ref,
+        lazy_stmts: self.lazy_statements(normal.idx, ast.program()),
       };
       let mut g = Gen::new(&mut a, &mut sh, &facts);
       g.program(ast.program());
@@ -361,6 +369,7 @@ impl LinkStage<'_> {
       let Module::Normal(normal) = &self.module_table.modules[idx] else { continue };
       let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(idx);
       for (_, symbol) in exports {
+        lazy_roots.push(symbol);
         let v = sh.symbol_var(&mut a, symbol);
         a.constrain(v, Constraint::Escape(Flavour::Ext, None));
       }
@@ -372,12 +381,45 @@ impl LinkStage<'_> {
       }
     }
 
+    // == lazy top-level statements: a reference activates the statement declaring the symbol
+    // (design.md, principle 2). Roots are the references made outside generated code.
+    {
+      let mut seen: FxHashSet<(FnId, FnId)> = FxHashSet::default();
+      for (owner, sym) in std::mem::take(&mut sh.lazy_refs) {
+        if let Some(l) = sh.lazy_decls.get(&sym).copied() {
+          if l != owner && seen.insert((owner, l)) {
+            a.fns[owner].pending.push(Pending::Activate(l));
+          }
+        }
+      }
+      for module in order.iter().copied() {
+        let Some(ns) = sh.namespace_objs.get(&module).copied() else { continue };
+        let mut all: Vec<FnId> = sh.lazy_by_module.get(&module).cloned().unwrap_or_default();
+        for (name, symbol) in self.sorted_exports(module) {
+          let canonical = self.symbols.canonical_ref_for(symbol);
+          if let Some(l) = sh.lazy_decls.get(&canonical).copied() {
+            a.lazy_exports.insert((ns, name), l);
+            all.push(l);
+          }
+        }
+        if !all.is_empty() {
+          a.lazy_namespaces.insert(ns, all);
+        }
+      }
+      for sym in lazy_roots {
+        if let Some(l) = sh.lazy_decls.get(&self.symbols.canonical_ref_for(sym)).copied() {
+          a.activate(l);
+        }
+      }
+    }
+
     // == solve
     for f in module_fns {
       a.activate(f);
     }
     phase!("solving");
     a.solve();
+
     let solved = start.elapsed();
     phase!("solved: {}", a.histogram());
     if debug {
@@ -494,6 +536,47 @@ impl LinkStage<'_> {
       .collect();
     exports.sort_unstable_by(|x, y| x.0.cmp(&y.0));
     exports
+  }
+
+  /// The top-level statements of `module` whose constraints can wait until something
+  /// references what they declare: those Rolldown finds free of side effects that declare
+  /// symbols of their own (imports and re-exports name other modules' declarations). Entry
+  /// modules run eagerly. By body index, with the declared symbols.
+  fn lazy_statements(
+    &self,
+    module: ModuleIdx,
+    program: &oxc::ast::ast::Program<'_>,
+  ) -> FxHashMap<usize, Vec<SymbolRef>> {
+    let mut lazy = FxHashMap::default();
+    if self.user_defined_entry_modules.contains(&module) {
+      return lazy;
+    }
+    let infos = &self.stmt_infos[module];
+    for (i, stmt) in program.body.iter().enumerate() {
+      let idx = rolldown_common::StmtInfoIdx::new(i + 1);
+      if idx.index() >= infos.infos.len() {
+        break;
+      }
+      let info = infos.get(idx);
+      let reexport = matches!(
+        stmt,
+        Statement::ImportDeclaration(_)
+          | Statement::ExportAllDeclaration(_)
+          | Statement::ExportFromDeclaration(_)
+      );
+      if reexport
+        || info.eval_flags.has_side_effect_for_tree_shaking()
+        || info.declared_symbols.is_empty()
+      {
+        continue;
+      }
+      let declared: Vec<SymbolRef> =
+        info.declared_symbols.iter().map(rolldown_common::TaggedSymbolRef::inner).collect();
+      if declared.iter().all(|s| self.symbols.canonical_ref_for(*s) == *s) {
+        lazy.insert(i, declared);
+      }
+    }
+    lazy
   }
 
   /// A public export and the declarations it aliases: `export const map = internal.map`

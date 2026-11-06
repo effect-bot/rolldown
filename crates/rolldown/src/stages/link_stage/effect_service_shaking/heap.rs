@@ -593,6 +593,10 @@ pub struct Analysis {
   /// The property name of each `o.name(...)` call site, as generated (clones' sites are not
   /// listed and keep the general handling).
   pub method_names: FxHashMap<Site, ArcStr>,
+  /// The lazy top-level statement behind each named export of a namespace object, and every
+  /// lazy statement behind a namespace (activated by wholesale use).
+  pub lazy_exports: FxHashMap<(ObjId, ArcStr), FnId>,
+  pub lazy_namespaces: FxHashMap<ObjId, Vec<FnId>>,
   worklist: Vec<VarId>,
   /// Constraints registered since the last solver step, to be applied to the objects their
   /// variable already holds. Kept out of the call stack so constraint cycles cannot recurse.
@@ -670,6 +674,8 @@ impl Analysis {
       schedule_to_step: None,
       exits: FxHashSet::default(),
       method_names: FxHashMap::default(),
+      lazy_exports: FxHashMap::default(),
+      lazy_namespaces: FxHashMap::default(),
       worklist: vec![],
       new_constraints: vec![],
       activation_queue: vec![],
@@ -1378,6 +1384,7 @@ impl Analysis {
   }
 
   pub fn load_name(&mut self, obj: ObjId, name: &ArcStr, dst: VarId) {
+    self.touch_namespace(obj, Some(name));
     match self.objs[obj].kind.clone() {
       ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
         self.objs[obj].demand.add(name);
@@ -1521,6 +1528,7 @@ impl Analysis {
   }
 
   fn load_unknown(&mut self, obj: ObjId, dst: VarId) {
+    self.touch_namespace(obj, None);
     match self.objs[obj].kind.clone() {
       ObjKind::Object
       | ObjKind::Array
@@ -2128,6 +2136,28 @@ impl Analysis {
   }
 
   /// The wrap of `inner`, made by the rule call at `site` the first time.
+  /// A module namespace is read by `name`, or used wholesale (`None`: an unknown name,
+  /// enumeration, spread, contents, escape): the lazy statements behind what it may yield run.
+  fn touch_namespace(&mut self, obj: ObjId, name: Option<&ArcStr>) {
+    if !matches!(self.objs[obj].kind, ObjKind::Namespace) {
+      return;
+    }
+    match name {
+      Some(n) => {
+        if let Some(l) = self.lazy_exports.get(&(obj, n.clone())).copied() {
+          self.activate(l);
+        }
+      }
+      None => {
+        if let Some(ls) = self.lazy_namespaces.remove(&obj) {
+          for l in ls {
+            self.activate(l);
+          }
+        }
+      }
+    }
+  }
+
   /// Marks a model Effect as an Exit (see `exits`).
   pub fn mark_exit(&mut self, obj: ObjId) {
     self.exits.insert(obj);
@@ -2309,6 +2339,7 @@ impl Analysis {
 
   /// Everything a value holds, for an API the pass has no model for.
   fn contents_of(&mut self, obj: ObjId, dst: VarId) {
+    self.touch_namespace(obj, None);
     match self.objs[obj].kind.clone() {
       ObjKind::Array | ObjKind::Object => {
         self.load_unknown(obj, dst);
@@ -2326,6 +2357,7 @@ impl Analysis {
   }
 
   pub fn enumerate(&mut self, obj: ObjId) {
+    self.touch_namespace(obj, None);
     match self.objs[obj].kind.clone() {
       ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
         self.objs[obj].demand.all();
@@ -2343,6 +2375,7 @@ impl Analysis {
   }
 
   fn spread_into(&mut self, obj: ObjId, target: ObjId) {
+    self.touch_namespace(obj, None);
     match self.objs[obj].kind {
       ObjKind::Object | ObjKind::Array | ObjKind::Class { .. } | ObjKind::Closure(_) => {
         // Reads on the target reach this object through `spread_from`; also record the
@@ -2416,6 +2449,7 @@ impl Analysis {
       return;
     }
     self.objs[obj].escaped = Some(flavour);
+    self.touch_namespace(obj, None);
     // Host builtins never look inside their arguments (a wrong builtin model is a compiler
     // bug): a plain object handed to one keeps its shape, and runtime objects stay sealed. Only
     // the closures it holds become reachable, with unknown arguments. External code may do
