@@ -873,6 +873,8 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       .alloc(ObjKind::Class { ctor: None, heritage, prototype }, Some(self.site(c.span.start)));
     let cv = self.fresh();
     self.seed(cv, class_obj);
+    // `C.prototype.constructor` is `C`.
+    self.store(prototype, Key::Name(ArcStr::from("constructor")), cv);
     if let Some(h) = heritage {
       let pv = self.a.proto_var(class_obj);
       self.copy(h, pv);
@@ -987,41 +989,51 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       Expression::StaticMemberExpression(m) => {
         let obj = self.member_object(&m.object);
         let f = self.load(obj, Key::Name(ArcStr::from(m.property.name.as_str())));
-        (f, Some(obj))
+        (f, Some(self.receiver(&m.object, obj)))
       }
       Expression::ComputedMemberExpression(m) => {
         let obj = self.member_object(&m.object);
         let key = self.key_of_expr(&m.expression);
         let f = self.load(obj, key);
-        (f, Some(obj))
+        (f, Some(self.receiver(&m.object, obj)))
       }
       Expression::PrivateFieldExpression(m) => {
         let obj = self.member_object(&m.object);
         let f = self.load(obj, Key::Name(ArcStr::from(format!("#{}", m.field.name.as_str()))));
-        (f, Some(obj))
+        (f, Some(self.receiver(&m.object, obj)))
       }
       Expression::ParenthesizedExpression(p) => self.callee(&p.expression),
       Expression::ChainExpression(c) => match &c.expression {
         ChainElement::StaticMemberExpression(m) => {
           let obj = self.member_object(&m.object);
           let f = self.load(obj, Key::Name(ArcStr::from(m.property.name.as_str())));
-          (f, Some(obj))
+          (f, Some(self.receiver(&m.object, obj)))
         }
         ChainElement::ComputedMemberExpression(m) => {
           let obj = self.member_object(&m.object);
           let key = self.key_of_expr(&m.expression);
           let f = self.load(obj, key);
-          (f, Some(obj))
+          (f, Some(self.receiver(&m.object, obj)))
         }
         ChainElement::PrivateFieldExpression(m) => {
           let obj = self.member_object(&m.object);
           let f = self.load(obj, Key::Name(ArcStr::from(format!("#{}", m.field.name.as_str()))));
-          (f, Some(obj))
+          (f, Some(self.receiver(&m.object, obj)))
         }
         ChainElement::CallExpression(c) => (self.call_expression(c), None),
         ChainElement::TSNonNullExpression(e) => self.callee(&e.expression),
       },
       other => (self.expr(other), None),
+    }
+  }
+
+  /// The `this` a method call on `object` passes: `super.m()` looks `m` up on the parent
+  /// prototype but calls it with the current `this`.
+  fn receiver(&self, object: &Expression<'_>, looked_up_on: VarId) -> VarId {
+    if matches!(object, Expression::Super(_)) {
+      *self.this_stack.last().unwrap()
+    } else {
+      looked_up_on
     }
   }
 

@@ -1867,8 +1867,8 @@ impl Analysis {
     }
   }
 
-  /// `F.prototype` of an ordinary function: a default object until code replaces it, as
-  /// JavaScript creates one with every function that can be a constructor.
+  /// `F.prototype` of an ordinary function: a default object, whose `constructor` is `F`, until
+  /// code replaces it, as JavaScript creates one with every function that can be a constructor.
   pub fn function_prototype(&mut self, closure: ObjId, f: FnId) -> VarId {
     let field = self.field(closure, &ArcStr::from("prototype"));
     if matches!(self.fns[f].kind, FnKind::Normal | FnKind::Generator)
@@ -1880,6 +1880,9 @@ impl Analysis {
         |_| ObjKind::Object,
       );
       self.seed(field, proto);
+      // `F.prototype.constructor` is `F`.
+      let constructor = self.field(proto, &ArcStr::from("constructor"));
+      self.seed(constructor, closure);
     }
     field
   }
