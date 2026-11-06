@@ -264,7 +264,8 @@ impl LinkStage<'_> {
       a.copy(to, from);
     }
 
-    // `Effect.repeat` steps a Schedule through the bundled stable `Schedule.toStep`.
+    // `Effect.repeat` and `Effect.retry` step a Schedule through the bundled stable
+    // `Schedule.toStep`.
     if let Some(module) = schedule_module {
       if let Some(export) = self.metas[module].resolved_exports.get(effect::SCHEDULE_TO_STEP) {
         a.schedule_to_step = Some(sh.symbol_var(&mut a, export.symbol_ref));

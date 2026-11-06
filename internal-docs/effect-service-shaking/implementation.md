@@ -42,28 +42,28 @@ Environment variables, all opt-in:
 
 ## Tests
 
-- Fixtures: `crates/rolldown/tests/rolldown/tree_shaking/effect_service/` (122 real-`effect` programs). The README there has one row per fixture with its status. Run them with `cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service`.
+- Fixtures: `crates/rolldown/tests/rolldown/tree_shaking/effect_service/` (124 real-`effect` programs). The README there has one row per fixture with its status. Run them with `cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service`.
 - Acceptance: `crates/rolldown/tests/rolldown/topics/effect_service_acceptance/` builds each program in `programs/` with the pass off and on. It checks behaviour, removed names and the size reduction. `solve_is_deterministic` there builds `node_file_system` five times and requires the same bundle and the same solve (the variables, objects, solver steps and removals of the pass's `effect service shaking` debug event).
 - Timing: `cargo run --profile effect-verify -p rolldown --example effect_service_shaking -- <entry> <out-dir> 7` alternates off/on builds and prints medians.
 - Every run is under `rolldown_testing::memory_guard` (`ROLLDOWN_TEST_MAX_RSS_MB`).
 
 ## Current status
 
-- Fixtures: 117 of 122 pass.
+- Fixtures: 118 of 124 pass.
   - `dynamic_key_prefix` waits for prefix narrowing.
   - `effect_internal_analysed`, `schema_concurrency_no_fiber` and `schema_concurrency_context` keep every method because the solve goes over the entries budget (see design.md, "Precision on Schema-heavy programs").
-  - `internal_combinator_caller` runs correctly, since `Effect.repeat` now succeeds with the Schedule's output (stepped with the stable `Schedule.toStep`), but keeps `writeOne`: the ambient Context merges into `Schedule`/`Duration` values and is read as reflection.
-  - `exit_view_of_effect` and `fiber_observer_exit` pass through the Exit (`_tag`, `value`, `cause`) and Fiber (`addObserver`, `pollUnsafe`) member rules.
-- Acceptance: `node_file_system`, the library and mixed builds pass. `openai_generated_client` and `distilled_stripe` keep every method; both go over the entries budget, and both are 0.0% smaller. Solve times on this host: about 10.5 s on OpenAI and 84 s on Distilled, against a 270 ms OpenAI build without the pass.
+  - `internal_combinator_caller` and `retry_schedule_callback` run correctly but keep the unread method. `Effect.repeat` succeeds with the Schedule's output, and `Effect.retry` steps its Schedule with `self`'s failure, both through the stable `Schedule.toStep`. The ambient Context then merges into `Schedule`/`Duration` values and is read as reflection.
+  - `exit_view_of_effect` and `fiber_observer_exit` pass through the Exit (`_tag`, `value`, `cause`) and Fiber (`addObserver`, `pollUnsafe`) member rules. `fiber_join_failure` passes through the failure a Fiber records for `Fiber.join`.
+- Acceptance: `node_file_system`, the library and mixed builds pass. `openai_generated_client` and `distilled_stripe` keep every method; both go over the entries budget, and both are 0.0% smaller. Solve times on this host: about 7.1 s on OpenAI and 19.6 s on Distilled, against a 277 ms OpenAI build without the pass.
 - Determinism: `solve_is_deterministic` passes.
 - Measurements against `0bf641510` (example binary, one build, `MemoryMax=6G` and `ROLLDOWN_TEST_MAX_RSS_MB=4096`):
 
-  | program | `0bf641510` vars / entries / solve / verdict | now |
-  | --- | --- | --- |
-  | `node_file_system` | 87k / 0.17M / 67 ms / within, 31 removed | 86k / 0.16M / 66 ms / within, 31 removed |
-  | `effect_internal_analysed` | 310k / 16.0M / 4.8 s / within | 230k / 16.0M / 16.7 s / over |
-  | `distilled_stripe` | 311k / 16.0M / 31 s / within | 291k / 16.0M / 84 s / over |
-  | `openai_generated_client` | 376k / 16.0M / 7.0 s / over | 374k / 16.0M / 10.5 s / over |
+  | program                    | `0bf641510` vars / entries / solve / verdict | now                                      |
+  | -------------------------- | -------------------------------------------- | ---------------------------------------- |
+  | `node_file_system`         | 87k / 0.17M / 67 ms / within, 31 removed     | 86k / 0.16M / 62 ms / within, 31 removed |
+  | `effect_internal_analysed` | 310k / 16.0M / 4.8 s / within                | 234k / 16.0M / 17.0 s / over             |
+  | `distilled_stripe`         | 311k / 16.0M / 31 s / within                 | 292k / 16.0M / 19.6 s / over             |
+  | `openai_generated_client`  | 376k / 16.0M / 7.0 s / over                  | 374k / 16.0M / 7.1 s / over              |
 
   Entries are points-to entries plus copy edges at the end of the solve; an over-budget solve stops at the limit.
 

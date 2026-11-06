@@ -49,7 +49,8 @@ pub enum Spec {
   PipeableClass,
 }
 
-/// The public Schedule module, and the stable export `Effect.repeat` steps a Schedule with.
+/// The public Schedule module, and the stable export `Effect.repeat` and `Effect.retry` step a
+/// Schedule with.
 pub const SCHEDULE_MODULE: &str = "/dist/Schedule.js";
 pub const SCHEDULE_TO_STEP: &str = "toStep";
 
@@ -192,7 +193,7 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("onExitPrimitive", Spec::Rule("effect:Effect.onExit")),
       ("ensuring", Spec::Rule("effect:Effect.passthrough")),
       ("onInterrupt", Spec::Rule("effect:Effect.passthrough")),
-      ("retry", Spec::Rule("effect:Effect.passthrough")),
+      ("retry", Spec::Rule("effect:Effect.retry")),
       ("retryOrElse", Spec::Rule("effect:Effect.orElseSucceed")),
       ("repeat", Spec::Rule("effect:Effect.repeat")),
       ("forever", Spec::Rule("effect:Effect.passthrough")),
@@ -383,6 +384,22 @@ fn fiber(a: &mut Analysis) -> VarId {
 /// `[output, delay]` or ends by failing with `Cause.Done(output)` (stable `Done.value`).
 /// Without a bundled `effect/Schedule`, a Schedule can only come from code the pass can't see:
 /// it is handed over, and its output is unknown.
+/// The Schedule a `repeat`/`retry` policy denotes: the policy itself, its `schedule` option,
+/// or what a builder returns when called with `identity`.
+fn policy_schedule(a: &mut Analysis, site: Site, policy: VarId) -> VarId {
+  let schedule = a.var();
+  a.copy(policy, schedule);
+  let opt = load(a, policy, "schedule");
+  a.copy(opt, schedule);
+  let id = a.rule_id("effect:identity").unwrap();
+  let identity = a.builtin(id, None, None);
+  let identity_var = a.var();
+  a.seed(identity_var, identity);
+  let built = invoke(a, site, policy, None, vec![identity_var]);
+  a.copy(built, schedule);
+  schedule
+}
+
 fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) -> (VarId, VarId) {
   let output = a.var();
   let failure = a.var();
@@ -1043,18 +1060,31 @@ pub fn register(a: &mut Analysis) {
       let rf = failure_of(a, r);
       a.copy(rf, of);
     }
-    let schedule = a.var();
-    a.copy(x, schedule);
-    let opt = load(a, x, "schedule");
-    a.copy(opt, schedule);
-    let id = a.rule_id("effect:identity").unwrap();
-    let identity = a.builtin(id, None, None);
-    let identity_var = a.var();
-    a.seed(identity_var, identity);
-    let built = invoke(a, c.site, x, None, vec![identity_var]);
-    a.copy(built, schedule);
+    let schedule = policy_schedule(a, c.site, x);
     let (output, failure) = step_schedule(a, c.site, schedule, s);
     a.copy(output, os);
+    a.copy(failure, of);
+    a.copy(out, c.ret);
+  });
+  dual!(a, "effect:Effect.retry", 2, |a, c| {
+    // `retry(self, options | schedule | ($) => schedule)` succeeds with `self`'s success and
+    // fails with its failure or the policy's. The schedule is stepped, and `while`/`until`
+    // run, with `self`'s failure as their input; the schedule's output is discarded.
+    let e = self_effect(a, c);
+    let x = arg(a, c, 1);
+    let s = success_of(a, e);
+    let fl = failure_of(a, e);
+    let (out, os, of) = new_effect(a, c.site, 1);
+    a.copy(s, os);
+    a.copy(fl, of);
+    for name in ["while", "until"] {
+      let f = load(a, x, name);
+      let r = invoke(a, c.site, f, None, vec![fl]);
+      let rf = failure_of(a, r);
+      a.copy(rf, of);
+    }
+    let schedule = policy_schedule(a, c.site, x);
+    let (_, failure) = step_schedule(a, c.site, schedule, fl);
     a.copy(failure, of);
     a.copy(out, c.ret);
   });
