@@ -1582,7 +1582,44 @@ impl Analysis {
 
   fn call(&mut self, callee: ObjId, call: &Call) {
     match self.objs[callee].kind.clone() {
+      ObjKind::Closure(f) if call.is_new && call.this.is_none() => {
+        // `new F(...)` on a function constructor: an instance per function, whose prototype is
+        // `F.prototype`, and the body writes to it through `this`. An object the body returns
+        // replaces the instance, so the result also takes the body's return values.
+        let instance = self.site_obj(
+          Site { module: self.fns[f].module, start: callee.raw(), sub: 0 },
+          201,
+          |_| ObjKind::Object,
+        );
+        let pv = self.proto_var(instance);
+        let prototype = self.field(callee, &ArcStr::from("prototype"));
+        self.copy(prototype, pv);
+        self.call_fn(f, call, Some(instance));
+        let ret = self.fns[f].ret;
+        self.copy(ret, call.ret);
+        self.seed(call.ret, instance);
+      }
       ObjKind::Closure(f) => self.call_fn(f, call, None),
+      ObjKind::Class { ctor, heritage, .. } if call.is_new && call.this.is_some() => {
+        // A parent constructor run on the instance a derived class is building (the arm below
+        // makes this call for every class with a heritage): it writes to that instance, not to
+        // an instance of its own, and runs its own parent on it in turn.
+        if let Some(h) = heritage {
+          let ret = self.var();
+          let parent_call = Call {
+            site: call.site,
+            this: call.this,
+            args: call.args.clone(),
+            ret,
+            is_new: true,
+            builtin: None,
+          };
+          self.constrain(h, Constraint::Call(Box::new(parent_call)));
+        }
+        if let Some(f) = ctor {
+          self.call_fn(f, call, None);
+        }
+      }
       ObjKind::Class { ctor, heritage, prototype } => {
         // `new C(...)` (or a bare call, treated the same): an instance per class.
         let instance = self.site_obj(
