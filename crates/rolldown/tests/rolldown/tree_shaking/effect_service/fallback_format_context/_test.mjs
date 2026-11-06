@@ -5,11 +5,12 @@ import path from 'node:path';
 // The program asserts its own output when imported.
 await import('./dist/main.js');
 
-// Effect's Formatter enumerates the Store service: every method stays.
+// Formatter.format walks the Store service's keys, which keeps nothing.
 const code = fs.readFileSync(path.join(import.meta.dirname, 'dist/main.js'), 'utf8');
-for (const name of ['formatUnused', 'formatUnusedHelper']) {
-  assert.match(code, new RegExp(`\\b${name}\\b`), `${name} should be kept`);
+// The service literal is written with shorthand properties.
+for (const name of ['readOne']) {
+  assert.match(code, new RegExp(`(?<![.\\w$])${name}\\s*[:,}]`), `${name} should be kept`);
 }
-for (const name of []) {
+for (const name of ['formatUnused', 'formatUnusedHelper']) {
   assert.doesNotMatch(code, new RegExp(`\\b${name}\\b`), `${name} should be removed`);
 }

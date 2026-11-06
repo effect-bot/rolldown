@@ -1,0 +1,10 @@
+{
+  "_comment": "Structural Equal.equals and Hash.hash on plain objects, arrays and Data values walk a service field by field, which keeps nothing (Tim's decision), so its unread method is removed; a service's own [Equal.symbol] and [Hash.symbol], which equality and hashing call, stay (the program's results depend on them).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

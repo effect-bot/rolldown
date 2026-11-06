@@ -1,5 +1,5 @@
 {
-  "_comment": "Formatter.format, Effect code the pass analyses generically, prints the service the program reads out of its Context with Context.get; it enumerates the service, so every method stays and the printed output does not change.",
+  "_comment": "Formatter.format prints the service the program reads out of its Context with Context.get. Effect's formatting is treated like user formatting (Tim's decision): walking the service's keys keeps nothing, so the unread method and its helper are removed; the program asserts only on the method it reads.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

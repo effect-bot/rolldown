@@ -1,0 +1,10 @@
+{
+  "_comment": "A service in a Cause printed with Cause.pretty, and a service logged as a log annotation by the built-in logger: Effect's formatting keeps nothing (Tim's decision), so the unread method is removed. Today both keep every method through an unknown-key read on the service that is not one of the formatting walks.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
