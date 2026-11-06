@@ -42,14 +42,16 @@ Environment variables, all opt-in:
 
 ## Tests
 
-- Fixtures: `crates/rolldown/tests/rolldown/tree_shaking/effect_service/` (116 real-`effect` programs). The README there has one row per fixture with its status. Run them with `cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service`.
+- Fixtures: `crates/rolldown/tests/rolldown/tree_shaking/effect_service/` (122 real-`effect` programs). The README there has one row per fixture with its status. Run them with `cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service`.
 - Acceptance: `crates/rolldown/tests/rolldown/topics/effect_service_acceptance/` builds each program in `programs/` with the pass off and on. It checks behaviour, removed names and the size reduction. `solve_is_deterministic` there builds `node_file_system` five times and requires the same bundle and the same solve (the variables, objects, solver steps and removals of the pass's `effect service shaking` debug event).
 - Timing: `cargo run --profile effect-verify -p rolldown --example effect_service_shaking -- <entry> <out-dir> 7` alternates off/on builds and prints medians.
 - Every run is under `rolldown_testing::memory_guard` (`ROLLDOWN_TEST_MAX_RSS_MB`).
 
 ## Current status
 
-- Fixtures: 114 of 116 pass. `dynamic_key_prefix` waits for prefix narrowing. `effect_internal_analysed` keeps every method, within the budget (about 310k variables, 3.7 s solve); see design.md, "Precision on Schema-heavy programs".
+- Fixtures: 115 of 122 pass. `dynamic_key_prefix` waits for prefix narrowing. `effect_internal_analysed` keeps every method, within the budget (about 310k variables, 3.7 s solve); see design.md, "Precision on Schema-heavy programs". Five regressions for the next binding increment are red:
+  - Three bundles throw. In `exit_view_of_effect` and `fiber_observer_exit`, a public member read on a model Effect or Fiber that has no rule records no demand. In `internal_combinator_caller`, `Effect.repeat` is modelled as a passthrough, but with a schedule it succeeds with the schedule's output.
+  - `schema_concurrency_no_fiber` and `schema_concurrency_context` keep the unread method, because the default rule on Schema's internal helpers hands Schema a Fiber.
 - Acceptance: `node_file_system`, the library and mixed builds pass. `openai_generated_client` and `distilled_stripe` keep every method. OpenAI goes over its budget on entries: 14.2M points-to entries plus 1.8M copy edges pass the 16M limit, in the example binary and in the suite alike, so its bundle is unchanged (0.0% smaller). Distilled stays within the budget but reads Schema fields on the ambient Context, and it is also 0.0% smaller. Both are also far over the time target: the solve takes about 4.6 s on OpenAI and 13 s on Distilled, against a 247 ms OpenAI build without the pass.
 - Determinism: `solve_is_deterministic` passes. Repeated builds give the same variables, objects, solver steps, budget verdict and bundle: `node_file_system` 87,452 / 7,797 / 183,023 steps, `effect_internal_analysed` 310,395 / 20,446 / 10.9M, `distilled_stripe` 310,613 / 21,351 / 25.5M, OpenAI 375,882 / 45,304 / 7.8M (over budget every time). Before the walks were ordered (see Data flow, step 2), `ModuleIdx` order differed in every build, the step count of `node_file_system` ranged from about 178,600 to 183,200, and the larger programs' variable counts and budget verdicts changed from build to build.
 

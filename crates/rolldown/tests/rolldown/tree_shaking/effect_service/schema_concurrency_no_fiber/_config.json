@@ -1,0 +1,10 @@
+{
+  "_comment": "Decoding a Struct holding an Array and a Union with concurrency runs Schema's internal resolveConcurrency, iterateEager and iterateConcurrent; none of them hands Schema a Fiber or a Context, so the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

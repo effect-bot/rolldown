@@ -1,0 +1,10 @@
+{
+  "_comment": "Schedule (a public module outside the model) maps a user callback's Effect with internal/effect.js's map, and Effect.repeat with that schedule succeeds with the schedule's output, the service: the method read on it stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "Effect.succeed is an Exit at run time, and Exit.isExit/isSuccess plus .value read the service through that public view: the method read there stays, the unread one is removed (miscompile regression).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

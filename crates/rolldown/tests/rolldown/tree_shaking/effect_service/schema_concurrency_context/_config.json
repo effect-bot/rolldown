@@ -1,0 +1,10 @@
+{
+  "_comment": "A transformation's decode, run concurrently by Schema, reads one service from Effect.context() with Context.get: that method stays and the service's other method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

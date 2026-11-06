@@ -1,0 +1,10 @@
+{
+  "_comment": "A transformation's decode yields the service and puts it in the decoded output; concurrent decoding runs it on forked fibers, and the program calls a method on it: that method stays and the program runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
