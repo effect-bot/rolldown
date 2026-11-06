@@ -1,0 +1,10 @@
+{
+  "_comment": "A prototype's `constructor` property refers back to its function or class: a constructor recovered through `F.prototype.constructor` or `instance.constructor` builds instances whose service methods are read, so those stay and the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

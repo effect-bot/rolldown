@@ -1,0 +1,10 @@
+{
+  "_comment": "`super.method()` looks the method up on the parent prototype but calls it with the current `this`: the parent method reads the instance's field, so the service method read on its result stays and the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
