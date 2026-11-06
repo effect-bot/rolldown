@@ -1,0 +1,10 @@
+{
+  "_comment": "Soundness guards for pipe forwarders: a forwarder called with another receiver through `.call`, one given spread functions, and a lookalike whose `pipeArguments` is a local function each read one service method, which stays; the method nothing reads is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

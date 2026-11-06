@@ -1,0 +1,10 @@
+{
+  "_comment": "A bundled `pipe() { return pipeArguments(this, arguments) }` forwarder is called at more sites than the clone cap: two later calls each read one method of their own service, so each service's other method is removed (the forwarder is the Pipeable pipe, not a function whose overflow callers share one receiver).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

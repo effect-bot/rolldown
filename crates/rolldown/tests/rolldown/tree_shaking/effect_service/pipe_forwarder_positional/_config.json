@@ -1,0 +1,10 @@
+{
+  "_comment": "`store.pipe(f, g)` through a bundled pipe forwarder: each function receives only the previous step's result, so the service's `step`, read by name only by `g` on `f`'s result, is removed; `first`, which `f` calls on the service, stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
