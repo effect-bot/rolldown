@@ -1,0 +1,10 @@
+{
+  "_comment": "A Context written to a ManagedRuntime's public, writable cachedContext provides its services to every run on that runtime: the method the run reads stays and the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

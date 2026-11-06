@@ -22,9 +22,7 @@ const program = Effect.gen(function* () {
   holder.context = yield* Effect.context();
   const held = yield* Holder;
   const out = [];
-  for (const service of held.context.mapUnsafe.values()) {
-    if (typeof service[name] === 'function') out.push(service[name]());
-  }
+  out.push(Context.get(held.context, Store)[name]());
   return [(yield* Store).readOne(), out];
 });
 assert.deepStrictEqual(await Effect.runPromise(Effect.provide(program, StoreLayer)), ['r', ['u']]);

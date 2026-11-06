@@ -1,5 +1,5 @@
 {
-  "_comment": "Retention: the provided value is plain data, but the program later stores the ambient Context into the same allocation and enumerates it through the service. Uses the real effect package from the repository devDependencies.",
+  "_comment": "Retention: the provided value is plain data, but the program later stores the ambient Context into the same allocation and reads Store out of it through the service, calling it by a computed name. Uses the real effect package from the repository devDependencies.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

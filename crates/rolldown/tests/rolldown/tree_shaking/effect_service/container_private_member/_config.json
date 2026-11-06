@@ -1,0 +1,10 @@
+{
+  "_comment": "Non-public members of Effect's containers (a MemoMap's map, a Context's base, a property written to a Layer) are empty slots: reads and writes through them keep nothing, so the methods read only there are removed and the bundle is not run.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -24,9 +24,7 @@ const AppLayer = Layer.provideMerge(BoxLayer, StoreLayer);
 const program = Effect.gen(function* () {
   const box = Context.get(yield* Effect.context(), Box);
   const out = [];
-  for (const service of box.context.mapUnsafe.values()) {
-    if (typeof service[name] === 'function') out.push(service[name]());
-  }
+  out.push(Context.get(box.context, Store)[name]());
   return [(yield* Store).readOne(), out];
 });
 assert.deepStrictEqual(await Effect.runPromise(Effect.provide(program, AppLayer)), ['r', ['u']]);

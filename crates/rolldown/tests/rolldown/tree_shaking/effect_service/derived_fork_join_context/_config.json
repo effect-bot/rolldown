@@ -1,5 +1,5 @@
 {
-  "_comment": "A child fiber succeeds with its Context and Fiber.join hands it to the program, which enumerates it: every method of its entries stays.",
+  "_comment": "A child fiber succeeds with its Context and Fiber.join hands it to the program, which reads Store out of it with Context.get and calls a method named at run time: every method stays.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

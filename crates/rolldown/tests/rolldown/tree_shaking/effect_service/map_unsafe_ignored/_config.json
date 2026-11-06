@@ -1,0 +1,11 @@
+{
+  "_comment": "Context.mapUnsafe is ignored (Tim's decision): a static read, an enumeration called by a run-time name, a write through it and handing it to an external module all keep nothing, so every method read only through it is removed and the bundle is not run.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./late.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

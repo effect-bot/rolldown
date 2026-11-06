@@ -1,5 +1,5 @@
 {
-  "_comment": "A Context in the failure channel reaches a catch handler that enumerates it: every method of its entries stays.",
+  "_comment": "A Context in the failure channel reaches a catch handler that reads Store out of it with Context.get and calls a method named at run time: every method stays.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

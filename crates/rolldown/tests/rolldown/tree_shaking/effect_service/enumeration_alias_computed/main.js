@@ -3,8 +3,8 @@ import * as Context from 'effect/Context';
 import * as Effect from 'effect/Effect';
 import * as Layer from 'effect/Layer';
 
-// Control: an enumerated service read by a name built at run time may use any
-// method. Every method stays.
+// Control: a service read out of the Context with `Context.get` and called by
+// a name built at run time may use any method. Every method stays.
 const Store = Context.Service('test/RealEnumerationComputed');
 const enumComputedUnusedHelper = () => 'enumComputedUnused';
 const StoreLayer = Layer.effect(
@@ -21,9 +21,7 @@ const program = Effect.gen(function* () {
   const context = yield* Effect.context();
   const name = ['enumComputed', 'Unused'].join('');
   const results = [];
-  for (const service of context.mapUnsafe.values()) {
-    if (typeof service[name] === 'function') results.push(service[name]());
-  }
+  results.push(Context.get(context, Store)[name]());
   return [store.readOne(), results];
 });
 

@@ -1,5 +1,5 @@
 {
-  "_comment": "A Context collected by Effect.all reaches the program, which enumerates it and reads a method named at run time: every method of its entries stays.",
+  "_comment": "A Context collected by Effect.all reaches the program, which reads Store out of it with Context.get and calls a method named at run time: every method stays.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

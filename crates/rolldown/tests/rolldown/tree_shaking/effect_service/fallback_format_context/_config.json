@@ -1,5 +1,5 @@
 {
-  "_comment": "A Context handed to Formatter.format, Effect code the pass analyses generically; it enumerates the services, so every method stays and the printed output does not change.",
+  "_comment": "Formatter.format, Effect code the pass analyses generically, prints the service the program reads out of its Context with Context.get; it enumerates the service, so every method stays and the printed output does not change.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

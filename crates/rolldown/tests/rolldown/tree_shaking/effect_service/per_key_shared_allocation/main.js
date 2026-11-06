@@ -15,8 +15,7 @@ const StoreLayer = Layer.effect(
 );
 const name = ['sharedAlloc', 'Unused'].join('');
 // The provided value is plain data, but the program stores the Context into
-// the same allocation later: enumerating it through the service reads every
-// service.
+// the same allocation later and reads Store out of it through the service.
 const shared = { context: undefined };
 const Box = Context.Service('test/RealPerKeySharedAllocationBox');
 const BoxLayer = Layer.succeed(Box, Box.of({ shared }));
@@ -24,9 +23,7 @@ const program = Effect.gen(function* () {
   shared.context = yield* Effect.context();
   const box = yield* Box;
   const out = [];
-  for (const service of box.shared.context.mapUnsafe.values()) {
-    if (typeof service[name] === 'function') out.push(service[name]());
-  }
+  out.push(Context.get(box.shared.context, Store)[name]());
   return [(yield* Store).readOne(), out];
 });
 assert.deepStrictEqual(

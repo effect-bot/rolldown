@@ -4,8 +4,8 @@ import * as Effect from 'effect/Effect';
 import * as Layer from 'effect/Layer';
 
 // `Effect.withFiber` hands its closure the running fiber. The closure
-// enumerates the fiber's Context and calls `fiberPing` on every service that
-// has it. `fiberPing` is demanded of every service; other unread methods go.
+// reads Store out of the fiber's Context with `Context.get` and calls
+// `fiberPing`. `fiberPing` is demanded; other unread methods go.
 const Store = Context.Service('test/RealWithFiberEnumeration');
 const fiberUnusedHelper = () => 'unused';
 const StoreLayer = Layer.effect(
@@ -20,9 +20,7 @@ const StoreLayer = Layer.effect(
 
 const pings = Effect.withFiber((fiber) => {
   const out = [];
-  for (const service of fiber.context.mapUnsafe.values()) {
-    if (typeof service.fiberPing === 'function') out.push(service.fiberPing());
-  }
+  out.push(Context.get(fiber.context, Store).fiberPing());
   return Effect.succeed(out);
 });
 

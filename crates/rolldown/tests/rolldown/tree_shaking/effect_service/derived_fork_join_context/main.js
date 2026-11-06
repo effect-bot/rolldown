@@ -21,9 +21,7 @@ const StoreLayer = Layer.effect(
 const name = ['forkJoin', 'Unused'].join('');
 const callAll = (context) => {
   const out = [];
-  for (const service of context.mapUnsafe.values()) {
-    if (typeof service[name] === 'function') out.push(service[name]());
-  }
+  out.push(Context.get(context, Store)[name]());
   return out;
 };
 

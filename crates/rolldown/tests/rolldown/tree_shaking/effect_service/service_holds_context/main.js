@@ -5,7 +5,7 @@ import * as Layer from 'effect/Layer';
 
 // A service built from the Context holds it, and its Layer is a const passed
 // to Effect.provide: the program reads the Context out of the service and
-// calls, on every service in it, the method named at run time.
+// calls the method named at run time on the Store it reads out of it.
 const Store = Context.Service('test/RealServiceHoldsContext');
 const heldUnusedHelper = () => 'u';
 const StoreLayer = Layer.effect(
@@ -29,9 +29,7 @@ const AppLayer = Layer.provideMerge(BoxLayer, StoreLayer);
 const program = Effect.gen(function* () {
   const box = yield* Box;
   const out = [];
-  for (const service of box.context.mapUnsafe.values()) {
-    if (typeof service[name] === 'function') out.push(service[name]());
-  }
+  out.push(Context.get(box.context, Store)[name]());
   return [(yield* Store).readOne(), out];
 });
 

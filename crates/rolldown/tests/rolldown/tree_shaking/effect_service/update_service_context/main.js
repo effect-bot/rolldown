@@ -20,9 +20,7 @@ const BoxLayer = Layer.succeed(Box, Box.of({ context: undefined }));
 const inner = Effect.gen(function* () {
   const box = yield* Box;
   const out = [];
-  for (const service of box.context.mapUnsafe.values()) {
-    if (typeof service[name] === 'function') out.push(service[name]());
-  }
+  out.push(Context.get(box.context, Store)[name]());
   return [(yield* Store).readOne(), out];
 });
 const program = Effect.gen(function* () {

@@ -1,5 +1,5 @@
 {
-  "_comment": "runPromise resolves with the Context the Effect succeeds with; the program enumerates it: every method of its entries stays.",
+  "_comment": "runPromise resolves with the Context the Effect succeeds with; the program reads Store out of it with Context.get and calls a method named at run time: every method stays.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

@@ -1,5 +1,5 @@
 {
-  "_comment": "Retention: Effect.service yields a service holding the ambient Context, which the program enumerates and calls by a computed name, so every method stays. Uses the real effect package from the repository devDependencies.",
+  "_comment": "Retention: Effect.service yields a service holding the ambient Context; the program reads Store out of it with Context.get and calls it by a computed name, so every method stays. Uses the real effect package from the repository devDependencies.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

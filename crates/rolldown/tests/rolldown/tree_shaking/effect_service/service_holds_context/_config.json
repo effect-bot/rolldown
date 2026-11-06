@@ -1,5 +1,5 @@
 {
-  "_comment": "A service built from Effect.context() holds the Context; the program enumerates it out of the service, so Store's entries bail and heldUnused stays.",
+  "_comment": "A service built from Effect.context() holds the Context; the program reads Store out of it with Context.get and calls a computed name, so Store bails and heldUnused stays.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

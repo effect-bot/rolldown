@@ -1,5 +1,5 @@
 {
-  "_comment": "Services enumerated from a Context and read by a static name: that name is demanded of every key, other unread methods are still removed.",
+  "_comment": "Store read out of a Context with Context.get and called by a static name: that name is demanded, other unread methods are still removed.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

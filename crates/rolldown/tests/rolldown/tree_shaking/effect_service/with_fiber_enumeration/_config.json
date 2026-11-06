@@ -1,5 +1,5 @@
 {
-  "_comment": "An Effect.withFiber closure enumerates fiber.context and calls fiberPing on every service: fiberPing is demanded of every key, other unread methods are removed.",
+  "_comment": "An Effect.withFiber closure reads Store out of fiber.context with Context.get and calls fiberPing: fiberPing is demanded, other unread methods are removed.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

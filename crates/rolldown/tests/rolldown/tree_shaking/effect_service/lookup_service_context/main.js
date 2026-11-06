@@ -25,9 +25,7 @@ const program = Effect.service(Box).pipe(
   Effect.flatMap((box) =>
     Effect.gen(function* () {
       const out = [];
-      for (const service of box.context.mapUnsafe.values()) {
-        if (typeof service[name] === 'function') out.push(service[name]());
-      }
+      out.push(Context.get(box.context, Store)[name]());
       return [(yield* Store).readOne(), out];
     }),
   ),
