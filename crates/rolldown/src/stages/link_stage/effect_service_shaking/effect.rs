@@ -2157,17 +2157,29 @@ pub fn register(a: &mut Analysis) {
     a.copy(arity, af);
     let bf = a.field(obj, &ArcStr::from("body"));
     a.copy(body, bf);
+    // A literal arity (`dual(2, body)`) is already in the argument when this runs. It is
+    // recorded on the builtin, because `dual.fn` decides full or partial once per call site and
+    // the `arity` field's load may not have propagated by then: an unknown arity takes both
+    // branches, which turned every full call's result into a partial too. A predicate arity
+    // (`dual(args => …, body)`) is not a literal and keeps both branches.
+    let literal = match a.pts(arity).iter().map(|o| &a.objs[*o].kind).collect::<Vec<_>>().as_slice()
+    {
+      [ObjKind::Num(n)] => Some(*n),
+      _ => None,
+    };
     let id = a.rule_id("effect:dual.fn").unwrap();
-    let b = a.builtin(id, Some(data), None);
+    let b = a.builtin_full(id, Some(data), literal, None);
     a.seed(c.ret, b);
   });
   a.rule("effect:dual.fn", |a, c| {
     let data = this_of(a, c);
     let body = load(a, data, "body");
     let av = load(a, data, "arity");
-    let arity = a.pts(av).iter().find_map(|o| match a.objs[*o].kind {
-      ObjKind::Num(n) => Some(n as usize),
-      _ => None,
+    let arity = a.builtin_arity(c).map(|n| n as usize).or_else(|| {
+      a.pts(av).iter().find_map(|o| match a.objs[*o].kind {
+        ObjKind::Num(n) => Some(n as usize),
+        _ => None,
+      })
     });
     let n = c.args.len();
     let full = match arity {
