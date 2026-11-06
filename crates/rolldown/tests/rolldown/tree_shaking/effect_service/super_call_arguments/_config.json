@@ -1,0 +1,10 @@
+{
+  "_comment": "`super(...)` hands the parent constructor its own arguments, not the `new` call's: the service passed only through `super(store)` is written to `this` by the base constructor, so the method read on it stays and the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

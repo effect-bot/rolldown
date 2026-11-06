@@ -1,0 +1,10 @@
+{
+  "_comment": "A constructor that returns an object replaces the instance: directly on a class, inherited by a derived class from a function or class base, and as the derived constructor's `this` after `super(...)`. The methods read through the replacement stay, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "An ordinary function has a default `prototype` object: a method assigned on it is found by instances made with `new`, and the service read through that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
