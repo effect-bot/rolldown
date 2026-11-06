@@ -1,0 +1,10 @@
+{
+  "_comment": "One constructor runs at 65 `new` sites, one more than the per-constructor context limit; the last instance holds the service, and its read counts: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

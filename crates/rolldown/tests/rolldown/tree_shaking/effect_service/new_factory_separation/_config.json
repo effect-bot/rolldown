@@ -1,0 +1,10 @@
+{
+  "_comment": "One factory calls `new` for two callers, the service at one call site and plain data at the other; the plain instance is compared structurally, the service reads one method: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

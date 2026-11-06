@@ -1,0 +1,10 @@
+{
+  "_comment": "A method that closes over `this` and is too large to clone per receiver keeps one shared body for two receivers; its closure reads the service through `this`: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
