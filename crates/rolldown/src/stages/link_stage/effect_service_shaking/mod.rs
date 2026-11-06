@@ -101,7 +101,7 @@ impl LinkStage<'_> {
     for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       match module {
         Module::Normal(normal) => {
-          let ns = a.alloc(ObjKind::Namespace(normal.idx), None);
+          let ns = a.alloc(ObjKind::Namespace, None);
           sh.namespace_objs.insert(normal.idx, ns);
           sh.namespace_syms.insert(
             self.symbols.canonical_ref_for(normal.ecma_view.namespace_object_ref),

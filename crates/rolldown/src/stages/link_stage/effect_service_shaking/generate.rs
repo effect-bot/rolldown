@@ -1109,6 +1109,12 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     let (callee, this) = self.callee(&c.callee);
     let args = self.args(&c.arguments);
+    if let Expression::StaticMemberExpression(m) = &c.callee {
+      // `o.m(...)`: the name lets a call into unseen code hand over only the receivers that
+      // can hold that callee (`Analysis::method_names`).
+      let site = Site { module: self.m.module, start: c.span.start, sub: c.span.end | 0x8000_0000 };
+      self.a.method_names.insert(site, ArcStr::from(m.property.name.as_str()));
+    }
     self.call(callee, this, args, c.span, false)
   }
 

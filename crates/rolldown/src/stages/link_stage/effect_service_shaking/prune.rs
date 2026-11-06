@@ -149,7 +149,12 @@ pub fn plan(
           }
           candidate_keys.entry(obj).or_default().push(key.clone());
         }
-        ObjKind::Top(_) | ObjKind::Wrap(_) | ObjKind::External { .. } => d.all(),
+        ObjKind::Wrap(_) => d.all(),
+        // Anything else adds no demand. In particular a value from code the pass can't see (an
+        // external Layer may provide any key) is another implementation, not a reader of the
+        // bundled providers: those are read only through the program's own variables, where
+        // the reads are recorded, or after escaping to unseen code, which keeps every method
+        // (issue, "Code the pass can't see").
         _ => {}
       }
     }

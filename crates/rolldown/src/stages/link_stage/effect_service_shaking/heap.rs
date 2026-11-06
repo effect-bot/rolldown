@@ -240,6 +240,12 @@ pub enum Constraint {
   SetProto(VarId),
   /// Objects in a Layer/Context position: opaque ones may provide any key.
   Provision,
+  /// On the receiver of `o.name(...)` whose callee is code the pass can't see: hand over the
+  /// receivers that can hold that callee (`Analysis::escape_receiver`).
+  EscapeReceiver(Flavour, Option<Site>, ArcStr),
+  /// On a property slot of `receiver`: if code the pass can't see reaches the slot, the
+  /// receiver is handed over with it.
+  EscapeIfOpaque(ObjId, Flavour, Option<Site>),
   /// On a prototype variable: the object inherits from the variable's objects, directly or
   /// through their own prototypes (`Analysis::inherit`).
   Inherits(ObjId),
@@ -308,6 +314,8 @@ impl Constraint {
         setter: acc.setter.as_ref().map(|(name, param)| (name.clone(), v(*param))),
       }),
       C::Inherits(_)
+      | C::EscapeReceiver(..)
+      | C::EscapeIfOpaque(..)
       | C::Demand(_)
       | C::DemandAll
       | C::Escape(..)
@@ -462,7 +470,7 @@ pub enum ObjKind {
     target: Option<u16>,
   },
   /// The namespace object of a bundled module.
-  Namespace(ModuleIdx),
+  Namespace,
   /// The namespace of an external module.
   External {
     flavour: Flavour,
@@ -580,6 +588,11 @@ pub struct Analysis {
   /// `Effect.retry` and `Effect.retryOrElse` rules use to step a Schedule. `None` when
   /// `effect/Schedule` is not bundled.
   pub schedule_to_step: Option<VarId>,
+  /// Model Effects whose public type is `Exit`: only these have the Exit members.
+  exits: FxHashSet<ObjId>,
+  /// The property name of each `o.name(...)` call site, as generated (clones' sites are not
+  /// listed and keep the general handling).
+  pub method_names: FxHashMap<Site, ArcStr>,
   worklist: Vec<VarId>,
   /// Constraints registered since the last solver step, to be applied to the objects their
   /// variable already holds. Kept out of the call stack so constraint cycles cannot recurse.
@@ -655,6 +668,8 @@ impl Analysis {
       effect_key_strings,
       default_rule: None,
       schedule_to_step: None,
+      exits: FxHashSet::default(),
+      method_names: FxHashMap::default(),
       worklist: vec![],
       new_constraints: vec![],
       activation_queue: vec![],
@@ -1296,6 +1311,14 @@ impl Analysis {
         _ => {}
       },
       Constraint::Inherits(heir) => self.inherit(*heir, obj),
+      Constraint::EscapeReceiver(flavour, site, name) => {
+        self.escape_receiver(obj, *flavour, *site, name);
+      }
+      Constraint::EscapeIfOpaque(receiver, flavour, site) => {
+        if matches!(self.objs[obj].kind, ObjKind::Top(_) | ObjKind::External { .. }) {
+          self.escape(*receiver, *flavour, *site);
+        }
+      }
       Constraint::Accessor(acc) => self.accessor(obj, acc),
       Constraint::SetProto(src) => {
         if matches!(
@@ -1431,7 +1454,7 @@ impl Analysis {
           self.seed(dst, t);
         }
       }
-      ObjKind::Namespace(_) => {
+      ObjKind::Namespace => {
         // Namespace member reads are resolved during constraint generation; a
         // dynamic read falls through to every export via `fields`/`elem`.
         self.read_field(obj, name, dst);
@@ -1457,7 +1480,13 @@ impl Analysis {
       | ObjKind::Promise { .. }
       | ObjKind::Iterator(_) => {
         let holder = self.holder(obj);
-        let kind_name = model_kind_name(&self.objs[obj].kind);
+        // An Exit is an Effect that also has the public Exit members.
+        let kind_name =
+          if self.exits.contains(&obj) && self.rule_id(&format!("Exit.{name}:get")).is_some() {
+            "Exit"
+          } else {
+            model_kind_name(&self.objs[obj].kind)
+          };
         let full = format!("{kind_name}.{name}");
         if let Some(id) = self.rule_id(&full) {
           let b = self.method(id, obj);
@@ -1497,7 +1526,7 @@ impl Analysis {
       | ObjKind::Array
       | ObjKind::Closure(_)
       | ObjKind::Class { .. }
-      | ObjKind::Namespace(_)
+      | ObjKind::Namespace
       | ObjKind::Builtin { .. } => {
         if let ObjKind::Closure(f) = self.objs[obj].kind {
           self.function_prototype(obj, f);
@@ -1590,7 +1619,7 @@ impl Analysis {
       | ObjKind::Array
       | ObjKind::Closure(_)
       | ObjKind::Class { .. }
-      | ObjKind::Namespace(_)
+      | ObjKind::Namespace
       | ObjKind::Builtin { .. } => {
         if matches!(self.objs[obj].kind, ObjKind::Closure(_) | ObjKind::Class { .. })
           && name.as_str() == "prototype"
@@ -1639,7 +1668,7 @@ impl Analysis {
       | ObjKind::Array
       | ObjKind::Closure(_)
       | ObjKind::Class { .. }
-      | ObjKind::Namespace(_)
+      | ObjKind::Namespace
       | ObjKind::Builtin { .. } => {
         if let Some(Flavour::Ext) = self.objs[obj].escaped {
           self.constrain(src, Constraint::Escape(Flavour::Ext, None));
@@ -2072,11 +2101,38 @@ impl Analysis {
       self.constrain(v, Constraint::Escape(flavour, Some(call.site)));
     }
     if let Some(this) = call.this {
-      self.constrain(this, Constraint::Escape(flavour, Some(call.site)));
+      let c = match self.method_names.get(&call.site) {
+        Some(name) => Constraint::EscapeReceiver(flavour, Some(call.site), name.clone()),
+        None => Constraint::Escape(flavour, Some(call.site)),
+      };
+      self.constrain(this, c);
+    }
+  }
+
+  /// `o.name(...)` called code the pass can't see. The receiver variable holds every object `o`
+  /// may be, but unseen code runs with `this` only for the receivers whose `name` it is: an
+  /// object whose own `name` slot holds bundled functions only calls those. So a plain
+  /// receiver is handed over when its own slot can hold unseen code, or when it has no own slot
+  /// (the method comes from its prototype or elsewhere). Other receivers are handed over as
+  /// before.
+  fn escape_receiver(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>, name: &ArcStr) {
+    match self.objs[obj].kind {
+      ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
+        match self.objs[obj].fields.get(name).copied() {
+          Some(slot) => self.constrain(slot, Constraint::EscapeIfOpaque(obj, flavour, site)),
+          None => self.escape(obj, flavour, site),
+        }
+      }
+      _ => self.escape(obj, flavour, site),
     }
   }
 
   /// The wrap of `inner`, made by the rule call at `site` the first time.
+  /// Marks a model Effect as an Exit (see `exits`).
+  pub fn mark_exit(&mut self, obj: ObjId) {
+    self.exits.insert(obj);
+  }
+
   pub fn wrap_of(&mut self, inner: VarId, site: Site) -> VarId {
     let w = match self.wraps.get(&inner) {
       Some(w) => *w,
@@ -2134,7 +2190,9 @@ impl Analysis {
       ObjKind::Promise { value } => self.copy(value, dst),
       ObjKind::Wrap(_) => self.seed(dst, obj),
       ObjKind::Top(Flavour::Ext) | ObjKind::External { flavour: Flavour::Ext, .. } => {
-        self.bail_everything("an effect from outside the bundle runs in this runtime");
+        // An effect built by code the pass can't see runs in this runtime. It reaches services
+        // only through the Context it runs with, which is not a path (issue, "Code the pass
+        // can't see"): nothing bails, and what it yields is unknown.
         self.seed(dst, self.top_ext);
       }
       ObjKind::Object | ObjKind::Array => {
@@ -2361,7 +2419,10 @@ impl Analysis {
     // Host builtins never look inside their arguments (a wrong builtin model is a compiler
     // bug): a plain object handed to one keeps its shape, and runtime objects stay sealed. Only
     // the closures it holds become reachable, with unknown arguments. External code may do
-    // anything with what it receives.
+    // anything with the ordinary values it receives, now or later: a service among them bails
+    // its key. Effect's containers (Effect, Context, Layer, ManagedRuntime, MemoMap, Fiber),
+    // keys and primitives are not a path to services, so they bail nothing, and neither do
+    // the services reached only through them (issue, "Code the pass can't see").
     let external = flavour == Flavour::Ext;
     if external {
       self.bail_view(obj, "a view of a Context's entries escapes to external code");
@@ -2399,25 +2460,6 @@ impl Analysis {
         }
       }
       ObjKind::Closure(f) => self.escape_fn(f, flavour, site),
-      ObjKind::Key { .. } if external => {
-        let reason =
-          format!("a key (from {:?}) escapes to external code at {site:?}", self.objs[obj].site);
-        self.bail_reasons.push(reason);
-        self.key_use(obj, &KeyUse::Bail);
-      }
-      ObjKind::Context { .. } | ObjKind::Layer { .. } | ObjKind::Runtime { .. } if !external => {}
-      ObjKind::Context { .. } | ObjKind::Layer { .. } | ObjKind::Runtime { .. } => {
-        let reason = format!(
-          "{} (from {:?}) escapes to {flavour:?} code at {site:?}",
-          model_kind_name(&self.objs[obj].kind),
-          self.objs[obj].site
-        );
-        self.bail_object(obj, &reason);
-      }
-      ObjKind::Effect { success, failure } => {
-        self.constrain(success, Constraint::Escape(flavour, site));
-        self.constrain(failure, Constraint::Escape(flavour, site));
-      }
       ObjKind::Promise { value } | ObjKind::Wrap(value) => {
         self.constrain(value, Constraint::Escape(flavour, site));
       }
@@ -2426,50 +2468,22 @@ impl Analysis {
         let ret = self.fns[f].ret;
         self.constrain(ret, Constraint::Escape(flavour, site));
       }
-      ObjKind::Builtin { rule, .. } => {
-        // A primitive that reaches the environment lets opaque code read any key. Other
-        // builtins (combinators, helpers) are harmless in host code; external code may
-        // combine anything, so every Effect primitive bails there.
-        let name = self.rules[rule as usize].0;
-        let reads_environment = matches!(
-          name,
-          "effect:Effect.withFiber"
-            | "effect:Effect.withFiberSucceed"
-            | "effect:Effect.context"
-            | "effect:Effect.contextWith"
-            | "effect:Effect.updateContext"
-            | "effect:Context.get"
-            | "effect:Context.getOption"
-            | "effect:Context.getOrElse"
-            | "effect:Context.getOrUndefinedUnsafe"
-            | "effect:Context.makeUnsafe"
-            | "effect:Context.Service"
-            | "effect:Context.Reference"
-            | "effect:Fiber.getCurrent"
-            | "Fiber.getRef"
-            | "Fiber.context:get"
-        );
-        if reads_environment || (flavour == Flavour::Ext && name.starts_with("effect:")) {
-          let reason = format!("builtin `{name}` escapes to {flavour:?} code at {site:?}");
-          self.bail_everything(&reason);
+      ObjKind::Namespace => {
+        // A module namespace hands over every export, as ordinary values.
+        let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
+        for f in fields {
+          self.constrain(f, Constraint::Escape(flavour, site));
         }
+        let elem = self.elem(obj);
+        self.constrain(elem, Constraint::Escape(flavour, site));
       }
-      ObjKind::Namespace(module) => {
-        // A module namespace reaching code outside the bundle hands it every export.
-        if flavour == Flavour::Ext {
-          let reason =
-            format!("namespace of module {} escapes to external code at {site:?}", module.raw());
-          self.bail_everything(&reason);
-        } else {
-          let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
-          for f in fields {
-            self.constrain(f, Constraint::Escape(flavour, site));
-          }
-          let elem = self.elem(obj);
-          self.constrain(elem, Constraint::Escape(flavour, site));
-        }
-      }
-      ObjKind::Key { .. }
+      // Effect's containers, keys and primitives bail nothing (see above).
+      ObjKind::Context { .. }
+      | ObjKind::Layer { .. }
+      | ObjKind::Runtime { .. }
+      | ObjKind::Effect { .. }
+      | ObjKind::Key { .. }
+      | ObjKind::Builtin { .. }
       | ObjKind::Fiber
       | ObjKind::MemoMap
       | ObjKind::Str(_)

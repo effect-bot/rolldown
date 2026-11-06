@@ -42,32 +42,32 @@ Environment variables, all opt-in:
 
 ## Tests
 
-- Fixtures: `crates/rolldown/tests/rolldown/tree_shaking/effect_service/` (148 real-`effect` programs). The README there has one row per fixture with its status. Run them with `cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service`.
+- Fixtures: `crates/rolldown/tests/rolldown/tree_shaking/effect_service/` (153 real-`effect` programs). The README there has one row per fixture with its status. Run them with `cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service`.
 - Acceptance: `crates/rolldown/tests/rolldown/topics/effect_service_acceptance/` builds each program in `programs/` with the pass off and on. It checks behaviour, removed names and the size reduction. `solve_is_deterministic` there builds `node_file_system` five times and requires the same bundle and the same solve (the variables, objects, solver steps and removals of the pass's `effect service shaking` debug event).
 - Timing: `cargo run --profile effect-verify -p rolldown --example effect_service_shaking -- <entry> <out-dir> 7` alternates off/on builds and prints medians.
 - Every run is under `rolldown_testing::memory_guard` (`ROLLDOWN_TEST_MAX_RSS_MB`).
 
 ## Current status
 
-- Fixtures: 132 of 148 pass.
+- Escape rules (issue, "Code the pass can't see"): `Analysis::escape` hands over ordinary values only. A service reached through them keeps every method (`demand.all`), and later stores into an escaped object escape too. Effect's containers, keys and Effect primitives escape as nothing, a module namespace escapes as its exports, and an effect built by unseen code runs without a bail. For `o.m()` into unseen code, `Constraint::EscapeReceiver` hands over only the receivers whose own `m` slot can hold that code (`EscapeIfOpaque`), or that have no own `m`. The call's property name comes from `Analysis::method_names`, filled by the generator; clone sites are not listed and hand over every receiver. A key whose values include an external value no longer counts as fully demanded (`prune.rs`).
+- Public types (issue, "Assumptions" 2): `Analysis::exits` marks the model Effects whose public type is `Exit`, and only those resolve `Exit.{_tag,value,cause}`. `Effect.exit`, `onExit`, `runSyncExit`/`runPromiseExit` (both forms), `Fiber.await`, `addObserver`/`pollUnsafe` and `acquireUseRelease`'s release produce Exits rather than Wraps. `ManagedRuntime`'s remaining public members (`dispose`, `disposeEffect`, `scope`) have rules, so reading them is no longer reflection.
+- Fixtures: 133 of 153 pass.
   - `dynamic_key_prefix` waits for prefix narrowing.
-  - `function_constructor_this`, `implicit_derived_constructor`, `super_call_arguments`, `constructor_replacement_object`, `function_default_prototype`, `super_method_receiver`, `prototype_constructor_reference`, `static_super_lookup` and `class_accessor_receiver` pass: `new` on a function constructor keeps its `this` writes (`Option.some`), a derived class keeps what its parent writes to `this` (`Data.Class`, `Data.TaggedClass`), `super(...)` passes its own arguments, a returned object replaces the instance at every level, methods assigned on a function's default `prototype` are found, `super.m()` runs with the derived `this` and looks up on the parent class in static code, `prototype.constructor` leads back to the function or class, and class accessors run with the instance they are accessed on.
-  - `receiver_helper_separation`, `constructor_receiver_separation`, `derived_constructor_separation`, `heap_factory_separation` and `new_factory_separation` keep the unread method: one shared method body, constructor or factory serves every receiver or caller (one instance per class or function constructor), so values merge. `constructor_context_limit` and `large_method_fallback` pass. They wait on the receiver and heap contexts proposal.
-  - `effect_unruled_member` throws with the pass on: a member of a model Effect that no rule defines reads an empty slot (design.md, "Sealing model objects").
-  - `effect_internal_analysed`, `schema_concurrency_no_fiber` and `schema_concurrency_context` keep every method because the solve goes over the entries budget (see design.md, "Precision on Schema-heavy programs").
-  - `internal_combinator_caller`, `retry_schedule_callback`, `retry_or_else_schedule_callback`, `retry_or_else_schedule_output` and `retry_metadata_output` run correctly but keep the unread method. `Effect.repeat` succeeds with the Schedule's output; `Effect.retry` and `Effect.retryOrElse` step their Schedule with `self`'s failure, and `retryOrElse` calls `orElse` with that failure and the Schedule's last output; all three step through the stable `Schedule.toStep` and provide `Schedule.CurrentMetadata` (`input`: the previous success or failure, `output`: the Schedule's output) to `self`. The ambient Context then merges into `Schedule`/`Duration` values and is read as reflection, or the solve goes over the entries budget.
-  - `retry_or_else_source_defect` runs correctly: `retryOrElse` passes `self`'s failure through, since defects are not retried. It keeps the unread method because the Schedule's own Pull failure values share the result's failure slot with the defect, and the `catchDefect` handler's argument then reads as reflection. `repeat_metadata_input` passes.
-  - `exit_view_of_effect` and `fiber_observer_exit` pass through the Exit (`_tag`, `value`, `cause`) and Fiber (`addObserver`, `pollUnsafe`) member rules. `fiber_join_failure` passes through the failure a Fiber records for `Fiber.join`.
-- Acceptance: `node_file_system`, the library and mixed builds pass. `openai_generated_client` and `distilled_stripe` keep every method; both go over the entries budget, and both are 0.0% smaller. Solve times on this host: about 11 s on OpenAI and 19 s on Distilled, against a 270 ms OpenAI build without the pass. Over-budget solve times move with when the solve reaches the limit and with host load.
+  - `exit_view_of_effect` and `effect_unruled_member`: the pass removes both methods (`removed=2`), but each `_test.mjs` asserts the method names appear nowhere, and the program's own call site (`eff.value.probeUsed()`, `….value.value.unruledUsed()`) stays in the bundle. The checks need to match the definitions instead; that is a tests-only fix.
+  - The class-semantics fixtures `computed_setter_receiver`, `super_accessor_borrowed_receiver` and `nested_class_computed_super` still fail (the bundle throws). That work is paused.
+  - `receiver_helper_separation`, `constructor_receiver_separation`, `derived_constructor_separation`, `heap_factory_separation` and `new_factory_separation` keep the unread method because one body or allocation serves every receiver or caller.
+  - `effect_internal_analysed`, `schema_concurrency_no_fiber` and `schema_concurrency_context` go over the entries budget.
+  - `internal_combinator_caller`, `retry_schedule_callback`, `retry_or_else_schedule_callback`, `retry_or_else_schedule_output`, `retry_metadata_output` and `retry_or_else_source_defect` run correctly but keep the unread method (Schedule/Duration merging, or the Pull failure sharing a slot with the defect).
+- Acceptance: `node_file_system` and both mixed setups pass. `mixed_effect_bundled_library_external` now removes `appUnused` (0.1% smaller). `openai_generated_client` and `distilled_stripe` go over the entries budget and are 0.0% smaller; design.md, "What blocks the OpenAI and Stripe gates", has the trace.
 - Determinism: `solve_is_deterministic` passes.
-- Measurements against `0bf641510` (example binary, one build, `MemoryMax=6G` and `ROLLDOWN_TEST_MAX_RSS_MB=4096`):
+- Measurements against `1129245ac` (example binary, one build, `MemoryMax=6G` and `ROLLDOWN_TEST_MAX_RSS_MB=4096`):
 
-  | program                    | `0bf641510` vars / entries / solve / verdict | now                                       |
-  | -------------------------- | -------------------------------------------- | ----------------------------------------- |
-  | `node_file_system`         | 87k / 0.17M / 67 ms / within, 31 removed     | 86k / 0.25M / 101 ms / within, 31 removed |
-  | `effect_internal_analysed` | 310k / 16.0M / 4.8 s / within                | 335k / 16.0M / 4.2 s / over               |
-  | `distilled_stripe`         | 311k / 16.0M / 31 s / within                 | 295k / 16.0M / 19.2 s / over              |
-  | `openai_generated_client`  | 376k / 16.0M / 7.0 s / over                  | 412k / 16.1M / 11.3 s / over              |
+  | program                    | `1129245ac` vars / entries / solve / verdict | now                                      |
+  | -------------------------- | -------------------------------------------- | ---------------------------------------- |
+  | `node_file_system`         | 86k / 0.25M / 101 ms / within, 31 removed    | 86k / 0.21M / 91 ms / within, 31 removed |
+  | `effect_internal_analysed` | 335k / 16.0M / 4.3 s / over                  | 295k / 16.0M / 5.9 s / over              |
+  | `distilled_stripe`         | 295k / 16.0M / 19.2 s / over                 | 299k / 16.0M / 32.4 s / over             |
+  | `openai_generated_client`  | 412k / 16.1M / 11.4 s / over                 | 379k / 16.0M / 5.4 s / over              |
 
   Entries are points-to entries plus copy edges at the end of the solve; an over-budget solve stops at the limit.
 

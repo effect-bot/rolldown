@@ -182,7 +182,7 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("ignoreCause", Spec::Rule("effect:Effect.passthrough")),
       ("result", Spec::Rule("effect:Effect.wrapBoth")),
       ("option", Spec::Rule("effect:Effect.wrapBoth")),
-      ("exit", Spec::Rule("effect:Effect.wrapBoth")),
+      ("exit", Spec::Rule("effect:Effect.exit")),
       ("sandbox", Spec::Rule("effect:Effect.passthrough")),
       ("tapError", Spec::Rule("effect:Effect.tapError")),
       ("tapCause", Spec::Rule("effect:Effect.tapError")),
@@ -457,10 +457,20 @@ fn forked_fiber(a: &mut Analysis, site: Site, e: VarId) -> ObjId {
 fn fiber_exit(a: &mut Analysis, site: Site, fb: VarId) -> VarId {
   let s = load(a, fb, FIBER_SUCCESS);
   let fl = load(a, fb, FIBER_FAILURE);
-  let (exit, es, ef) = new_effect(a, site, 23);
+  new_exit(a, site, 23, s, fl)
+}
+
+/// An `Exit<A, E>` with success `s` and failure `fl`: an Effect (an Exit is one) whose public
+/// Exit members (`_tag`, `value`, `cause`) have rules. Other Effects have no such members by
+/// their public types, so the same reads on them yield nothing (issue, "Assumptions" 2).
+fn new_exit(a: &mut Analysis, site: Site, tag: u8, s: VarId, fl: VarId) -> VarId {
+  let (obj, es, ef) = a.new_effect(site, tag);
+  a.mark_exit(obj);
   a.copy(s, es);
   a.copy(fl, ef);
-  exit
+  let v = a.var();
+  a.seed(v, obj);
+  v
 }
 
 fn ambient(a: &mut Analysis) -> VarId {
@@ -1142,6 +1152,16 @@ pub fn register(a: &mut Analysis) {
     a.copy(fl, of);
     a.copy(out, c.ret);
   });
+  a.rule("effect:Effect.exit", |a, c| {
+    // `Effect.exit(self)` succeeds with `self`'s Exit.
+    let e = self_effect(a, c);
+    let s = success_of(a, e);
+    let fl = failure_of(a, e);
+    let exit = new_exit(a, c.site, 24, s, fl);
+    let (out, os, _) = new_effect(a, c.site, 1);
+    a.copy(exit, os);
+    a.copy(out, c.ret);
+  });
   a.rule("effect:Effect.wrapBoth", |a, c| {
     let e = self_effect(a, c);
     let s = success_of(a, e);
@@ -1378,15 +1398,14 @@ pub fn register(a: &mut Analysis) {
   for name in ["Fiber.id:get", "Fiber.currentOpCount:get"] {
     a.rule(name, |a, c| a.seed(c.ret, a.prim));
   }
-  // The public `Exit` view of an Effect: `Effect.succeed(x)` and friends are Exits at run time.
-  // `value` is the success; `cause` is a Cause holding the failure.
-  a.rule("Effect._tag:get", |a, c| a.seed(c.ret, a.prim));
-  a.rule("Effect.value:get", |a, c| {
+  // The public members of `Exit`: `value` is the success; `cause` is a Cause holding the failure.
+  a.rule("Exit._tag:get", |a, c| a.seed(c.ret, a.prim));
+  a.rule("Exit.value:get", |a, c| {
     let e = this_of(a, c);
     let s = success_of(a, e);
     a.copy(s, c.ret);
   });
-  a.rule("Effect.cause:get", |a, c| {
+  a.rule("Exit.cause:get", |a, c| {
     let e = this_of(a, c);
     let fl = failure_of(a, e);
     let cause = wrap(a, c.site, fl);
@@ -1539,15 +1558,16 @@ pub fn register(a: &mut Analysis) {
     let use_ = arg(a, c, 1);
     let release = arg(a, c, 2);
     let s = success_of(a, acquire);
-    let exit = host_var(a);
     let used = invoke(a, c.site, use_, None, vec![s]);
+    let us = success_of(a, used);
+    let uf = failure_of(a, used);
+    // `release(resource, exit)` gets the Exit of `use`.
+    let exit = new_exit(a, c.site, 25, us, uf);
     invoke(a, c.site, release, None, vec![s, exit]);
     let (out, os, of) = new_effect(a, c.site, 1);
-    let us = success_of(a, used);
     a.copy(us, os);
     let fl = failure_of(a, acquire);
     a.copy(fl, of);
-    let uf = failure_of(a, used);
     a.copy(uf, of);
     a.copy(out, c.ret);
   });
@@ -1700,11 +1720,8 @@ pub fn register(a: &mut Analysis) {
     let e = self_effect(a, c);
     let s = success_of(a, e);
     let fl = failure_of(a, e);
-    let both = a.var();
-    a.copy(s, both);
-    a.copy(fl, both);
-    let w = wrap(a, c.site, both);
-    call_callbacks(a, c, 1, &[w]);
+    let exit = new_exit(a, c.site, 24, s, fl);
+    call_callbacks(a, c, 1, &[exit]);
     let (out, os, of) = new_effect(a, c.site, 1);
     a.copy(s, os);
     a.copy(fl, of);
@@ -1771,11 +1788,8 @@ pub fn register(a: &mut Analysis) {
     let (_, pv, value) = new_promise(a, c.site, 12);
     let s = success_of(a, e);
     let fl = failure_of(a, e);
-    let both = a.var();
-    a.copy(s, both);
-    a.copy(fl, both);
-    let w = wrap(a, c.site, both);
-    a.copy(w, value);
+    let exit = new_exit(a, c.site, 24, s, fl);
+    a.copy(exit, value);
     run_options(a, c, 1);
     a.copy(pv, c.ret);
   });
@@ -1789,11 +1803,8 @@ pub fn register(a: &mut Analysis) {
     let e = self_effect(a, c);
     let s = success_of(a, e);
     let fl = failure_of(a, e);
-    let both = a.var();
-    a.copy(s, both);
-    a.copy(fl, both);
-    let w = wrap(a, c.site, both);
-    a.copy(w, c.ret);
+    let exit = new_exit(a, c.site, 24, s, fl);
+    a.copy(exit, c.ret);
     run_options(a, c, 1);
   });
   a.rule("effect:Effect.runFork", |a, c| {
@@ -2080,11 +2091,8 @@ pub fn register(a: &mut Analysis) {
     let (_, pv, value) = new_promise(a, c.site, 12);
     let s = success_of(a, e);
     let fl = failure_of(a, e);
-    let both = a.var();
-    a.copy(s, both);
-    a.copy(fl, both);
-    let w = wrap(a, c.site, both);
-    a.copy(w, value);
+    let exit = new_exit(a, c.site, 24, s, fl);
+    a.copy(exit, value);
     a.copy(pv, c.ret);
   });
   a.rule("Runtime.runSync", |a, c| {
@@ -2096,11 +2104,8 @@ pub fn register(a: &mut Analysis) {
     let e = arg(a, c, 0);
     let s = success_of(a, e);
     let fl = failure_of(a, e);
-    let both = a.var();
-    a.copy(s, both);
-    a.copy(fl, both);
-    let w = wrap(a, c.site, both);
-    a.copy(w, c.ret);
+    let exit = new_exit(a, c.site, 24, s, fl);
+    a.copy(exit, c.ret);
   });
   a.rule("Runtime.runFork", |a, c| {
     let e = arg(a, c, 0);
@@ -2138,6 +2143,18 @@ pub fn register(a: &mut Analysis) {
     let m = memo_map(a);
     a.copy(m, c.ret);
   });
+  // The rest of the public `ManagedRuntime` members: none hands out a service.
+  a.rule("Runtime.dispose", |a, c| {
+    let (_, pv, value) = new_promise(a, c.site, 12);
+    a.seed(value, a.prim);
+    a.copy(pv, c.ret);
+  });
+  a.rule("Runtime.disposeEffect:get", |a, c| {
+    let (out, os, _) = new_effect(a, c.site, 1);
+    a.seed(os, a.prim);
+    a.copy(out, c.ret);
+  });
+  a.rule("Runtime.scope:get", |a, c| a.seed(c.ret, a.top_host));
 
   // == Function and Pipeable
 
