@@ -526,6 +526,15 @@ fn lookup(a: &mut Analysis, key: VarId) -> VarId {
   dst
 }
 
+/// The services of key argument 1 found in Context argument 0 (`Context.get(ctx, key)`).
+fn lookup_in_context(a: &mut Analysis, c: &Call) -> VarId {
+  let ctx = arg(a, c, 0);
+  let key = arg(a, c, 1);
+  let dst = a.var();
+  a.constrain(ctx, Constraint::LookupIn { key, dst });
+  dst
+}
+
 fn provide(a: &mut Analysis, key: VarId, src: VarId) {
   a.constrain(key, Constraint::KeyUse(KeyUse::Provide(src)));
 }
@@ -695,27 +704,23 @@ pub fn register(a: &mut Analysis) {
     a.copy(ctx, c.ret);
   });
   dual!(a, "effect:Context.get", 2, |a, c| {
-    let key = arg(a, c, 1);
-    let v = lookup(a, key);
+    let v = lookup_in_context(a, c);
     a.copy(v, c.ret);
   });
   dual!(a, "effect:Context.getOption", 2, |a, c| {
-    let key = arg(a, c, 1);
-    let v = lookup(a, key);
+    let v = lookup_in_context(a, c);
     let w = wrap(a, c.site, v);
     a.copy(w, c.ret);
   });
   dual!(a, "effect:Context.getOrElse", 3, |a, c| {
-    let key = arg(a, c, 1);
-    let v = lookup(a, key);
+    let v = lookup_in_context(a, c);
     a.copy(v, c.ret);
     let f = arg(a, c, 2);
     let r = invoke(a, c.site, f, None, vec![]);
     a.copy(r, c.ret);
   });
   a.rule("effect:Context.getOrUndefinedUnsafe", |a, c| {
-    let key = arg(a, c, 1);
-    let v = lookup(a, key);
+    let v = lookup_in_context(a, c);
     a.copy(v, c.ret);
   });
   a.rule("effect:Context.makeUnsafe", |a, c| {
@@ -783,28 +788,6 @@ pub fn register(a: &mut Analysis) {
     let (ctx, _) = new_context(a, c.site, 3);
     a.copy(ctx, c.ret);
   });
-  a.rule("Context.mapUnsafe:get", |a, c| {
-    // The entries of the Context as a read-only Map: the values of its keys and the key strings.
-    // Reading a name on a value demands that name of its key, like any other lookup; writing to
-    // the Map or handing it to external code bails the keys (`view_of`).
-    let this = this_of(a, c);
-    let (map, arr, elem) = new_array(a, c.site, 5);
-    // One view object per site: every Context read through it adds its keys to the view's.
-    let keys = match a.objs[map].view_of {
-      Some(keys) => keys,
-      None => {
-        let keys = a.var();
-        a.objs[map].view_of = Some(keys);
-        keys
-      }
-    };
-    context_keys(a, this, keys);
-    let values = lookup(a, keys);
-    a.copy(values, elem);
-    a.seed(elem, a.top_host);
-    a.copy(arr, c.ret);
-  });
-
   // == Key methods
 
   a.rule("Key.of", |a, c| {
@@ -2142,6 +2125,14 @@ pub fn register(a: &mut Analysis) {
   a.rule("Runtime.memoMap:get", |a, c| {
     let m = memo_map(a);
     a.copy(m, c.ret);
+  });
+  a.rule("Runtime.cachedContext:get", |a, c| {
+    // The runtime's cached Context, or `undefined`.
+    let rt = this_of(a, c);
+    let (ctx, keys) = new_context(a, c.site, 15);
+    context_keys(a, rt, keys);
+    a.copy(ctx, c.ret);
+    a.seed(c.ret, a.prim);
   });
   // The rest of the public `ManagedRuntime` members: none hands out a service.
   a.rule("Runtime.dispose", |a, c| {

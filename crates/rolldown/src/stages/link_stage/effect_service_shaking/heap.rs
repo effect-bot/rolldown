@@ -182,8 +182,6 @@ pub enum KeyUse {
   Lookup(VarId),
   /// The variable's objects become services of the key.
   Provide(VarId),
-  /// Every method of the key stays.
-  Bail,
   /// The key strings flow into the variable, as `Str` objects.
   Strings(VarId),
 }
@@ -240,6 +238,12 @@ pub enum Constraint {
   SetProto(VarId),
   /// Objects in a Layer/Context position: opaque ones may provide any key.
   Provision,
+  /// On the Context argument of `Context.get(ctx, key)` and friends: the services of `key`
+  /// flow into `dst` when `ctx` may be a Context (`Analysis::lookup_in`).
+  LookupIn {
+    key: VarId,
+    dst: VarId,
+  },
   /// On the receiver of `o.name(...)` whose callee is code the pass can't see: hand over the
   /// receivers that can hold that callee (`Analysis::escape_receiver`).
   EscapeReceiver(Flavour, Option<Site>, ArcStr),
@@ -298,7 +302,6 @@ impl Constraint {
         KeyUse::Lookup(x) => KeyUse::Lookup(v(*x)),
         KeyUse::Provide(x) => KeyUse::Provide(v(*x)),
         KeyUse::Strings(x) => KeyUse::Strings(v(*x)),
-        KeyUse::Bail => KeyUse::Bail,
       }),
       C::ContextKeys(x) => C::ContextKeys(v(*x)),
       C::ElemOf(x) => C::ElemOf(v(*x)),
@@ -309,6 +312,7 @@ impl Constraint {
       C::ProtoOf(x) => C::ProtoOf(v(*x)),
       C::SetProto(x) => C::SetProto(v(*x)),
       C::MapKeys(x) => C::MapKeys(v(*x)),
+      C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
       C::Accessor(acc) => C::Accessor(Accessor {
         this: v(acc.this),
         setter: acc.setter.as_ref().map(|(name, param)| (name.clone(), v(*param))),
@@ -498,9 +502,6 @@ pub struct Obj {
   /// The prototype object of a host builtin (`Map.prototype`): writing to it changes what the
   /// models assume.
   pub builtin_proto: bool,
-  /// A live view of runtime objects' entries (`Context.mapUnsafe`): the keys of the viewed
-  /// objects. Writing to the view, or handing it to external code, changes their entries.
-  pub view_of: Option<VarId>,
 }
 
 #[derive(Default)]
@@ -570,7 +571,6 @@ pub struct Analysis {
   pub key_values: FxHashMap<ArcStr, VarId>,
   pub unknown_key_values: VarId,
   pub all_values: VarId,
-  pub bailed_keys: FxHashSet<ArcStr>,
   pub bail_all: bool,
   pub bail_reasons: Vec<String>,
   /// Keys never pruned: References and the keys the fiber runtime reads itself.
@@ -663,7 +663,6 @@ impl Analysis {
       key_values: FxHashMap::default(),
       unknown_key_values,
       all_values,
-      bailed_keys: FxHashSet::default(),
       bail_all: false,
       bail_reasons: vec![],
       never_prune: FxHashSet::default(),
@@ -1317,6 +1316,7 @@ impl Analysis {
         _ => {}
       },
       Constraint::Inherits(heir) => self.inherit(*heir, obj),
+      Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
       Constraint::EscapeReceiver(flavour, site, name) => {
         self.escape_receiver(obj, *flavour, *site, name);
       }
@@ -1472,15 +1472,10 @@ impl Analysis {
       ObjKind::Builtin { .. } => {
         self.read_field(obj, name, dst);
       }
-      ObjKind::MemoMap => {
-        // The memo map holds the Contexts of the Layers built so far.
-        self.seed(dst, self.ambient_context);
-        self.copy(self.all_values, dst);
-        self.seed(dst, obj);
-      }
       ObjKind::Key { .. }
       | ObjKind::Context { .. }
       | ObjKind::Layer { .. }
+      | ObjKind::MemoMap
       | ObjKind::Effect { .. }
       | ObjKind::Fiber
       | ObjKind::Runtime { .. }
@@ -1511,13 +1506,14 @@ impl Analysis {
           (self.rules[id as usize].1)(self, &call);
         } else if matches!(
           self.objs[obj].kind,
-          ObjKind::Context { .. } | ObjKind::Layer { .. } | ObjKind::Runtime { .. }
+          ObjKind::Context { .. }
+            | ObjKind::Layer { .. }
+            | ObjKind::Runtime { .. }
+            | ObjKind::MemoMap
         ) {
-          // Reading an internal of a runtime object is reflection: its entries may be reached.
-          let reason = format!("internal `{name}` of a {kind_name} is read");
-          self.bail_object(obj, &reason);
-          self.seed(dst, self.ambient_context);
-          self.copy(self.all_values, dst);
+          // Effect's containers have only their public members (rules above). Any other member
+          // does not type check, so it reads nothing and bails nothing (issue, "Assumptions" 2).
+          // `mapUnsafe` and every MemoMap member are ignored too ("When a method is kept").
         } else {
           self.read_field(obj, name, dst);
         }
@@ -1570,20 +1566,15 @@ impl Analysis {
         let t = self.top_of(obj);
         self.seed(dst, t);
       }
-      ObjKind::Context { .. } | ObjKind::Runtime { .. } | ObjKind::Layer { .. } => {
-        // Reading a Context by an unknown name is reflection on its internals: its entries bail.
-        self.bail_object(obj, "unknown property read on a runtime object");
-        let field = self.elem(obj);
-        self.copy(field, dst);
-      }
+      // A container read by an unknown name: under the public types it can only be one of its
+      // public members, none of which hands out a service.
+      ObjKind::Context { .. }
+      | ObjKind::Runtime { .. }
+      | ObjKind::Layer { .. }
+      | ObjKind::MemoMap => {}
       ObjKind::Fiber => {
         // `fiber[x]` may reach `context`: the ambient Context.
         self.seed(dst, self.ambient_context);
-      }
-      ObjKind::MemoMap => {
-        self.seed(dst, self.ambient_context);
-        self.copy(self.all_values, dst);
-        self.seed(dst, obj);
       }
       ObjKind::Key { .. }
       | ObjKind::Effect { .. }
@@ -1612,7 +1603,6 @@ impl Analysis {
     if self.objs[obj].builtin_proto {
       self.bail_everything("a builtin prototype is modified: the Context model no longer holds");
     }
-    self.bail_view(obj, "a view of a Context's entries is written");
     match self.objs[obj].kind.clone() {
       ObjKind::Key { strings, .. } => {
         // `key.key = x` retargets the key: whatever `x` names is now looked up through it.
@@ -1645,19 +1635,18 @@ impl Analysis {
         self.constrain(src, Constraint::Escape(flavour, None));
       }
       ObjKind::Wrap(inner) => self.copy(src, inner),
-      ObjKind::Context { .. } | ObjKind::Layer { .. } | ObjKind::Runtime { .. } => {
-        // Mutating a runtime object: what is stored may be read back by anything, and the
-        // object's entries are no longer what the model says.
-        let reason = format!(
-          "write of `{name}` to a {} (from {:?})",
-          model_kind_name(&self.objs[obj].kind),
-          self.objs[obj].site
-        );
-        self.bail_object(obj, &reason);
-        let elem = self.elem(obj);
-        self.copy(src, elem);
+      // The only writable public member of a container is `ManagedRuntime.cachedContext`: the
+      // Context written there provides its services. Other writes don't type check, so they
+      // store nothing.
+      ObjKind::Runtime { .. } if name.as_str() == "cachedContext" => {
+        self.constrain(src, Constraint::Provision);
       }
-      ObjKind::Prim | ObjKind::Num(_) => {}
+      ObjKind::Context { .. }
+      | ObjKind::Layer { .. }
+      | ObjKind::Runtime { .. }
+      | ObjKind::MemoMap
+      | ObjKind::Prim
+      | ObjKind::Num(_) => {}
       _ => {
         let elem = self.elem(obj);
         self.copy(src, elem);
@@ -1669,7 +1658,6 @@ impl Analysis {
     if self.objs[obj].builtin_proto {
       self.bail_everything("a builtin prototype is modified: the Context model no longer holds");
     }
-    self.bail_view(obj, "a view of a Context's entries is written");
     match self.objs[obj].kind.clone() {
       ObjKind::Key { strings, .. } => self.copy(src, strings),
       ObjKind::Object
@@ -1695,11 +1683,10 @@ impl Analysis {
         self.constrain(src, Constraint::Escape(flavour, None));
       }
       ObjKind::Wrap(inner) => self.copy(src, inner),
-      ObjKind::Context { .. } | ObjKind::Layer { .. } | ObjKind::Runtime { .. } => {
-        self.bail_object(obj, "write to a runtime object");
-        let elem = self.elem(obj);
-        self.copy(src, elem);
-      }
+      ObjKind::Context { .. }
+      | ObjKind::Layer { .. }
+      | ObjKind::Runtime { .. }
+      | ObjKind::MemoMap => {}
       _ => {
         let elem = self.elem(obj);
         self.copy(src, elem);
@@ -2158,6 +2145,19 @@ impl Analysis {
     }
   }
 
+  /// `Context.get(ctx, key)` with `obj` among `ctx`'s values: only a Context, or a value that
+  /// may be one (unknown, or wrapped), hands out the key's services. Anything else reached
+  /// where a Context is expected (a MemoMap's or a Context's non-public slot, `mapUnsafe`) is
+  /// not a Context by the public types, so the lookup reads nothing (issue, "Assumptions" 2).
+  fn lookup_in(&mut self, obj: ObjId, key: VarId, dst: VarId) {
+    if matches!(
+      self.objs[obj].kind,
+      ObjKind::Context { .. } | ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_)
+    ) {
+      self.constrain(key, Constraint::KeyUse(KeyUse::Lookup(dst)));
+    }
+  }
+
   /// Marks a model Effect as an Exit (see `exits`).
   pub fn mark_exit(&mut self, obj: ObjId) {
     self.exits.insert(obj);
@@ -2271,17 +2271,11 @@ impl Analysis {
           let v = self.key_value_var(&name);
           self.copy(*src, v);
         }
-        KeyUse::Bail => {
-          if self.bailed_keys.insert(name.clone()) {
-            self.bail_reasons.push(format!("key {name} keeps every method"));
-          }
-        }
         KeyUse::Strings(dst) => self.seed(*dst, obj),
       },
       ObjKind::AllKeys => match use_ {
         KeyUse::Lookup(dst) => self.copy(self.all_values, *dst),
         KeyUse::Provide(src) => self.copy(*src, self.unknown_key_values),
-        KeyUse::Bail => self.bail_everything("an unknown key is bailed, so every key is"),
         KeyUse::Strings(dst) => self.seed(*dst, obj),
       },
       ObjKind::Object => {
@@ -2325,11 +2319,8 @@ impl Analysis {
         let yielded = self.fns[f].yielded;
         self.copy(yielded, dst);
       }
-      ObjKind::Context { .. } => {
-        // Iterating a Context enumerates its entries.
-        self.bail_object(obj, "a Context is iterated");
-        self.copy(self.all_values, dst);
-      }
+      // A Context is not iterable by its public type.
+      ObjKind::Context { .. } => {}
       _ => {
         let elem = self.elem(obj);
         self.copy(elem, dst);
@@ -2349,8 +2340,10 @@ impl Analysis {
         let t = self.top_of(obj);
         self.seed(dst, t);
       }
-      ObjKind::Context { .. } | ObjKind::Layer { .. } | ObjKind::Runtime { .. } => {
-        self.bail_object(obj, "a runtime object is handed to an API without a model");
+      // A container handed to an API without a model: what it may hand back are the services
+      // of its keys. Reads on them are then recorded as demand, like any lookup.
+      ObjKind::Context { keys } | ObjKind::Layer { keys } | ObjKind::Runtime { keys } => {
+        self.constrain(keys, Constraint::KeyUse(KeyUse::Lookup(dst)));
       }
       _ => {}
     }
@@ -2366,9 +2359,7 @@ impl Analysis {
           self.constrain(src, Constraint::Enumerate);
         }
       }
-      ObjKind::Context { .. } | ObjKind::Layer { .. } | ObjKind::Runtime { .. } => {
-        self.bail_object(obj, "a runtime object is enumerated");
-      }
+      // Containers have no enumerable public data: enumerating one keeps nothing.
       ObjKind::Wrap(inner) => self.constrain(inner, Constraint::Enumerate),
       _ => {}
     }
@@ -2407,32 +2398,8 @@ impl Analysis {
         let t = self.top_of(obj);
         self.seed(elem, t);
       }
-      ObjKind::Context { .. } | ObjKind::Layer { .. } | ObjKind::Runtime { .. } => {
-        self.bail_object(obj, "a runtime object is spread");
-      }
+      // Spreading a container copies no public data.
       _ => {}
-    }
-  }
-
-  pub fn bail_object(&mut self, obj: ObjId, reason: &str) {
-    match self.objs[obj].kind {
-      ObjKind::Context { keys } | ObjKind::Layer { keys } | ObjKind::Runtime { keys } => {
-        self.constrain(keys, Constraint::KeyUse(KeyUse::Bail));
-        self.bail_reasons.push(reason.to_string());
-      }
-      _ => {}
-    }
-  }
-
-  /// Bails the keys behind a view of runtime objects' entries, including keys that join the
-  /// view later.
-  fn bail_view(&mut self, obj: ObjId, reason: &str) {
-    if let Some(keys) = self.objs[obj].view_of {
-      let bail = Constraint::KeyUse(KeyUse::Bail);
-      if !self.vars[keys].constraint_set.contains(&bail) {
-        self.bail_reasons.push(format!("{reason} (from {:?})", self.objs[obj].site));
-        self.constrain(keys, bail);
-      }
     }
   }
 
@@ -2458,9 +2425,6 @@ impl Analysis {
     // keys and primitives are not a path to services, so they bail nothing, and neither do
     // the services reached only through them (issue, "Code the pass can't see").
     let external = flavour == Flavour::Ext;
-    if external {
-      self.bail_view(obj, "a view of a Context's entries escapes to external code");
-    }
     match self.objs[obj].kind.clone() {
       ObjKind::Object | ObjKind::Array | ObjKind::Class { .. } => {
         if external {
@@ -2556,7 +2520,7 @@ impl Analysis {
   }
 
   pub fn key_is_bailed(&self, key: &str) -> bool {
-    self.bail_all || self.bailed_keys.contains(key) || self.never_prune.contains(key)
+    self.bail_all || self.never_prune.contains(key)
   }
 }
 
@@ -2576,7 +2540,6 @@ impl Obj {
       site,
       protocols: 0,
       builtin_proto: false,
-      view_of: None,
     }
   }
 }
