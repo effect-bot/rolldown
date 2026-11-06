@@ -130,6 +130,7 @@ impl LinkStage<'_> {
     let mut effect_external = false;
     let mut unsupported_version: Option<String> = None;
     let mut public_modules: Vec<(ModuleIdx, &'static [(&'static str, effect::Spec)])> = vec![];
+    let mut listed_modules: Vec<(ModuleIdx, &'static [(&'static str, effect::Spec)])> = vec![];
     let mut schedule_module: Option<ModuleIdx> = None;
     for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       match module {
@@ -152,6 +153,12 @@ impl LinkStage<'_> {
             effect::MODULES.iter().find(|(name, _)| path.ends_with(&format!("/dist/{name}.js")))
           {
             public_modules.push((normal.idx, specs));
+          }
+          if let Some((_, specs)) = effect::LISTED_MODULES
+            .iter()
+            .find(|(name, _)| path.ends_with(&format!("/dist/{name}.js")))
+          {
+            listed_modules.push((normal.idx, specs));
           }
         }
         Module::External(ext) => {
@@ -256,6 +263,19 @@ impl LinkStage<'_> {
           if claim {
             sh.rule_symbols.insert(sym, obj);
             bind_rank.insert(sym, rank);
+          }
+        }
+      }
+    }
+    // The listed exports of otherwise ordinary modules (`effect::LISTED_MODULES`): their
+    // declarations take the rule, and the generator skips them.
+    for (module, specs) in &listed_modules {
+      for (name, spec) in *specs {
+        let Some(export) = self.metas[*module].resolved_exports.get(*name) else { continue };
+        let obj = effect::spec_object(&mut a, *spec);
+        for sym in self.alias_chain(export.symbol_ref) {
+          if sym.owner == *module {
+            sh.rule_symbols.entry(sym).or_insert(obj);
           }
         }
       }

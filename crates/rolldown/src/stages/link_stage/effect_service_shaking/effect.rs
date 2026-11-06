@@ -18,7 +18,7 @@ use arcstr::ArcStr;
 
 use super::heap::{
   Analysis, Arg, Call, Constraint, FIBER_FAILURE, FIBER_SUCCESS, Flavour, KeyUse, ObjId, ObjKind,
-  Site, VarId,
+  Site, VarId, Walk,
 };
 use super::host::{
   arg, args_from, await_of, const_string_of, elem_of, host_var, invoke, invoke_args, load,
@@ -353,6 +353,21 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
   ("Tracer", &[("ParentSpan", Spec::Key(PARENT_SPAN_KEY))]),
 ];
 
+/// Public modules that are otherwise ordinary code: only the exports listed here take a rule, and
+/// the rest of each module is analysed generically. Effect's own formatting and structural
+/// equality walk a value's keys, which keeps nothing (issue, "When a method is kept").
+pub const LISTED_MODULES: &[(&str, &[(&str, Spec)])] = &[
+  (
+    "Formatter",
+    &[
+      ("format", Spec::Rule("effect:Formatter.format")),
+      ("formatJson", Spec::Rule("effect:Formatter.format")),
+    ],
+  ),
+  ("Equal", &[("equals", Spec::Rule("effect:Equal.equals"))]),
+  ("Hash", &[("hash", Spec::Rule("effect:Hash.hash"))]),
+];
+
 /// Pure callables whose results are safe to drop with a removed property.
 pub const PURE_RULES: &[&str] = &[
   "effect:Effect.fn",
@@ -477,6 +492,50 @@ fn ambient(a: &mut Analysis) -> VarId {
   let v = a.var();
   a.seed(v, a.ambient_context);
   v
+}
+
+/// The program-wide pool of the formatting walk. The walk passes the current Context to
+/// `[Redactable.symbolRedactable]`, as `Redactable.getRedacted` does.
+fn format_pool(a: &mut Analysis) -> VarId {
+  if let Some(pool) = a.format_pool {
+    return pool;
+  }
+  let pool = a.var();
+  a.format_pool = Some(pool);
+  let context = ambient(a);
+  let site = walk_site(1);
+  a.constrain(pool, Constraint::Walk { walk: Walk::Format, pool, arg: context, site });
+  pool
+}
+
+/// The program-wide pool of the hashing walk.
+fn hash_pool(a: &mut Analysis) -> VarId {
+  if let Some(pool) = a.hash_pool {
+    return pool;
+  }
+  let pool = a.var();
+  a.hash_pool = Some(pool);
+  let arg = a.var();
+  let site = walk_site(2);
+  a.constrain(pool, Constraint::Walk { walk: Walk::Hash, pool, arg, site });
+  pool
+}
+
+/// One `Equal.equals` call site: its values are walked and hashed, and each `[Equal.symbol]`
+/// among them receives the walked values that have one. A walk per site keeps one site's
+/// values away from another's `[Equal.symbol]`, which may enumerate its argument (`Data`'s).
+fn equal_walk(a: &mut Analysis, site: Site, compared: VarId) {
+  let hash = hash_pool(a);
+  a.copy(compared, hash);
+  let pool = a.var();
+  a.copy(compared, pool);
+  let with_equal = a.var();
+  a.constrain(pool, Constraint::Walk { walk: Walk::Equal, pool, arg: with_equal, site });
+}
+
+/// A call site no source position has, for the program-wide walks' protocol calls.
+fn walk_site(n: u32) -> Site {
+  Site { module: rolldown_common::ModuleIdx::from_raw(0), start: u32::MAX - n, sub: 0 }
 }
 
 fn new_effect(a: &mut Analysis, site: Site, tag: u8) -> (VarId, VarId, VarId) {
@@ -1839,6 +1898,51 @@ pub fn register(a: &mut Analysis) {
     a.copy(fl, of);
     a.copy(out, c.ret);
   });
+  // == Formatter, Equal and Hash: walks that keep nothing (see `Walk`)
+
+  a.rule("effect:Formatter.format", |a, c| {
+    // `format(input, options)`, `formatJson(input, options)`: the options hold no callbacks.
+    let input = arg(a, c, 0);
+    let pool = format_pool(a);
+    a.copy(input, pool);
+    a.seed(c.ret, a.top_host);
+  });
+  a.rule("effect:Hash.hash", |a, c| {
+    let input = arg(a, c, 0);
+    let pool = hash_pool(a);
+    a.copy(input, pool);
+    a.seed(c.ret, a.prim);
+  });
+  a.rule("effect:Equal.equals", |a, c| {
+    // `equals(self, that)`, or `equals(that)` returning `self => equals(self, that)`.
+    let compared = a.var();
+    for x in args_from(a, c, 0) {
+      let v = match x {
+        Arg::Var(v) => v,
+        Arg::Spread(v) => elem_of(a, v),
+      };
+      a.copy(v, compared);
+    }
+    if c.args.len() != 1 || c.has_spread() {
+      equal_walk(a, c.site, compared);
+      a.seed(c.ret, a.prim);
+    }
+    if c.args.len() <= 1 || c.has_spread() {
+      let id = a.rule_id("effect:Equal.equals:partial").expect("registered");
+      let partial = a.builtin(id, Some(compared), None);
+      a.seed(c.ret, partial);
+    }
+  });
+  a.rule("effect:Equal.equals:partial", |a, c| {
+    let compared = a.var();
+    let that = this_of(a, c);
+    a.copy(that, compared);
+    let input = arg(a, c, 0);
+    a.copy(input, compared);
+    equal_walk(a, c.site, compared);
+    a.seed(c.ret, a.prim);
+  });
+
   a.rule("effect:Effect.log", |a, c| {
     for x in args_from(a, c, 0) {
       let (Arg::Var(v) | Arg::Spread(v)) = x;

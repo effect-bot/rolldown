@@ -531,15 +531,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         self.statement(&s.body);
       }
       Statement::VariableDeclaration(d) => self.variable_declaration(d),
-      Statement::FunctionDeclaration(f) => {
-        let v = self.function(f, FnKind::Normal);
-        if let Some(id) = &f.id {
-          self.record_decl(id, DeclKind::Function);
-          if let Some(bv) = self.binding_var(id) {
-            self.copy(v, bv);
-          }
-        }
-      }
+      Statement::FunctionDeclaration(f) => self.function_declaration(f),
       Statement::ClassDeclaration(c) => {
         let v = self.class(c);
         if let Some(id) = &c.id {
@@ -599,15 +591,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   fn declaration(&mut self, decl: &Declaration<'_>) {
     match decl {
       Declaration::VariableDeclaration(d) => self.variable_declaration(d),
-      Declaration::FunctionDeclaration(f) => {
-        let v = self.function(f, FnKind::Normal);
-        if let Some(id) = &f.id {
-          self.record_decl(id, DeclKind::Function);
-          if let Some(bv) = self.binding_var(id) {
-            self.copy(v, bv);
-          }
-        }
-      }
+      Declaration::FunctionDeclaration(f) => self.function_declaration(f),
       Declaration::ClassDeclaration(c) => {
         let v = self.class(c);
         if let Some(id) = &c.id {
@@ -632,6 +616,29 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         if let Some(target) = other.as_assignment_target() {
           self.assign_target(target, value);
         }
+      }
+    }
+  }
+
+  fn function_declaration(&mut self, f: &Function<'_>) {
+    // A declaration bound to a model rule keeps the rule and its body is not analysed, as a
+    // bound variable's initialiser is not (`variable_declaration`).
+    if let Some(id) = &f.id {
+      if let Some(symbol) = id.symbol_id.get() {
+        let sym: SymbolRef = (self.m.module, symbol).into();
+        let canonical = self.sh.symbols.canonical_ref_for(sym);
+        if self.sh.rule_symbols.contains_key(&canonical) {
+          self.record_decl(id, DeclKind::Function);
+          self.symbol_var(sym);
+          return;
+        }
+      }
+    }
+    let v = self.function(f, FnKind::Normal);
+    if let Some(id) = &f.id {
+      self.record_decl(id, DeclKind::Function);
+      if let Some(bv) = self.binding_var(id) {
+        self.copy(v, bv);
       }
     }
   }

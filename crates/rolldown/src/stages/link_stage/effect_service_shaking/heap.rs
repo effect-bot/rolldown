@@ -86,6 +86,42 @@ pub enum Protocol {
   Inspect,
 }
 
+/// Effect's own formatting and structural equality (issue, "When a method is kept"): they walk
+/// a value's keys, and the walk keeps nothing. What the walk reaches flows on to it, and the
+/// protocol methods it calls on each object are read and run like any call (`Analysis::walk`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Walk {
+  /// `Formatter.format` and `Formatter.formatJson`: `toString`, `toJSON`, a Date's
+  /// `toISOString` and `[Redactable.symbolRedactable]`, which receives the current Context.
+  Format,
+  /// `Hash.hash`: `[Hash.symbol]`, and a Date's `getTime`/`toISOString` or a RegExp's
+  /// `toString`.
+  Hash,
+  /// `Equal.equals`: `[Equal.symbol]`, which receives the walked values that have one
+  /// (`compareStructure` calls it only when both sides do). Both sides are hashed too.
+  Equal,
+}
+
+/// `Symbol.for("~effect/Redactable")`, `Equal.symbol` and `Hash.symbol` as model keys.
+pub const REDACTABLE_KEY: &str = "@@for:~effect/Redactable";
+pub const EQUAL_KEY: &str = "~effect/Equal";
+pub const HASH_KEY: &str = "~effect/Hash";
+
+impl Walk {
+  /// The methods the walk calls on each object, and whether each receives the walk's argument.
+  fn protocols(self) -> &'static [(&'static str, bool)] {
+    match self {
+      Walk::Format => {
+        &[("toString", false), ("toJSON", false), ("toISOString", false), (REDACTABLE_KEY, true)]
+      }
+      Walk::Hash => {
+        &[(HASH_KEY, false), ("getTime", false), ("toISOString", false), ("toString", false)]
+      }
+      Walk::Equal => &[(EQUAL_KEY, true)],
+    }
+  }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum FnKind {
   Normal,
@@ -261,6 +297,18 @@ pub enum Constraint {
   /// into the variable; opaque values may be any string, so they name every key; containers (the
   /// `[key, value]` pairs) and other values cannot match a string key and are skipped.
   MapKeys(VarId),
+  /// On a variable whose objects a walk reaches (`Analysis::walk`).
+  Walk {
+    walk: Walk,
+    /// Everything the walk reaches.
+    pool: VarId,
+    /// What the protocol methods that take an argument receive.
+    arg: VarId,
+    site: Site,
+  },
+  /// `obj` flows into `dst` once anything reaches the variable (a walked object that has the
+  /// protocol method loaded into the variable).
+  Witness(ObjId, VarId),
 }
 
 impl Key {
@@ -312,6 +360,10 @@ impl Constraint {
       C::ProtoOf(x) => C::ProtoOf(v(*x)),
       C::SetProto(x) => C::SetProto(v(*x)),
       C::MapKeys(x) => C::MapKeys(v(*x)),
+      C::Walk { walk, pool, arg, site } => {
+        C::Walk { walk: *walk, pool: v(*pool), arg: v(*arg), site: s(*site) }
+      }
+      C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
       C::Accessor(acc) => C::Accessor(Accessor {
         this: v(acc.this),
@@ -544,6 +596,11 @@ pub struct Analysis {
   accessors: FxHashMap<ObjId, Vec<Accessor>>,
   /// Set when the analysis exceeded its allocation budget: everything is kept.
   pub budget_exceeded: bool,
+  /// Objects each walk pool has walked.
+  walked: FxHashSet<(VarId, ObjId)>,
+  /// The program-wide pools of the formatting and hashing walks (`Walk`).
+  pub format_pool: Option<VarId>,
+  pub hash_pool: Option<VarId>,
   /// Rule invocations, for diagnostics.
   pub rule_calls: FxHashMap<u16, usize>,
   /// One "any argument" variable per spread call, shared by every `arg` read of that call.
@@ -646,6 +703,9 @@ impl Analysis {
       heirs: FxHashMap::default(),
       accessors: FxHashMap::default(),
       budget_exceeded: false,
+      walked: FxHashSet::default(),
+      format_pool: None,
+      hash_pool: None,
       rule_calls: FxHashMap::default(),
       rule_memo: FxHashMap::default(),
       spread_any: FxHashMap::default(),
@@ -1316,6 +1376,8 @@ impl Analysis {
         _ => {}
       },
       Constraint::Inherits(heir) => self.inherit(*heir, obj),
+      Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
+      Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
       Constraint::EscapeReceiver(flavour, site, name) => {
         self.escape_receiver(obj, *flavour, *site, name);
@@ -2344,6 +2406,78 @@ impl Analysis {
       // of its keys. Reads on them are then recorded as demand, like any lookup.
       ObjKind::Context { keys } | ObjKind::Layer { keys } | ObjKind::Runtime { keys } => {
         self.constrain(keys, Constraint::KeyUse(KeyUse::Lookup(dst)));
+      }
+      _ => {}
+    }
+  }
+
+  /// One object reached by a walk (`Walk`): the walk reads none of its keys, so nothing is
+  /// demanded and nothing bails, but every value it holds, now or later, joins the pool and is
+  /// walked in turn. The protocol methods the walk calls are loaded by name and called with the
+  /// object as `this`, exactly as `obj.toString()` in bundled code would be: they count as
+  /// reads and their bodies run. Their results are walked too.
+  fn walk(&mut self, obj: ObjId, walk: Walk, pool: VarId, arg: VarId, site: Site) {
+    if !self.walked.insert((pool, obj)) {
+      return;
+    }
+    let again = Constraint::Walk { walk, pool, arg, site };
+    match self.objs[obj].kind.clone() {
+      ObjKind::Object
+      | ObjKind::Array
+      | ObjKind::Closure(_)
+      | ObjKind::Class { .. }
+      | ObjKind::Namespace => {
+        self.touch_namespace(obj, None);
+        let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
+        for f in fields {
+          self.copy(f, pool);
+        }
+        // Fields created later reach the pool too (without the demand `load_unknown` adds).
+        if !self.objs[obj].unknown_loads.contains(&pool) {
+          self.objs[obj].unknown_loads.push(pool);
+        }
+        let elem = self.elem(obj);
+        self.copy(elem, pool);
+        for src in self.objs[obj].spread_from.clone() {
+          self.constrain(src, again.clone());
+        }
+        // `Hash`'s and `Equal`'s key walks include inherited keys.
+        if let Some(proto) = self.objs[obj].proto {
+          self.constrain(proto, again);
+        }
+        let this = self.holder(obj);
+        for (name, takes_arg) in walk.protocols() {
+          let method = self.var();
+          self
+            .constrain(this, Constraint::Load { key: Key::Name(ArcStr::from(*name)), dst: method });
+          if walk == Walk::Equal {
+            self.constrain(method, Constraint::Witness(obj, arg));
+          }
+          let ret = self.var();
+          let call = Call {
+            site: site.sub(method),
+            this: Some(this),
+            args: if *takes_arg { vec![Arg::Var(arg)] } else { vec![] },
+            ret,
+            is_new: false,
+            builtin: None,
+          };
+          self.constrain(method, Constraint::Call(Box::new(call)));
+          self.copy(ret, pool);
+        }
+      }
+      // Printing an Effect (an Exit, say) prints what it holds; comparing two compares them.
+      ObjKind::Effect { success, failure } => {
+        self.constrain(success, again.clone());
+        self.constrain(failure, again);
+      }
+      // A wrapped value may be any of the values it wraps. A Promise has no keys of its own.
+      ObjKind::Wrap(inner) => self.constrain(inner, again),
+      // A printed Context or runtime prints its services. Context equality is ignored.
+      ObjKind::Context { keys } | ObjKind::Runtime { keys } if walk == Walk::Format => {
+        let services = self.var();
+        self.constrain(keys, Constraint::KeyUse(KeyUse::Lookup(services)));
+        self.constrain(services, again);
       }
       _ => {}
     }
