@@ -5,7 +5,7 @@ import path from 'node:path';
 // The program asserts its own output when imported.
 await import('./dist/main.js');
 
-// The Context reaches host-compiled code: every method stays.
+// The service reaches host-compiled code: every method stays.
 const code = fs.readFileSync(path.join(import.meta.dirname, 'dist/main.js'), 'utf8');
 for (const name of ['readOne', 'hostLoaderUnused', 'hostLoaderUnusedHelper']) {
   assert.match(code, new RegExp(`\\b${name}\\b`), `${name} should be kept`);

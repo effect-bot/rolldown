@@ -1,0 +1,11 @@
+{
+  "_comment": "Runtime objects handed to an external module bail nothing: Store's Context, Layer, a ManagedRuntime built from it, an Effect succeeding with it, the running Fiber, the current-fiber global, its key, an Effect primitive and the Context module namespace. Only a service handed over itself (Direct) keeps every method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./late.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,4 +1,5 @@
 {
   "external": ["effect-fixture-lib"],
-  "keep": ["configGetHelper"]
+  "keep": ["configGetHelper"],
+  "remove": ["appUnusedHelper"]
 }

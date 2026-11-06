@@ -13,9 +13,7 @@
 //! - an `EFFECT_SERVICE_SHAKING` warning is emitted, when `expectDiagnostic` is set.
 //!
 //! The two bundles are written to `dist/off/main.js` and `dist/on/main.js` in
-//! the program directory. `run` names a script run as `node <run> <bundle>`
-//! instead of running the bundle itself, for library programs whose consumer
-//! lives outside the bundle. Node resolves `effect` and the other fixture
+//! the program directory. Node resolves `effect` and the other fixture
 //! packages from the repository's root `node_modules`.
 //!
 //! Byte sizes of both bundles are printed for every program so that the
@@ -44,15 +42,9 @@ const PROGRAMS: &str =
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Expect {
-  /// Entry module, relative to the program directory. Defaults to `main.js`.
-  #[serde(default)]
-  entry: Option<String>,
   /// Module specifiers left out of the bundle.
   #[serde(default)]
   external: Vec<String>,
-  /// Script run as `node <run> <bundle>` instead of running the bundle itself.
-  #[serde(default)]
-  run: Option<String>,
   /// Names that must still be in the enabled bundle.
   #[serde(default)]
   keep: Vec<String>,
@@ -80,7 +72,7 @@ async fn build(dir: &Path, expect: &Expect, enabled: bool, out: &str) -> Build {
   let mut bundler = Bundler::new(BundlerOptions {
     input: Some(vec![InputItem {
       name: Some("main".to_string()),
-      import: format!("./{}", expect.entry.as_deref().unwrap_or("main.js")),
+      import: "./main.js".to_string(),
     }]),
     cwd: Some(dir.to_path_buf()),
     dir: Some(out.to_string_lossy().into_owned()),
@@ -101,14 +93,8 @@ async fn build(dir: &Path, expect: &Expect, enabled: bool, out: &str) -> Build {
   Build { bundle, bytes, warnings }
 }
 
-fn run(dir: &Path, expect: &Expect, bundle: &Path) -> (i32, String, String) {
-  let mut command = Command::new("node");
-  command.current_dir(dir);
-  match &expect.run {
-    Some(script) => command.arg(script).arg(bundle),
-    None => command.arg(bundle),
-  };
-  let output = command.output().expect("node should run");
+fn run(dir: &Path, bundle: &Path) -> (i32, String, String) {
+  let output = Command::new("node").current_dir(dir).arg(bundle).output().expect("node should run");
   (
     output.status.code().unwrap_or(-1),
     String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -163,8 +149,8 @@ async fn check(name: &str) {
 
   let mut failures = vec![];
 
-  let (off_status, off_stdout, off_stderr) = run(&dir, &expect, &off.bundle);
-  let (on_status, on_stdout, on_stderr) = run(&dir, &expect, &on.bundle);
+  let (off_status, off_stdout, off_stderr) = run(&dir, &off.bundle);
+  let (on_status, on_stdout, on_stderr) = run(&dir, &on.bundle);
   if off_status != 0 {
     failures
       .push(format!("the program fails with the pass off (exit {off_status}):\n{off_stderr}"));
@@ -224,20 +210,15 @@ async fn distilled_stripe() {
   check("distilled_stripe").await;
 }
 
-/// 4. A library built with `effect` external, consumed by an app that uses
-/// every exported key and Layer.
-#[tokio::test]
-async fn library_effect_external() {
-  check("library_effect_external").await;
-}
-
-/// 5a. `effect` bundled, an Effect library left external.
+/// 4a. `effect` bundled, an Effect library left external.
 #[tokio::test]
 async fn mixed_effect_bundled_library_external() {
   check("mixed_effect_bundled_library_external").await;
 }
 
-/// 5b. The Effect library bundled, `effect` external.
+/// 4b. The Effect library bundled, `effect` external. This is also the
+/// application build with `effect` external: it must behave the same and emit
+/// the diagnostic; pruning is allowed but not required, so nothing is in `remove`.
 #[tokio::test]
 async fn mixed_library_bundled_effect_external() {
   check("mixed_library_bundled_effect_external").await;

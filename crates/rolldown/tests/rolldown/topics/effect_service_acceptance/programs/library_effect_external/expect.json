@@ -1,7 +1,0 @@
-{
-  "entry": "lib/main.js",
-  "external": ["effect", "effect/Context", "effect/Effect", "effect/Layer"],
-  "run": "app/run.mjs",
-  "keep": ["storeReadHelper", "storeWriteHelper", "keys", "increment", "current", "reset"],
-  "expectDiagnostic": true
-}

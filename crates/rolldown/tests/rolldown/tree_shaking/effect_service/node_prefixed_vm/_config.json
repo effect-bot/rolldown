@@ -1,5 +1,5 @@
 {
-  "_comment": "Retention: the fiber's Context is handed to code compiled by node:vm, so its entries keep every method. Uses the real effect package from the repository devDependencies.",
+  "_comment": "Retention: a service handed to code compiled by node:vm bails its key, so it keeps every method. Uses the real effect package from the repository devDependencies.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

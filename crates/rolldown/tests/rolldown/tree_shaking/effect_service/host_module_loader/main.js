@@ -4,8 +4,9 @@ import * as Effect from 'effect/Effect';
 import * as Layer from 'effect/Layer';
 import { getBuiltinModule } from 'node:process';
 
-// A Context is handed to code compiled at run time by the host. The pass cannot
-// see that code, so every entry of the Context keeps every method.
+// The service is handed to code compiled at run time by a loader reached through
+// `process.getBuiltinModule('vm')`. The pass cannot see that code, so the
+// service's key keeps every method.
 const Store = Context.Service('test/RealHostModuleLoader');
 const hostLoaderUnusedHelper = () => 'unused';
 
@@ -18,16 +19,12 @@ const StoreLayer = Layer.effect(
   }),
 );
 
-const observe = (context) =>
-  getBuiltinModule('vm').compileFunction(
-    'return ctx.mapUnsafe.get("test/RealHostModuleLoader").hostLoaderUnused()',
-    ['ctx'],
-  )(context);
+const observe = (store) =>
+  getBuiltinModule('vm').compileFunction('return store.hostLoaderUnused()', ['store'])(store);
 
 const program = Effect.gen(function* () {
   const store = yield* Store;
-  const context = yield* Effect.withFiber((fiber) => Effect.succeed(fiber.context));
-  return [store.readOne(), observe(context)];
+  return [store.readOne(), observe(store)];
 });
 
 assert.deepStrictEqual(await Effect.runPromise(Effect.provide(program, StoreLayer)), [

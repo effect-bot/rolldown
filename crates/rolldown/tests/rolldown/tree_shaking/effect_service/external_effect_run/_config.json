@@ -1,0 +1,13 @@
+{
+  "_comment": "An Effect built by an external module (with the Effect.sync primitive handed to it) runs in the application's runtime: it bails nothing, so the unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": [
+      "./late.js"
+    ]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
