@@ -1,0 +1,10 @@
+{
+  "_comment": "One factory literal is provided under two keys; each key reads a different method, so both stay on the literal (the program calls both), and the method neither key reads is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

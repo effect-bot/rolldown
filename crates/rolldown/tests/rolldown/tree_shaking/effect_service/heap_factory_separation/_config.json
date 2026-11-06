@@ -1,0 +1,10 @@
+{
+  "_comment": "One small factory wraps the service at one call site and plain data at another; the plain value is compared structurally, the service reads one method: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

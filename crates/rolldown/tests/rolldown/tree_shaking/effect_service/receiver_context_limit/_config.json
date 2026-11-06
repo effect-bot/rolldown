@@ -1,0 +1,10 @@
+{
+  "_comment": "One method reading `this` is called on 65 receivers allocated at different sites, one more than the per-function context limit; the last receiver holds the service, and its read counts: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "`new` on a function constructor returns the object its body writes through `this` (a user `function Box`, and `Option.some`, which is built that way); the methods read through them stay, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
