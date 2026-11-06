@@ -1,6 +1,6 @@
 # Effect service shaking fixtures
 
-Real-`effect` programs for `experimental.effectServiceShaking` (EFF-3430). Each fixture is bundled by the integration harness with the option on, then `_test.mjs` imports the bundle (the program asserts its own behaviour) and checks which names stayed in `dist/main.js`. There are no snapshots: the bundles contain the `effect` package and would be noise. Every program also runs unbundled with `node main.js` from its directory, except `external_unresolvable`, `external_effect_run` and `opaque_runtime_objects`, whose external module is written by `_test.mjs` after bundling.
+Real-`effect` programs for `experimental.effectServiceShaking` (EFF-3430). Each fixture is bundled by the integration harness with the option on, then `_test.mjs` imports the bundle (the program asserts its own behaviour) and checks which names stayed in `dist/main.js`. There are no snapshots: the bundles contain the `effect` package and would be noise. Every program also runs unbundled with `node main.js` from its directory, except `external_unresolvable`, `external_effect_run`, `opaque_runtime_objects` and `opaque_wrapped_service`, whose external module is written by `_test.mjs` after bundling.
 
 Run them with:
 
@@ -8,7 +8,7 @@ Run them with:
 cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service
 ```
 
-21 red, 131 green.
+21 red, 132 green.
 
 ### Memory cap
 
@@ -103,6 +103,7 @@ The analysis runs inside the test process, so a solve that never terminates woul
 | `opaque_accessor_reach`                     | green | Retention: a plain object handed to runtime-compiled code gets a getter that later reads a service stored into that object, so the service keeps every method. Uses the real effect package from the repository devDependencies.                                                                                                                                                                                                                 |
 | `opaque_loader_reach`                       | green | Runtime-compiled code receives one service, so that key keeps every method; the keys provided alongside and elsewhere lose their unread methods. No build-wide bailout. Uses the real effect package from the repository devDependencies.                                                                                                                                                                                                        |
 | `opaque_runtime_objects`                    | red   | An external module is handed Store's Context, Layer, a ManagedRuntime, an Effect, the Fiber, the current-fiber global, the key, an Effect primitive and the Context namespace: none bails, Store's unread method goes; Direct, handed over itself, keeps every method. Red at b253836b4: Store keeps it.                                                                                                                                         |
+| `opaque_wrapped_service`                    | green | A service handed to an external module inside a plain object, which keeps it and later calls a method by a name built at run time: the key bails and keeps every method (Tim's decision); Other, never handed over, loses its unread one.                                                                                                                                                                                                        |
 | `per_key_separate_values`                   | green | One key's service holds the Context but only compares it, another holds plain data that is enumerated: no Context is enumerated, so the unread method goes. Uses the real effect package from the repository devDependencies.                                                                                                                                                                                                                    |
 | `per_key_shared_allocation`                 | green | Retention: the provided value is plain data, but the program later stores the ambient Context into the same allocation and enumerates it through the service. Uses the real effect package from the repository devDependencies.                                                                                                                                                                                                                  |
 | `pipe_spread_steps`                         | green | On a Pipeable value, x.pipe(...steps) runs the steps in turn: the second step gets the service the first returns and calls writeOne, which is kept.                                                                                                                                                                                                                                                                                              |

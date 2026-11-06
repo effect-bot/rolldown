@@ -1,0 +1,11 @@
+{
+  "_comment": "A service handed to an external module inside a plain object, which keeps the object and later reads a method of the service by a name built at run time: the wrapped service's key bails, so it keeps every method. Other is never handed over and loses its unread method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./late.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

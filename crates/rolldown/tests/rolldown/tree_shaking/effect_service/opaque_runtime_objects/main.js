@@ -5,8 +5,8 @@ import * as Layer from 'effect/Layer';
 import * as ManagedRuntime from 'effect/ManagedRuntime';
 import { describe, readDirect } from './late.js';
 
-// Code the pass cannot see reaches a service only when it is handed the service
-// object itself. Store reaches the external module only through runtime objects
+// Code the pass cannot see reaches a service only through ordinary values it is
+// given, never through Effect's containers. Store reaches the external module only through runtime objects
 // (its Context, Layer, a ManagedRuntime, an Effect, the running Fiber and the
 // current-fiber global), so its unread method goes. Direct is handed over itself,
 // and the external module reads a method of it by a name built at run time.
