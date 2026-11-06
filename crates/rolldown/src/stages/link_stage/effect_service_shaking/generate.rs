@@ -24,8 +24,8 @@ use rolldown_common::{ModuleIdx, SymbolRef, SymbolRefDb};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::heap::{
-  Analysis, Arg, Call, Constraint, Flavour, FnId, FnInfo, FnKind, Key, ObjId, ObjKind, Pending,
-  Protocol, Site, VarId,
+  Accessor, Analysis, Arg, Call, Constraint, Flavour, FnId, FnInfo, FnKind, Key, ObjId, ObjKind,
+  Pending, Protocol, Site, VarId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +147,8 @@ pub struct Gen<'a, 'l, 's> {
   this_stack: Vec<VarId>,
   /// Enclosing class heritage variables, for `super`.
   class_stack: Vec<Option<VarId>>,
+  /// Whether the innermost class member being generated is static (for `super`).
+  static_stack: Vec<bool>,
   generator_stack: Vec<bool>,
   module_fn: FnId,
   /// End offset until which the binding being declared is uninitialised.
@@ -172,6 +174,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       cur: module_fn,
       this_stack: vec![this],
       class_stack: vec![],
+      static_stack: vec![],
       generator_stack: vec![false],
       module_fn,
       tdz_until: None,
@@ -888,7 +891,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     for element in &c.body.body {
       match element {
         ClassElement::MethodDefinition(m) => {
+          self.static_stack.push(m.r#static);
           let fv = self.function(&m.value, FnKind::Normal);
+          self.static_stack.pop();
           let Some(fid) = self.closure_of(fv) else { continue };
           match m.kind {
             MethodDefinitionKind::Constructor => {
@@ -902,22 +907,33 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
               self.store(target, key, fv);
             }
             MethodDefinitionKind::Get => {
+              // The getter runs on the target and on every object inheriting from it; its
+              // result is the property's value there.
               let target = if m.r#static { cv } else { prototype };
               let key = self.property_key(&m.key, m.computed);
               let ret = self.a.fns[fid].ret;
               let this = self.a.fns[fid].this;
               self.copy(target, this);
+              self.constrain(target, Constraint::Accessor(Accessor { this, setter: None }));
               self.emit(Pending::Activate(fid));
               self.store(target, key, ret);
             }
             MethodDefinitionKind::Set => {
+              // The setter runs on the target and on every object inheriting from it, and
+              // receives what is written under its name there.
               let target = if m.r#static { cv } else { prototype };
               let key = self.property_key(&m.key, m.computed);
               let this = self.a.fns[fid].this;
               self.copy(target, this);
+              let param = self.a.fns[fid].params.first().copied();
+              let setter = match (&key, param) {
+                (Key::Name(name), Some(p)) => Some((name.clone(), p)),
+                _ => None,
+              };
+              self.constrain(target, Constraint::Accessor(Accessor { this, setter }));
               self.emit(Pending::Activate(fid));
               let field = self.load(target, key);
-              if let Some(p) = self.a.fns[fid].params.first().copied() {
+              if let Some(p) = param {
                 self.copy(field, p);
               }
             }
@@ -929,7 +945,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
           if let Some(value) = &p.value {
             let old_this = self.this_stack.last().copied();
             self.this_stack.push(if p.r#static { cv } else { prototype });
+            self.static_stack.push(p.r#static);
             let v = self.expr(value);
+            self.static_stack.pop();
             self.this_stack.pop();
             let _ = old_this;
             self.store(target, key, v);
@@ -945,7 +963,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         }
         ClassElement::StaticBlock(b) => {
           self.this_stack.push(cv);
+          self.static_stack.push(true);
           self.statements(&b.body);
+          self.static_stack.pop();
           self.this_stack.pop();
         }
         ClassElement::TSIndexSignature(_) => {}
@@ -1044,8 +1064,11 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
   }
 
+  /// What `super.x` looks `x` up on: the parent's prototype in instance code, the parent class
+  /// itself in static code.
   fn super_prototype(&mut self) -> VarId {
     match self.class_stack.last().copied().flatten() {
+      Some(h) if self.static_stack.last().copied().unwrap_or(false) => h,
       Some(h) => self.load(h, Key::Name(ArcStr::from("prototype"))),
       None => self.sh.top_host,
     }

@@ -240,6 +240,13 @@ pub enum Constraint {
   SetProto(VarId),
   /// Objects in a Layer/Context position: opaque ones may provide any key.
   Provision,
+  /// On a prototype variable: the object inherits from the variable's objects, directly or
+  /// through their own prototypes (`Analysis::inherit`).
+  Inherits(ObjId),
+  /// On the variable holding a class accessor's declaration target: the accessor runs with
+  /// every object that inherits from the target as `this`, and a setter's parameter takes what
+  /// is stored under its name on those objects (`Analysis::accessor`).
+  Accessor(Accessor),
   /// Entries of a string-keyed map (`Context.makeUnsafe`): `Str` objects are its keys and flow
   /// into the variable; opaque values may be any string, so they name every key; containers (the
   /// `[key, value]` pairs) and other values cannot match a string key and are skipped.
@@ -296,7 +303,12 @@ impl Constraint {
       C::ProtoOf(x) => C::ProtoOf(v(*x)),
       C::SetProto(x) => C::SetProto(v(*x)),
       C::MapKeys(x) => C::MapKeys(v(*x)),
-      C::Demand(_)
+      C::Accessor(acc) => C::Accessor(Accessor {
+        this: v(acc.this),
+        setter: acc.setter.as_ref().map(|(name, param)| (name.clone(), v(*param))),
+      }),
+      C::Inherits(_)
+      | C::Demand(_)
       | C::DemandAll
       | C::Escape(..)
       | C::Enumerate
@@ -305,6 +317,14 @@ impl Constraint {
       | C::Provision => self.clone(),
     }
   }
+}
+
+/// A class getter or setter: its `this` variable, and for a setter its property name and
+/// parameter.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Accessor {
+  pub this: VarId,
+  pub setter: Option<(ArcStr, VarId)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -507,6 +527,12 @@ pub struct Analysis {
   holders: FxHashMap<ObjId, VarId>,
   /// Closures whose default `prototype` object exists (`function_prototype`).
   default_prototypes: FxHashSet<ObjId>,
+  /// `(heir, ancestor)` pairs of the prototype relation, its transitive closure included.
+  inherits: FxHashSet<(ObjId, ObjId)>,
+  /// The objects inheriting from each object.
+  heirs: FxHashMap<ObjId, Vec<ObjId>>,
+  /// The class accessors declared on each object.
+  accessors: FxHashMap<ObjId, Vec<Accessor>>,
   /// Set when the analysis exceeded its allocation budget: everything is kept.
   pub budget_exceeded: bool,
   /// Rule invocations, for diagnostics.
@@ -599,6 +625,9 @@ impl Analysis {
       wrap_sites: FxHashSet::default(),
       holders: FxHashMap::default(),
       default_prototypes: FxHashSet::default(),
+      inherits: FxHashSet::default(),
+      heirs: FxHashMap::default(),
+      accessors: FxHashMap::default(),
       budget_exceeded: false,
       rule_calls: FxHashMap::default(),
       rule_memo: FxHashMap::default(),
@@ -844,7 +873,55 @@ impl Analysis {
     }
     let v = self.var();
     self.objs[obj].proto = Some(v);
+    // Whatever becomes this object's prototype is inherited from by it, and by every object
+    // that already inherits from it.
+    self.constrain(v, Constraint::Inherits(obj));
+    if let Some(heirs) = self.heirs.get(&obj).cloned() {
+      for heir in heirs {
+        self.constrain(v, Constraint::Inherits(heir));
+      }
+    }
     v
+  }
+
+  /// `heir` inherits from `ancestor`: the accessors declared on `ancestor` run on `heir`, and
+  /// `heir` also inherits from `ancestor`'s own prototypes.
+  fn inherit(&mut self, heir: ObjId, ancestor: ObjId) {
+    if heir == ancestor || !self.inherits.insert((heir, ancestor)) {
+      return;
+    }
+    self.heirs.entry(ancestor).or_default().push(heir);
+    if let Some(accessors) = self.accessors.get(&ancestor).cloned() {
+      for acc in &accessors {
+        self.run_accessor_on(heir, acc);
+      }
+    }
+    if let Some(pv) = self.objs[ancestor].proto {
+      self.constrain(pv, Constraint::Inherits(heir));
+    }
+  }
+
+  /// A class accessor declared on `target`: it runs on every object inheriting from it.
+  fn accessor(&mut self, target: ObjId, acc: &Accessor) {
+    let list = self.accessors.entry(target).or_default();
+    if list.contains(acc) {
+      return;
+    }
+    list.push(acc.clone());
+    if let Some(heirs) = self.heirs.get(&target).cloned() {
+      for heir in heirs {
+        self.run_accessor_on(heir, acc);
+      }
+    }
+  }
+
+  fn run_accessor_on(&mut self, obj: ObjId, acc: &Accessor) {
+    self.seed(acc.this, obj);
+    if let Some((name, param)) = &acc.setter {
+      // `obj.name = v` writes `obj`'s own slot in the model: the setter receives it.
+      let field = self.field(obj, name);
+      self.copy(field, *param);
+    }
   }
 
   // == edges and seeds
@@ -1218,6 +1295,8 @@ impl Analysis {
         }
         _ => {}
       },
+      Constraint::Inherits(heir) => self.inherit(*heir, obj),
+      Constraint::Accessor(acc) => self.accessor(obj, acc),
       Constraint::SetProto(src) => {
         if matches!(
           self.objs[obj].kind,
