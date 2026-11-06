@@ -1,0 +1,10 @@
+{
+  "_comment": "Effect.repeat provides Schedule.CurrentMetadata to each attempt; its input is the previous attempt's success, the service, and the next attempt calls a method on it: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

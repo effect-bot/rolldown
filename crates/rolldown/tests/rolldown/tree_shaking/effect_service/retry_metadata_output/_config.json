@@ -1,0 +1,10 @@
+{
+  "_comment": "Effect.retry provides Schedule.CurrentMetadata to each retry; its output is the Schedule's output, here the service, and the retry calls a method on it: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

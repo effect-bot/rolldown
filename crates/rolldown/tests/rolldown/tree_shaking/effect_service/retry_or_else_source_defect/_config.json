@@ -1,0 +1,10 @@
+{
+  "_comment": "A defect of Effect.retryOrElse's source bypasses the retries and orElse and reaches Effect.catchDefect, whose handler calls a method on it: that method stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
