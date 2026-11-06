@@ -1006,7 +1006,7 @@ impl Analysis {
   /// points-to and edge totals bound the memory the solver can take (about 16 bytes each).
   const MAX_OBJECTS: usize = 3_000_000;
   const MAX_VARS: usize = 30_000_000;
-  const MAX_ENTRIES: u64 = 16_000_000;
+  const MAX_ENTRIES: u64 = 32_000_000;
 
   fn over_budget(&self) -> bool {
     self.objs.len() > self.max_objects()

@@ -40,7 +40,7 @@ Environment variables, all opt-in:
 
 - `ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT=1` prints the per-key summary (providers, removed and kept methods, bail reasons), plus the solve statistics.
 - `ROLLDOWN_EFFECT_SERVICE_SHAKING_DEBUG=1` adds phase timings, the module index table, solver histograms during the solve (loads by name, calls by module, the fattest variables).
-- `ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_{OBJECTS,VARS,ENTRIES}` override the budget (defaults 3M objects, 30M variables, 16M points-to entries).
+- `ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_{OBJECTS,VARS,ENTRIES}` override the budget (defaults 3M objects, 30M variables, 32M points-to and copy entries; the entries default was raised from 16M on Tim's decision of 2026-11-06).
 
 ## Tests
 
