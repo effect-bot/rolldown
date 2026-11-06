@@ -3,6 +3,7 @@ mod hidden_module_markers;
 mod hmr_files;
 pub mod integration_test;
 pub mod manual_integration_test_helper;
+pub mod memory_guard;
 pub mod test_config;
 pub mod types;
 pub mod utils;

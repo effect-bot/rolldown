@@ -17,6 +17,11 @@
 //!
 //! Byte sizes of both bundles are printed for every program so that the
 //! baseline can be read from `cargo test ... -- effect_service_acceptance --nocapture`.
+//!
+//! The builds run in the test process, so every program runs under
+//! `rolldown_testing::memory_guard`. If the analysis runs away, the process
+//! stops at `ROLLDOWN_TEST_MAX_RSS_MB` (6 GiB by default) instead of
+//! exhausting the host.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -110,6 +115,8 @@ fn word(name: &str) -> regex::Regex {
 /// Runs the acceptance program in `programs/<name>` and collects every failed
 /// expectation, so one run reports everything that is wrong with a program.
 async fn check(name: &str) {
+  let _memory_guard =
+    rolldown_testing::memory_guard::guard(format!("effect_service_acceptance::{name}"));
   let dir = PathBuf::from(PROGRAMS).join(name);
   let expect: Expect =
     serde_json::from_str(&std::fs::read_to_string(dir.join("expect.json")).expect("expect.json"))
@@ -125,7 +132,8 @@ async fn check(name: &str) {
   let (off_status, off_stdout, off_stderr) = run(&dir, &expect, &off.bundle);
   let (on_status, on_stdout, on_stderr) = run(&dir, &expect, &on.bundle);
   if off_status != 0 {
-    failures.push(format!("the program fails with the pass off (exit {off_status}):\n{off_stderr}"));
+    failures
+      .push(format!("the program fails with the pass off (exit {off_status}):\n{off_stderr}"));
   }
   if on_status != 0 {
     failures.push(format!("the program fails with the pass on (exit {on_status}):\n{on_stderr}"));

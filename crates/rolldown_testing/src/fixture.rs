@@ -5,10 +5,11 @@ use std::{
 
 use crate::{
   integration_test::{IntegrationTest, NamedBundlerOptions},
+  memory_guard,
   test_config::read_test_config,
 };
 use rolldown::{BundlerOptions, plugin::__inner::SharedPluginable};
-use rolldown_common::PreserveEntrySignatures;
+use rolldown_common::{ExperimentalOptions, PreserveEntrySignatures};
 use rolldown_testing_config::{ConfigVariant, TestConfig, TestMeta};
 
 pub struct Fixture {
@@ -76,6 +77,23 @@ impl Fixture {
       expect_execution_failure: variant.expect_execution_failure,
     }))
     .collect::<Vec<_>>();
+
+    // The Effect service analysis runs in this process; cap its memory so a
+    // runaway fails the run instead of exhausting the host. See `memory_guard`.
+    let _memory_guard = configs
+      .iter()
+      .any(|config| {
+        config
+          .options
+          .experimental
+          .as_ref()
+          .is_some_and(ExperimentalOptions::is_effect_service_shaking_enabled)
+      })
+      .then(|| {
+        let workspace = Path::new(env!("WORKSPACE_DIR"));
+        let name = self.fixture_path.strip_prefix(workspace).unwrap_or(&self.fixture_path);
+        memory_guard::guard(name.to_string_lossy().into_owned())
+      });
 
     IntegrationTest::new(meta, self.fixture_path.clone()).run_multiple(configs, plugins).await;
   }

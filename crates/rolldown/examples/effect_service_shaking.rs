@@ -35,6 +35,9 @@ async fn build(entry: &std::path::Path, out_dir: &std::path::Path, enabled: bool
 #[tokio::main]
 async fn main() {
   let args: Vec<String> = std::env::args().collect();
+  // A runaway analysis stops at `ROLLDOWN_TEST_MAX_RSS_MB` instead of
+  // exhausting the host.
+  let _memory_guard = rolldown_testing::memory_guard::guard("effect_service_shaking example");
   let entry = std::path::Path::new(&args[1]).absolutize().into_owned();
   let out = std::path::Path::new(&args[2]).absolutize().into_owned();
   let runs: usize = args.get(3).and_then(|n| n.parse().ok()).unwrap_or(7);

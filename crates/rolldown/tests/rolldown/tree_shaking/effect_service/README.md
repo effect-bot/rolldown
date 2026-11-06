@@ -10,6 +10,10 @@ cargo test --profile effect-verify -p rolldown --test integration -- tree_shakin
 
 72 red, 41 green.
 
+### Memory cap
+
+The analysis runs inside the test process, so a solve that never terminates would keep allocating until the host runs out of memory. A runaway like that hit 45 GiB in 75 seconds. Every fixture with `effectServiceShaking` on, and every acceptance program, runs under `rolldown_testing::memory_guard`. When the test process's resident memory goes over `ROLLDOWN_TEST_MAX_RSS_MB` (default 6144), the guard prints the guarded tests that are still running and exits the process. `0` turns the guard off. Measured peaks with the pass absent are about 650 MiB for this suite and 370 MiB for the acceptance set, counting the Node child processes. The cap applies to the whole process, so it is sized for runs filtered to these tests. To bound a run from outside as well, wrap it: `systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 cargo test ...`.
+
 | fixture                                     | today | what it checks                                                                                                                                                                                                                                                        |
 | ------------------------------------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `all_context`                               | green | A Context collected by Effect.all reaches the program, which enumerates it and reads a method named at run time: every method of its entries stays.                                                                                                                   |
