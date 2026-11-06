@@ -1,5 +1,5 @@
 {
-  "_comment": "A key built at run time with no constant prefix may alias any key, so every provided key keeps every method.",
+  "_comment": "A key whose string comes from the environment at run time, with no constant prefix, may alias any key: the method read through it stays on every provided key. The read names one method, so methods nothing reads are still removed.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

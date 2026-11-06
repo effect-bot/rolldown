@@ -6,6 +6,9 @@
 //! - both runs exit 0 with identical stdout (behaviour is unchanged);
 //! - every name in `expect.json#keep` is still in the enabled bundle;
 //! - no name in `expect.json#remove` is in the enabled bundle;
+//! - names are matched as whole words in the bundle's code with every comment
+//!   blanked out, so a name that survives only in a JSDoc example neither
+//!   satisfies `keep` nor fails `remove`; string literals still count;
 //! - the enabled bundle is at least `minReductionPercent` smaller, when set;
 //! - an `EFFECT_SERVICE_SHAKING` warning is emitted, when `expectDiagnostic` is set.
 //!
@@ -112,6 +115,28 @@ fn word(name: &str) -> regex::Regex {
   regex::Regex::new(&format!(r"\b{}\b", regex::escape(name))).unwrap()
 }
 
+/// The bundle with every comment replaced by a space. Code and string
+/// literals are untouched, so a name still present anywhere but a comment is
+/// still found.
+fn without_comments(code: &str) -> String {
+  let allocator = oxc::allocator::Allocator::default();
+  let ret = oxc::parser::Parser::new(&allocator, code, oxc::span::SourceType::mjs()).parse();
+  assert!(
+    !ret.fatal_error && ret.diagnostics.is_empty(),
+    "the enabled bundle should parse: {:?}",
+    ret.diagnostics
+  );
+  let mut stripped = String::with_capacity(code.len());
+  let mut end = 0;
+  for comment in &ret.program.comments {
+    stripped.push_str(&code[end..comment.span.start as usize]);
+    stripped.push(' ');
+    end = comment.span.end as usize;
+  }
+  stripped.push_str(&code[end..]);
+  stripped
+}
+
 /// Runs the acceptance program in `programs/<name>` and collects every failed
 /// expectation, so one run reports everything that is wrong with a program.
 async fn check(name: &str) {
@@ -142,7 +167,7 @@ async fn check(name: &str) {
     failures.push(format!("stdout differs.\noff:\n{off_stdout}\non:\n{on_stdout}"));
   }
 
-  let code = std::fs::read_to_string(&on.bundle).unwrap();
+  let code = without_comments(&std::fs::read_to_string(&on.bundle).unwrap());
   for keep in &expect.keep {
     if !word(keep).is_match(&code) {
       failures.push(format!("`{keep}` should be kept"));

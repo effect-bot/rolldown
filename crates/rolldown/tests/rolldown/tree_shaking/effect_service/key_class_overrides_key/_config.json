@@ -1,5 +1,5 @@
 {
-  "_comment": "A class-form key with a static `key` override: its services live under the overriding string, so a key declared with that string reads the same service and the method it calls stays.",
+  "_comment": "A class-form key with a static `key` override: its services live under the overriding string, so a key declared with that string reads the same service and the method it calls stays. The method nothing reads is removed.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

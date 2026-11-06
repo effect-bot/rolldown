@@ -5,18 +5,19 @@ import * as Layer from 'effect/Layer';
 
 // A class-form key that overrides the inherited `key`: its services live under
 // the static string, not the one in the heritage, so a key declared with that
-// string reads the same service.
+// string reads the same service. Nothing reads `overridesKeyUnread`.
 class Store extends Context.Service()('test/RealKeyClassDeclaredIdentity') {
   static key = 'test/RealKeyClassActualIdentity';
 }
 const Alias = Context.Service('test/RealKeyClassActualIdentity');
 const overridesKeyUnusedHelper = () => 'unused';
+const overridesKeyUnreadHelper = () => 'unread';
 
 const StoreLayer = Layer.effect(
   Store,
   Effect.gen(function* () {
     return Store.of({
-      readOne: () => 'read',
+      overridesKeyUnread: () => overridesKeyUnreadHelper(),
       overridesKeyUnused: () => overridesKeyUnusedHelper(),
     });
   }),
