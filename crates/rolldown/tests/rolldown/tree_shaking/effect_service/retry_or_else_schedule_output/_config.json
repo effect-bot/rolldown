@@ -1,0 +1,10 @@
+{
+  "_comment": "When Effect.retryOrElse's Schedule is exhausted, orElse receives the Schedule's last output, here the service: the method orElse calls on it stays, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
