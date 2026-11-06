@@ -1,5 +1,5 @@
 {
-  "_comment": "Retention: MemoMap.get on Layer.CurrentMemoMap returns the memoised build of StoreLayer; the program reads Store out of its Context and calls it by a computed name, so every method stays (CurrentMemoMap itself is never pruned). Uses the real effect package from the repository devDependencies.",
+  "_comment": "MemoMap is ignored (Tim's decision): Store reached through Layer.CurrentMemoMap and MemoMap.get and called by a computed name keeps nothing, so memoUnused is removed and the bundle is not run. Only the public read is asserted (CurrentMemoMap itself is never pruned).",
   "config": {
     "experimental": {
       "effectServiceShaking": true
