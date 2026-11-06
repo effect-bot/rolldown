@@ -1,0 +1,10 @@
+{
+  "_comment": "Readers declared in side-effect-free top-level statements of other modules, reached through a binding chain, a namespace read by name, a barrel namespace, an enumerated namespace, and a hook registered by a side-effectful initialiser nothing imports: every method read stays, the unread one goes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
