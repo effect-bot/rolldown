@@ -146,6 +146,8 @@ pub enum EventKind {
   /// Whether to emit warnings when the options of a dynamic import are not statically analyzable while `experimental.importAttributes` is on.
   InvalidImportAttribute = 55,
   LazyBarrelUnloadedBindingError = 56,
+  /// Whether to emit warnings when `experimental.effectServiceShaking` cannot analyse a build, such as when `effect` is external.
+  EffectServiceShaking = 57,
 }
 
 impl Display for EventKind {
@@ -158,6 +160,7 @@ impl Display for EventKind {
       EventKind::DeprecatedImportAssertion => write!(f, "DEPRECATED_IMPORT_ASSERTION"),
       EventKind::InvalidImportAttribute => write!(f, "INVALID_IMPORT_ATTRIBUTE"),
       EventKind::LazyBarrelUnloadedBindingError => write!(f, "LAZY_BARREL_UNLOADED_BINDING"),
+      EventKind::EffectServiceShaking => write!(f, "EFFECT_SERVICE_SHAKING"),
       EventKind::CircularDependency => write!(f, "CIRCULAR_DEPENDENCY"),
       EventKind::CircularReexportError => write!(f, "CIRCULAR_REEXPORT"),
       EventKind::Eval => write!(f, "EVAL"),

@@ -23,6 +23,7 @@ pub mod configuration_field_conflict;
 pub mod could_not_clean_directory;
 pub mod deprecated_import_assertion;
 pub mod duplicate_shebang;
+pub mod effect_service_shaking;
 pub mod empty_import_meta;
 pub mod eval;
 pub mod external_entry;

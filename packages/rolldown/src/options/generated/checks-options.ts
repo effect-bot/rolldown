@@ -225,4 +225,10 @@ export interface ChecksOptions {
    * @default true
    * */
   invalidImportAttribute?: boolean;
+
+  /**
+   * Whether to emit warnings when `experimental.effectServiceShaking` cannot analyse a build, such as when `effect` is external.
+   * @default true
+   * */
+  effectServiceShaking?: boolean;
 }

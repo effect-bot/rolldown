@@ -34,10 +34,27 @@ pub struct Site {
   pub sub: u32,
 }
 
+/// Tag of the sub-sites rules make (bit 31 marks the end-tagged sites the generator makes).
+const RULE_SUB: u32 = 0x4000_0000;
+/// Tag of the call sites inside a function clone (both bits); the low bits index `clone_sites`.
+const CLONE_SUB: u32 = 0xC000_0000;
+
 impl Site {
   /// A sub-site for a call a rule makes on `callee` on behalf of this call.
+  ///
+  /// Calls a rule makes from a sub-site stay on that sub-site: rules mint fresh variables each
+  /// time they run, so a site per variable would let a rule that reaches itself (`pipe` handed
+  /// `pipe`) mint memo entries without end. On one site such calls merge into the first
+  /// invocation of each callee (`rule_memo`), which keeps the constraint set finite.
   pub fn sub(self, callee: VarId) -> Site {
-    Site { module: self.module, start: self.start, sub: callee.raw().wrapping_add(1) }
+    if self.sub & CLONE_SUB == RULE_SUB {
+      return self;
+    }
+    Site {
+      module: self.module,
+      start: self.start,
+      sub: RULE_SUB | (callee.raw().wrapping_add(1) & !CLONE_SUB),
+    }
   }
 }
 
@@ -71,6 +88,7 @@ pub enum FnKind {
   AsyncGenerator,
 }
 
+#[expect(clippy::struct_excessive_bools)]
 pub struct FnInfo {
   pub params: Vec<VarId>,
   pub rest: Option<VarId>,
@@ -91,8 +109,52 @@ pub struct FnInfo {
   pub pending: Vec<Pending>,
   pub module: ModuleIdx,
   pub span_start: u32,
+  /// Variables that belong to this function's body (temporaries, parameters, local
+  /// bindings), renamed in a clone. Anything not listed is shared with the clone.
+  pub locals: Vec<VarId>,
+  /// No function or class is created in the body.
+  pub leaf: bool,
+  /// Calls get a copy of the body per call site (see `Analysis::clone_for`); `pending` is
+  /// kept as the template.
+  pub cloneable: bool,
+  /// For arrows, the `this` of the enclosing function.
+  pub enclosing_this: Option<VarId>,
+  /// Number of clones made of this function.
+  pub clones: u32,
 }
 
+impl FnInfo {
+  pub fn new(
+    module: ModuleIdx,
+    span_start: u32,
+    kind: FnKind,
+    [this, ret, yielded_fail, yielded, arguments_elem]: [VarId; 5],
+  ) -> Self {
+    Self {
+      params: vec![],
+      rest: None,
+      this,
+      ret,
+      yielded_fail,
+      yielded,
+      arguments_elem,
+      kind,
+      returns_closure_only: false,
+      closure: None,
+      activated: false,
+      pending: vec![],
+      module,
+      span_start,
+      locals: vec![],
+      leaf: true,
+      cloneable: false,
+      enclosing_this: None,
+      clones: 0,
+    }
+  }
+}
+
+#[derive(Clone)]
 pub enum Pending {
   Copy(VarId, VarId),
   Constraint(VarId, Constraint),
@@ -171,6 +233,71 @@ pub enum Constraint {
   SetProto(VarId),
   /// Objects in a Layer/Context position: opaque ones may provide any key.
   Provision,
+  /// Entries of a string-keyed map (`Context.makeUnsafe`): `Str` objects are its keys and flow
+  /// into the variable; opaque values may be any string, so they name every key; containers (the
+  /// `[key, value]` pairs) and other values cannot match a string key and are skipped.
+  MapKeys(VarId),
+}
+
+impl Key {
+  fn remap(&self, v: &impl Fn(VarId) -> VarId) -> Key {
+    match self {
+      Key::Var(k) => Key::Var(v(*k)),
+      other => other.clone(),
+    }
+  }
+}
+
+impl Constraint {
+  /// The same constraint with variables renamed by `v` and call sites by `s` (for clones).
+  fn remap(&self, v: &impl Fn(VarId) -> VarId, s: &mut impl FnMut(Site) -> Site) -> Constraint {
+    use Constraint as C;
+    match self {
+      C::Load { key, dst } => C::Load { key: key.remap(v), dst: v(*dst) },
+      C::Store { key, src } => C::Store { key: key.remap(v), src: v(*src) },
+      C::LoadThrough { base, dst } => C::LoadThrough { base: v(*base), dst: v(*dst) },
+      C::StoreThrough { base, src } => C::StoreThrough { base: v(*base), src: v(*src) },
+      C::Call(call) => C::Call(Box::new(Call {
+        site: s(call.site),
+        this: call.this.map(v),
+        args: call
+          .args
+          .iter()
+          .map(|a| match a {
+            Arg::Var(x) => Arg::Var(v(*x)),
+            Arg::Spread(x) => Arg::Spread(v(*x)),
+          })
+          .collect(),
+        ret: v(call.ret),
+        is_new: call.is_new,
+        builtin: call.builtin,
+      })),
+      C::SuccessOf(x) => C::SuccessOf(v(*x)),
+      C::FailureOf(x) => C::FailureOf(v(*x)),
+      C::KeyUse(u) => C::KeyUse(match u {
+        KeyUse::Lookup(x) => KeyUse::Lookup(v(*x)),
+        KeyUse::Provide(x) => KeyUse::Provide(v(*x)),
+        KeyUse::Strings(x) => KeyUse::Strings(v(*x)),
+        KeyUse::Bail => KeyUse::Bail,
+      }),
+      C::ContextKeys(x) => C::ContextKeys(v(*x)),
+      C::ElemOf(x) => C::ElemOf(v(*x)),
+      C::Contents(x) => C::Contents(v(*x)),
+      C::Callables(x) => C::Callables(v(*x)),
+      C::AwaitOf(x) => C::AwaitOf(v(*x)),
+      C::SpreadTarget(x) => C::SpreadTarget(v(*x)),
+      C::ProtoOf(x) => C::ProtoOf(v(*x)),
+      C::SetProto(x) => C::SetProto(v(*x)),
+      C::MapKeys(x) => C::MapKeys(v(*x)),
+      C::Demand(_)
+      | C::DemandAll
+      | C::Escape(..)
+      | C::Enumerate
+      | C::Protocol(_)
+      | C::SpreadInto(_)
+      | C::Provision => self.clone(),
+    }
+  }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -336,6 +463,9 @@ pub struct Obj {
   /// The prototype object of a host builtin (`Map.prototype`): writing to it changes what the
   /// models assume.
   pub builtin_proto: bool,
+  /// A live view of runtime objects' entries (`Context.mapUnsafe`): the keys of the viewed
+  /// objects. Writing to the view, or handing it to external code, changes their entries.
+  pub view_of: Option<VarId>,
 }
 
 #[derive(Default)]
@@ -372,6 +502,13 @@ pub struct Analysis {
   pub rule_calls: FxHashMap<u16, usize>,
   /// One "any argument" variable per spread call, shared by every `arg` read of that call.
   pub spread_any: FxHashMap<(Site, VarId), VarId>,
+  /// Function clones by (function, call site); see `clone_for`.
+  clone_memo: FxHashMap<(FnId, Site), FnId>,
+  /// Interned clone-tagged call sites: (site in the template, clone) -> index.
+  clone_site_ids: FxHashMap<(Site, FnId), u32>,
+  /// Per index: the template site and the clone depth of the function holding it.
+  clone_sites: Vec<(Site, u8)>,
+  rest_arrays: FxHashMap<FnId, ObjId>,
   /// Named loads by property name: (base variable, destination). A load wires only objects that
   /// have the field; when a store creates the field later, the registry wires the load then.
   loads_by_name: FxHashMap<ArcStr, FxHashSet<(VarId, VarId)>>,
@@ -449,6 +586,10 @@ impl Analysis {
       rule_calls: FxHashMap::default(),
       rule_memo: FxHashMap::default(),
       spread_any: FxHashMap::default(),
+      clone_memo: FxHashMap::default(),
+      clone_site_ids: FxHashMap::default(),
+      clone_sites: vec![],
+      rest_arrays: FxHashMap::default(),
       loads_by_name: FxHashMap::default(),
       debug: std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_DEBUG").is_some(),
       top_ext,
@@ -841,12 +982,14 @@ impl Analysis {
         format!("v{v}:{n} {kinds:?} c{}", self.vars[var].constraints.len())
       })
       .collect();
-    eprintln!(
-      "[effect-service-shaking] loads by name {:?}; calls by module {:?}; fattest vars {:?}",
-      &names[..names.len().min(15)],
-      &modules[..modules.len().min(8)],
-      fat_desc
-    );
+    if self.debug {
+      eprintln!(
+        "[effect-service-shaking] loads by name {:?}; calls by module {:?}; fattest vars {:?}",
+        &names[..names.len().min(15)],
+        &modules[..modules.len().min(8)],
+        fat_desc
+      );
+    }
     let mut calls: Vec<(&str, usize)> =
       self.rule_calls.iter().map(|(r, n)| (self.rules[*r as usize].0, *n)).collect();
     calls.sort_by_key(|x| std::cmp::Reverse(x.1));
@@ -889,7 +1032,11 @@ impl Analysis {
         break;
       }
       while let Some(f) = self.activation_queue.pop() {
-        let pending = std::mem::take(&mut self.fns[f].pending);
+        let pending = if self.fns[f].cloneable {
+          self.fns[f].pending.clone()
+        } else {
+          std::mem::take(&mut self.fns[f].pending)
+        };
         for p in pending {
           match p {
             Pending::Copy(src, dst) => self.copy(src, dst),
@@ -1043,6 +1190,13 @@ impl Analysis {
           for src in sources {
             self.constrain(src, Constraint::Provision);
           }
+        }
+        _ => {}
+      },
+      Constraint::MapKeys(dst) => match self.objs[obj].kind {
+        ObjKind::Str(_) => self.seed(*dst, obj),
+        ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => {
+          self.seed(*dst, self.all_keys);
         }
         _ => {}
       },
@@ -1316,6 +1470,7 @@ impl Analysis {
     if self.objs[obj].builtin_proto {
       self.bail_everything("a builtin prototype is modified: the Context model no longer holds");
     }
+    self.bail_view(obj, "a view of a Context's entries is written");
     match self.objs[obj].kind.clone() {
       ObjKind::Key { strings, .. } => {
         // `key.key = x` retargets the key: whatever `x` names is now looked up through it.
@@ -1372,6 +1527,7 @@ impl Analysis {
     if self.objs[obj].builtin_proto {
       self.bail_everything("a builtin prototype is modified: the Context model no longer holds");
     }
+    self.bail_view(obj, "a view of a Context's entries is written");
     match self.objs[obj].kind.clone() {
       ObjKind::Key { strings, .. } => self.copy(src, strings),
       ObjKind::Object
@@ -1533,7 +1689,104 @@ impl Analysis {
     ctor.map_or(ModuleIdx::from_raw(0), |f| self.fns[f].module)
   }
 
+  /// The array a function's rest parameter holds. One per function: the parameter itself is
+  /// shared by every caller, so an array per call site would add objects and no precision (and
+  /// rules mint call sites as they run, which made the count unbounded in practice).
+  fn rest_array(&mut self, f: FnId) -> ObjId {
+    if let Some(arr) = self.rest_arrays.get(&f) {
+      return *arr;
+    }
+    let arr = self.alloc(ObjKind::Array, None);
+    self.rest_arrays.insert(f, arr);
+    arr
+  }
+
+  /// Clones beyond this depth (a clone called from a clone ...) are keyed by the template
+  /// call site, which bounds the number of clones.
+  const MAX_CLONE_DEPTH: u8 = 2;
+  const MAX_CLONES_PER_FN: u32 = 64;
+
+  /// Per-call-site cloning of small functions (design §2): a leaf function called from a
+  /// known site gets its own copy of the body, so the values of different callers do not
+  /// merge in its parameters. Its calls get clone-tagged sites, so the clones they make and
+  /// the model objects rules allocate are per clone too. Variables the body does not own
+  /// (captured bindings, object fields) stay shared, so a clone is never less sound than the
+  /// shared body.
+  fn clone_for(&mut self, f: FnId, call: &Call) -> FnId {
+    if !self.fns[f].cloneable {
+      return f;
+    }
+    let (origin, depth) = if call.site.sub & CLONE_SUB == CLONE_SUB {
+      self.clone_sites[(call.site.sub & !CLONE_SUB) as usize]
+    } else {
+      (call.site, 0)
+    };
+    let key_site = if depth >= Self::MAX_CLONE_DEPTH { origin } else { call.site };
+    if let Some(c) = self.clone_memo.get(&(f, key_site)) {
+      return *c;
+    }
+    if self.fns[f].clones >= Self::MAX_CLONES_PER_FN {
+      return f;
+    }
+    self.fns[f].clones += 1;
+    let depth = (depth + 1).min(Self::MAX_CLONE_DEPTH);
+    let info = &self.fns[f];
+    let own = [info.this, info.ret, info.yielded_fail, info.yielded, info.arguments_elem];
+    let locals = info.locals.clone();
+    let template = info.pending.clone();
+    let (params, rest, kind, returns_closure_only, closure, module, span_start, enclosing_this) = (
+      info.params.clone(),
+      info.rest,
+      info.kind,
+      info.returns_closure_only,
+      info.closure,
+      info.module,
+      info.span_start,
+      info.enclosing_this,
+    );
+    let mut map: FxHashMap<VarId, VarId> = FxHashMap::default();
+    for v in own.iter().chain(&locals).chain(&params).chain(rest.iter()) {
+      if !map.contains_key(v) {
+        let nv = self.var();
+        map.insert(*v, nv);
+      }
+    }
+    let m = |v: VarId| *map.get(&v).unwrap_or(&v);
+    let id = self.fns.next_idx();
+    let mut tag = |site: Site| -> Site {
+      let next = u32::try_from(self.clone_sites.len()).expect("too many clone sites");
+      let index = *self.clone_site_ids.entry((site, id)).or_insert(next);
+      if index == next {
+        self.clone_sites.push((site, depth));
+      }
+      Site { module: site.module, start: site.start, sub: CLONE_SUB | index }
+    };
+    let mut pending: Vec<Pending> = template
+      .iter()
+      .map(|p| match p {
+        Pending::Copy(a, b) => Pending::Copy(m(*a), m(*b)),
+        Pending::Constraint(v, c) => Pending::Constraint(m(*v), c.remap(&m, &mut tag)),
+        Pending::Seed(v, o) => Pending::Seed(m(*v), *o),
+        Pending::Activate(g) => Pending::Activate(*g),
+      })
+      .collect();
+    if let Some(e) = enclosing_this {
+      pending.push(Pending::Copy(e, m(own[0])));
+    }
+    let mut clone = FnInfo::new(module, span_start, kind, own.map(m));
+    clone.params = params.iter().map(|p| m(*p)).collect();
+    clone.rest = rest.map(m);
+    clone.returns_closure_only = returns_closure_only;
+    clone.closure = closure;
+    clone.pending = pending;
+    let id2 = self.fns.push(clone);
+    debug_assert_eq!(id, id2);
+    self.clone_memo.insert((f, key_site), id);
+    id
+  }
+
   pub fn call_fn(&mut self, f: FnId, call: &Call, instance: Option<ObjId>) {
+    let f = if instance.is_none() { self.clone_for(f, call) } else { f };
     self.activate(f);
     let (params, rest, this_var, ret, kind, arguments_elem) = {
       let info = &self.fns[f];
@@ -1567,7 +1820,7 @@ impl Analysis {
         self.copy(any, *p);
       }
       if let Some(r) = rest {
-        let arr = self.site_obj(call.site, 201, |_| ObjKind::Array);
+        let arr = self.rest_array(f);
         let elem = self.elem(arr);
         self.copy(any, elem);
         self.seed(r, arr);
@@ -1580,7 +1833,7 @@ impl Analysis {
         }
       }
       if let Some(r) = rest {
-        let arr = self.site_obj(call.site, 201, |_| ObjKind::Array);
+        let arr = self.rest_array(f);
         let elem = self.elem(arr);
         for a in call.args.iter().skip(params.len()) {
           if let Arg::Var(v) = a {
@@ -1890,6 +2143,18 @@ impl Analysis {
     }
   }
 
+  /// Bails the keys behind a view of runtime objects' entries, including keys that join the
+  /// view later.
+  fn bail_view(&mut self, obj: ObjId, reason: &str) {
+    if let Some(keys) = self.objs[obj].view_of {
+      let bail = Constraint::KeyUse(KeyUse::Bail);
+      if !self.vars[keys].constraint_set.contains(&bail) {
+        self.bail_reasons.push(format!("{reason} (from {:?})", self.objs[obj].site));
+        self.constrain(keys, bail);
+      }
+    }
+  }
+
   pub fn bail_everything(&mut self, reason: &str) {
     self.bail_all = true;
     if self.bail_reasons.len() < 20 && !self.bail_reasons.iter().any(|r| r == reason) {
@@ -1908,6 +2173,9 @@ impl Analysis {
     // the closures it holds become reachable, with unknown arguments. External code may do
     // anything with what it receives.
     let external = flavour == Flavour::Ext;
+    if external {
+      self.bail_view(obj, "a view of a Context's entries escapes to external code");
+    }
     match self.objs[obj].kind.clone() {
       ObjKind::Object | ObjKind::Array | ObjKind::Class { .. } => {
         if external {
@@ -2034,7 +2302,7 @@ impl Analysis {
       self.seed(p, t);
     }
     if let Some(r) = rest {
-      let arr = self.alloc(ObjKind::Array, None);
+      let arr = self.rest_array(f);
       let elem = self.elem(arr);
       self.seed(elem, t);
       self.seed(r, arr);
@@ -2070,6 +2338,7 @@ impl Obj {
       site,
       protocols: 0,
       builtin_proto: false,
+      view_of: None,
     }
   }
 }

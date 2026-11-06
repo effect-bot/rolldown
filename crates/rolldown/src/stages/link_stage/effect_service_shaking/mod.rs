@@ -1,7 +1,7 @@
 //! Removal of Effect service methods that nothing in the bundle can read
 //! (`experimental.effectServiceShaking`, EFF-3430).
 //!
-//! A whole-bundle, inclusion-based value-flow analysis (`heap.rs`, `gen.rs`)
+//! A whole-bundle, inclusion-based value-flow analysis (`heap.rs`, `generate.rs`)
 //! with built-in models of JavaScript builtins (`host.rs`) and of the stable
 //! primitives of `effect` 4.x (`effect.rs`). Demand is recorded per key and
 //! applied to every provider of that key; `prune.rs` turns it into property
@@ -9,6 +9,9 @@
 //! what the removed methods were the only users of.
 //!
 //! Runs after `cross_module_optimization` and before `include_statements`.
+//!
+//! See `internal-docs/effect-service-shaking/implementation.md` (the how) and
+//! `internal-docs/effect-service-shaking/design.md` (the why).
 
 #![expect(clippy::print_stderr, reason = "the opt-in debug report")]
 
@@ -22,6 +25,7 @@ use arcstr::ArcStr;
 use oxc::ast::ast::{ClassElement, Expression, Statement};
 use oxc_index::IndexVec;
 use rolldown_common::{ExportsKind, Module, ModuleIdx, Specifier, SymbolRef};
+use rolldown_error::{BuildDiagnostic, EventKindSwitcher};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::generate::{Gen, ModuleFacts, Shared};
@@ -29,6 +33,14 @@ use self::heap::{Analysis, Constraint, Flavour, ObjKind};
 use super::LinkStage;
 
 impl LinkStage<'_> {
+  fn warn_effect_service_shaking(&mut self, reason: String) {
+    if self.options.checks.contains(EventKindSwitcher::EffectServiceShaking) {
+      self
+        .diagnostics
+        .push(BuildDiagnostic::effect_service_shaking(reason).with_severity_warning());
+    }
+  }
+
   #[tracing::instrument(level = "debug", skip_all)]
   #[expect(clippy::too_many_lines, reason = "one orchestration: bind, generate, solve, prune")]
   pub(super) fn effect_service_shaking(&mut self) {
@@ -97,8 +109,14 @@ impl LinkStage<'_> {
     }
 
     // == the Effect model, bound to canonical symbols of the public modules
+    // The modelled modules are the public modules `MODULES` names, plus the modules their
+    // explicitly ruled exports resolve into (`Effect.map` is `internal.map`, so
+    // `internal/effect.js` sits behind rules too). Every other module of the package is
+    // ordinary code and analysed generically. See design section 3.
     let mut effect_found = false;
     let mut effect_external = false;
+    let mut unsupported_version: Option<String> = None;
+    let mut public_modules: Vec<(ModuleIdx, &'static [(&'static str, effect::Spec)])> = vec![];
     for module in &self.module_table.modules {
       match module {
         Module::Normal(normal) => {
@@ -107,43 +125,16 @@ impl LinkStage<'_> {
             continue;
           }
           effect_found = true;
-          let path = normal.id.as_ref().replace('\\', "/");
-          if effect::GENERIC_MODULES.iter().any(|suffix| path.ends_with(suffix)) {
-            continue;
+          if let Some(version) = pkg.version() {
+            if version.split('.').next() != Some(effect::SUPPORTED_MAJOR) {
+              unsupported_version = Some(version.to_string());
+            }
           }
-          let public =
-            effect::MODULES.iter().find(|(name, _)| path.ends_with(&format!("/dist/{name}.js")));
-          let data = effect::DATA_MODULES.iter().any(|suffix| path.ends_with(suffix));
-          let exports: Vec<(ArcStr, SymbolRef)> = self.metas[normal.idx]
-            .resolved_exports
-            .iter()
-            .map(|(n, e)| (ArcStr::from(n.as_str()), e.symbol_ref))
-            .collect();
-          for (name, symbol) in exports {
-            let spec = public.and_then(|(_, specs)| {
-              specs.iter().find(|(n, _)| *n == name.as_str()).map(|(_, s)| *s)
-            });
-            let chain = self.alias_chain(symbol);
-            let obj = match spec {
-              Some(spec) => effect::spec_object(&mut a, spec),
-              None => match chain.iter().find_map(|sym| self.key_declaration_of(*sym)) {
-                Some((key_name, reference)) => {
-                  effect::declared_key(&mut a, key_name.as_deref(), reference)
-                }
-                None if data => effect::data_object(&mut a),
-                None => effect::default_object(&mut a),
-              },
-            };
-            // The export's own declaration always gets its spec; the declarations it aliases
-            // take it only when nothing more specific claimed them (`Reference` aliases
-            // `Service` in `Context.js`, and `Service` must keep its own rule).
-            let mut chain = chain.into_iter();
-            if let Some(own) = chain.next() {
-              sh.rule_symbols.insert(own, obj);
-            }
-            for sym in chain {
-              sh.rule_symbols.entry(sym).or_insert(obj);
-            }
+          let path = normal.id.as_ref().replace('\\', "/");
+          if let Some((_, specs)) =
+            effect::MODULES.iter().find(|(name, _)| path.ends_with(&format!("/dist/{name}.js")))
+          {
+            public_modules.push((normal.idx, specs));
           }
         }
         Module::External(ext) => {
@@ -154,8 +145,105 @@ impl LinkStage<'_> {
         }
       }
     }
-    if effect_external && !effect_found {
-      tracing::debug!("effect service shaking: `effect` is external, nothing can be recognised");
+    // See internal-docs/effect-service-shaking/design.md (diagnostics): when `effect` is external
+    // or does not match the model, one warning says so and the pass does no work.
+    if effect_external {
+      self.warn_effect_service_shaking(
+        "`effect` is external, so no Effect primitive can be recognised".to_string(),
+      );
+      return;
+    }
+    if !effect_found {
+      // No `effect` in the bundle: no service key can exist.
+      return;
+    }
+    if let Some(version) = unsupported_version {
+      self.warn_effect_service_shaking(format!(
+        "`effect` {version} is not a supported version (the model covers {}.x)",
+        effect::SUPPORTED_MAJOR
+      ));
+      return;
+    }
+    let missing: Vec<String> = public_modules
+      .iter()
+      .flat_map(|(module, specs)| {
+        let exports = &self.metas[*module].resolved_exports;
+        let path = self.module_table[*module].id().to_string();
+        specs
+          .iter()
+          .filter(move |(name, _)| !exports.contains_key(*name))
+          .map(move |(name, _)| format!("{}#{name}", path.rsplit('/').next().unwrap_or(&path)))
+      })
+      .collect();
+    if !missing.is_empty() {
+      self.warn_effect_service_shaking(format!(
+        "`effect` does not match the model, missing exports: {}",
+        missing.join(", ")
+      ));
+      return;
+    }
+    let mut modelled: FxHashSet<ModuleIdx> = public_modules.iter().map(|(m, _)| *m).collect();
+    for (module, specs) in &public_modules {
+      for (name, export) in &self.metas[*module].resolved_exports {
+        if specs.iter().any(|(n, _)| *n == name.as_str()) {
+          for sym in self.alias_chain(export.symbol_ref) {
+            modelled.insert(sym.owner);
+          }
+        }
+      }
+    }
+    // Model-bound declarations that alias ordinary code, linked once every rule is bound.
+    let mut links: Vec<(SymbolRef, SymbolRef)> = vec![];
+    for module in modelled.iter().copied().collect::<Vec<_>>() {
+      let specs = public_modules.iter().find(|(m, _)| *m == module).map(|(_, s)| *s);
+      let exports: Vec<(ArcStr, SymbolRef)> = self.metas[module]
+        .resolved_exports
+        .iter()
+        .map(|(n, e)| (ArcStr::from(n.as_str()), e.symbol_ref))
+        .collect();
+      for (name, symbol) in exports {
+        let spec =
+          specs.and_then(|specs| specs.iter().find(|(n, _)| *n == name.as_str()).map(|(_, s)| *s));
+        let chain = self.alias_chain(symbol);
+        // Only declarations inside modelled modules take a model object: an export that aliases
+        // ordinary code is that code (`export const x = internalRecord.x`).
+        let generic_target = chain.iter().copied().find(|sym| !modelled.contains(&sym.owner));
+        let chain: Vec<SymbolRef> =
+          chain.into_iter().take_while(|sym| modelled.contains(&sym.owner)).collect();
+        let obj = match spec {
+          Some(spec) => effect::spec_object(&mut a, spec),
+          None => match chain.iter().find_map(|sym| self.key_declaration_of(*sym)) {
+            Some((key_name, reference)) => {
+              effect::declared_key(&mut a, key_name.as_deref(), reference)
+            }
+            None => {
+              if let Some(target) = generic_target {
+                links.extend(chain.iter().map(|sym| (target, *sym)));
+                continue;
+              }
+              effect::default_object(&mut a)
+            }
+          },
+        };
+        // The export's own declaration always gets its spec; the declarations it aliases
+        // take it only when nothing more specific claimed them (`Reference` aliases
+        // `Service` in `Context.js`, and `Service` must keep its own rule).
+        let mut chain = chain.into_iter();
+        if let Some(own) = chain.next() {
+          sh.rule_symbols.insert(own, obj);
+        }
+        for sym in chain {
+          sh.rule_symbols.entry(sym).or_insert(obj);
+        }
+      }
+    }
+    for (target, sym) in links {
+      if sh.rule_symbols.contains_key(&sym) {
+        continue;
+      }
+      let to = sh.symbol_var(&mut a, target);
+      let from = sh.symbol_var(&mut a, sym);
+      a.copy(to, from);
     }
 
     phase!("model bound, {} rule symbols", sh.rule_symbols.len());
@@ -169,16 +257,9 @@ impl LinkStage<'_> {
     for module in &self.module_table.modules {
       let Module::Normal(normal) = module else { continue };
       let Some(ast) = self.ast_table[normal.idx].as_ref() else { continue };
-      if normal
-        .originative_resolved_id
-        .package_json
-        .as_ref()
-        .is_some_and(|p| p.name() == Some("effect"))
-      {
-        let path = normal.id.as_ref().replace('\\', "/");
-        if !effect::GENERIC_MODULES.iter().any(|suffix| path.ends_with(suffix)) {
-          continue;
-        }
+      // Modelled modules sit behind rules; their bodies are never analysed.
+      if modelled.contains(&normal.idx) {
+        continue;
       }
       let scoping = self.symbols[normal.idx].as_ref().expect("module symbols").scoping();
       let mut external_imports = FxHashMap::default();

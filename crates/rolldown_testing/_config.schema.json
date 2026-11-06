@@ -1627,6 +1627,12 @@
             "boolean",
             "null"
           ]
+        },
+        "effectServiceShaking": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

@@ -2031,6 +2031,7 @@ export interface BindingChecksOptions {
   shimmedExport?: boolean
   deprecatedImportAssertion?: boolean
   invalidImportAttribute?: boolean
+  effectServiceShaking?: boolean
 }
 
 export interface BindingChunkImportMap {

@@ -2,14 +2,10 @@
 //! the AST mutation, and the `StmtInfo` patch that lets Rolldown's tree shaking
 //! drop what the removed methods were the only users of.
 
-#![expect(
-  clippy::wildcard_imports,
-  clippy::print_stderr,
-  reason = "the oxc AST is used wholesale; stderr is the opt-in debug report"
-)]
+#![expect(clippy::print_stderr, reason = "stderr is the opt-in debug report")]
 
 use arcstr::ArcStr;
-use oxc::ast::ast::*;
+use oxc::ast::ast::{IdentifierReference, ObjectExpression, Program};
 use oxc::ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc::span::{GetSpan, Span};
 use rolldown_common::{ModuleIdx, StmtInfoIdx, SymbolOrMemberExprRef};
@@ -291,12 +287,13 @@ pub fn plan(
   (edits, report)
 }
 
-/// The property's value is provably a function.
+/// The property's value is provably a function, or a primitive such as a `var` read before its
+/// initialisation: removing it cannot drop an object some other path still uses.
 fn is_method(a: &Analysis, prop: &PropInfo) -> bool {
   let pts = a.pts(prop.value);
   !pts.is_empty()
     && pts.iter().all(|o| match &a.objs[*o].kind {
-      ObjKind::Closure(_) => true,
+      ObjKind::Closure(_) | ObjKind::Prim | ObjKind::Str(_) | ObjKind::Num(_) => true,
       ObjKind::Builtin { rule, .. } => {
         PURE_RULES.contains(&a.rules[*rule as usize].0)
           || a.rules[*rule as usize].0.ends_with(".fn")

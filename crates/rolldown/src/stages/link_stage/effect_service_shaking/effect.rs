@@ -3,17 +3,19 @@
 //!
 //! Rules bind to the canonical symbols of the public exports listed in
 //! `MODULES` (see `mod.rs`), so `internalEffect.map` inside `effect`'s own
-//! modules hits the same rule as `Effect.map` in user code. Exports of the
-//! modelled modules without an explicit rule get `effect:default`, which is
-//! sound by construction: callbacks receive every argument-derived value plus
-//! the runtime objects Effect hands out, and the result yields the same.
-//! Everything outside these modules is analysed as ordinary code.
+//! modules hits the same rule as `Effect.map` in user code. The modelled
+//! modules are the public ones listed here and the internal modules their ruled
+//! exports resolve into. Their exports without an explicit rule get
+//! `effect:default`, which is sound by construction: callbacks receive every
+//! argument-derived value plus the runtime objects Effect hands out, and the
+//! result yields the same. Every other module, inside `effect` or not, is
+//! analysed as ordinary code (design section 3).
 
 #![expect(clippy::many_single_char_names, reason = "rules are small closures over `a` and `c`")]
 
 use arcstr::ArcStr;
 
-use super::heap::{Analysis, Arg, Call, Constraint, Flavour, KeyUse, ObjId, ObjKind, Site, VarId};
+use super::heap::{Analysis, Arg, Call, Constraint, KeyUse, ObjId, ObjKind, Site, VarId};
 use super::host::{
   arg, args_from, await_of, const_string_of, elem_of, host_var, invoke, invoke_args, load,
   new_array, new_object, new_promise, prim_var, this_of,
@@ -37,7 +39,14 @@ pub enum Spec {
   FiberEffect,
   /// An empty Layer.
   EmptyLayer,
+  /// `Pipeable.Prototype`: an object whose `pipe` method applies its arguments in order.
+  PipeablePrototype,
+  /// `Pipeable.Class`: a constructor that does nothing, with `Pipeable.Prototype` as prototype.
+  PipeableClass,
 }
+
+/// The `effect` major version the model is written against.
+pub const SUPPORTED_MAJOR: &str = "4";
 
 /// Public modules and their explicit exports. Every other export of these
 /// modules gets `effect:default`.
@@ -63,7 +72,6 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("empty", Spec::Rule("effect:Context.empty")),
       ("isContext", Spec::Rule("effect:prim")),
       ("isReference", Spec::Rule("effect:prim")),
-      ("isService", Spec::Rule("effect:prim")),
     ],
   ),
   (
@@ -117,7 +125,6 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("fnUntracedEager", Spec::Rule("effect:Effect.fn")),
       ("service", Spec::Rule("effect:identity")),
       ("serviceOption", Spec::Rule("effect:Effect.serviceOption")),
-      ("serviceOptional", Spec::Rule("effect:Effect.serviceOption")),
       ("context", Spec::Rule("effect:Effect.context")),
       ("contextWith", Spec::Rule("effect:Effect.contextWith")),
       ("withFiber", Spec::Rule("effect:Effect.withFiber")),
@@ -324,7 +331,14 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("SK", Spec::Rule("effect:Function.SK")),
     ],
   ),
-  ("Pipeable", &[("pipeArguments", Spec::Rule("effect:Pipeable.pipeArguments"))]),
+  (
+    "Pipeable",
+    &[
+      ("pipeArguments", Spec::Rule("effect:Pipeable.pipeArguments")),
+      ("Prototype", Spec::PipeablePrototype),
+      ("Class", Spec::PipeableClass),
+    ],
+  ),
   ("Tracer", &[("ParentSpan", Spec::Key(PARENT_SPAN_KEY))]),
 ];
 
@@ -490,10 +504,6 @@ pub fn register(a: &mut Analysis) {
   }
 
   a.rule("effect:prim", |a, c| a.seed(c.ret, a.prim));
-  a.rule("effect:data", |a, c| {
-    a.escape_args(c, Flavour::Host);
-    a.seed(c.ret, a.top_host);
-  });
   a.rule("effect:identity", |a, c| {
     let v = arg(a, c, 0);
     a.copy(v, c.ret);
@@ -604,8 +614,10 @@ pub fn register(a: &mut Analysis) {
     let map = arg(a, c, 0);
     let (ctx, keys) = new_context(a, c.site, 3);
     let entries = elem_of(a, map);
-    a.copy(entries, keys);
-    provide(a, entries, entries);
+    let names = a.var();
+    a.constrain(entries, Constraint::MapKeys(names));
+    a.copy(names, keys);
+    provide(a, names, entries);
     a.copy(ctx, c.ret);
   });
   dual!(a, "effect:Context.merge", 2, |a, c| {
@@ -664,12 +676,23 @@ pub fn register(a: &mut Analysis) {
     a.copy(ctx, c.ret);
   });
   a.rule("Context.mapUnsafe:get", |a, c| {
+    // The entries of the Context as a read-only Map: the values of its keys and the key strings.
+    // Reading a name on a value demands that name of its key, like any other lookup; writing to
+    // the Map or handing it to external code bails the keys (`view_of`).
     let this = this_of(a, c);
-    for o in a.pts(this).iter().copied().collect::<Vec<_>>() {
-      a.bail_object(o, "`mapUnsafe` enumerates a Context");
-    }
-    let (_, arr, elem) = new_array(a, c.site, 5);
-    a.copy(a.all_values, elem);
+    let (map, arr, elem) = new_array(a, c.site, 5);
+    // One view object per site: every Context read through it adds its keys to the view's.
+    let keys = match a.objs[map].view_of {
+      Some(keys) => keys,
+      None => {
+        let keys = a.var();
+        a.objs[map].view_of = Some(keys);
+        keys
+      }
+    };
+    context_keys(a, this, keys);
+    let values = lookup(a, keys);
+    a.copy(values, elem);
     a.seed(elem, a.top_host);
     a.copy(arr, c.ret);
   });
@@ -2079,6 +2102,21 @@ pub fn register(a: &mut Analysis) {
     let v = arg(a, c, 1);
     a.copy(v, c.ret);
   });
+  a.rule("effect:Pipeable.pipe", |a, c| {
+    // `self.pipe(f, g)` is `g(f(self))`.
+    let acc = a.var();
+    let this = this_of(a, c);
+    a.copy(this, acc);
+    for x in args_from(a, c, 0) {
+      let f = match x {
+        Arg::Var(v) => v,
+        Arg::Spread(v) => elem_of(a, v),
+      };
+      let r = invoke(a, c.site, f, None, vec![acc]);
+      a.copy(r, acc);
+    }
+    a.copy(acc, c.ret);
+  });
   a.rule("effect:Pipeable.pipeArguments", |a, c| {
     let self_ = arg(a, c, 0);
     let fns = arg(a, c, 1);
@@ -2188,6 +2226,13 @@ pub fn spec_object(a: &mut Analysis, spec: Spec) -> ObjId {
       a.copy(fb, s);
       a.alloc(ObjKind::Effect { success: s, failure: f }, None)
     }
+    Spec::PipeablePrototype => pipeable_prototype(a),
+    Spec::PipeableClass => {
+      let proto = pipeable_prototype(a);
+      let prototype = a.var();
+      a.seed(prototype, proto);
+      a.alloc(ObjKind::Class { ctor: None, heritage: None, prototype }, None)
+    }
     Spec::EmptyLayer => {
       let keys = a.var();
       a.alloc(ObjKind::Layer { keys }, None)
@@ -2200,40 +2245,6 @@ pub fn default_object(a: &mut Analysis) -> ObjId {
   a.default_rule = Some(id);
   a.builtin(id, None, None)
 }
-
-/// Data codecs: Schema and its companions build and run decoders over plain data and never call
-/// methods of the values they receive. Their exports are modelled as data: arguments escape to
-/// host code (closures among them run with unknown arguments), results are host data.
-pub const DATA_MODULES: &[&str] = &[
-  "/dist/Schema.js",
-  "/dist/SchemaAST.js",
-  "/dist/SchemaCheck.js",
-  "/dist/SchemaGetter.js",
-  "/dist/SchemaIssue.js",
-  "/dist/SchemaParser.js",
-  "/dist/SchemaResult.js",
-  "/dist/SchemaTransformation.js",
-  "/dist/SchemaSerializer.js",
-  "/dist/SchemaAnnotations.js",
-  "/dist/SchemaToParser.js",
-  "/dist/SchemaRepresentation.js",
-  "/dist/JsonSchema.js",
-  "/dist/Arbitrary.js",
-  "/dist/Equivalence.js",
-  "/dist/Pretty.js",
-];
-
-pub fn data_object(a: &mut Analysis) -> ObjId {
-  let id = a.rule_id("effect:data").unwrap();
-  a.builtin(id, None, None)
-}
-
-/// Effect modules analysed as ordinary code: they build service objects whose shape the pruner
-/// must see. Every other module of the package is modelled: its keys stay keys, everything else
-/// gets `effect:default`. (Generic analysis of the rest of the package is deferred: see the
-/// Implementation thread of EFF-3430.)
-pub const GENERIC_MODULES: &[&str] =
-  &["/dist/FileSystem.js", "/dist/Glob.js", "/dist/internal/glob.js"];
 
 /// A key declared by `Context.Service(...)`, `Context.Service<..>()(...)` or
 /// `Context.Reference(...)`: its string, if literal, and whether it is a Reference.
@@ -2279,4 +2290,14 @@ pub fn declared_key(a: &mut Analysis, name: Option<&str>, reference: bool) -> Ob
     None => a.seed(strings, a.top_host),
   }
   a.alloc(ObjKind::Key { strings, reference }, None)
+}
+/// The one `Pipeable.Prototype` object: `{ pipe() { return pipeArguments(this, arguments) } }`.
+fn pipeable_prototype(a: &mut Analysis) -> ObjId {
+  let id = a.rule_id("effect:Pipeable.pipe").expect("registered");
+  let pipe = a.builtin(id, None, None);
+  let site = Site { module: rolldown_common::ModuleIdx::from_raw(0), start: u32::MAX, sub: 0 };
+  let obj = a.site_obj(site, 0, |_| ObjKind::Object);
+  let field = a.field(obj, &ArcStr::from("pipe"));
+  a.seed(field, pipe);
+  obj
 }

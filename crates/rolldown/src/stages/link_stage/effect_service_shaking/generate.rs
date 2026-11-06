@@ -6,10 +6,16 @@
 //! about Effect: symbols bound to a model rule (`rule_symbols`) are seeded with
 //! the rule's builtin object and their initialisers are skipped.
 
-#![expect(clippy::wildcard_imports, reason = "the oxc AST is used wholesale")]
-
 use arcstr::ArcStr;
-use oxc::ast::ast::*;
+use oxc::ast::ast::{
+  Argument, ArrayExpressionElement, ArrowFunctionBody, ArrowFunctionExpression,
+  AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty,
+  BindingIdentifier, BindingPattern, CallExpression, ChainElement, Class, ClassElement,
+  Declaration, ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft,
+  FormalParameters, Function, IdentifierReference, ImportDeclarationSpecifier,
+  MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, Program, PropertyKey, PropertyKind,
+  SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
+};
 use oxc::semantic::Scoping;
 use oxc::span::GetSpan;
 use oxc::syntax::operator::{AssignmentOperator, BinaryOperator};
@@ -148,6 +154,8 @@ pub struct Gen<'a, 'l, 's> {
   /// Innermost `switch` case ids.
   case_stack: Vec<u32>,
   next_case: u32,
+  /// Values thrown inside the enclosing inert `try` blocks (see `inert_statement`).
+  try_throws: Vec<VarId>,
 }
 
 impl<'a, 'l, 's> Gen<'a, 'l, 's> {
@@ -169,6 +177,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       tdz_until: None,
       case_stack: vec![],
       next_case: 0,
+      try_throws: vec![],
     }
   }
 
@@ -178,22 +187,12 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let yielded_fail = a.var();
     let yielded = a.var();
     let arguments_elem = a.var();
-    a.fns.push(FnInfo {
-      params: vec![],
-      rest: None,
-      this,
-      ret,
-      yielded_fail,
-      yielded,
-      arguments_elem,
-      kind,
-      returns_closure_only: false,
-      closure: None,
-      activated: false,
-      pending: vec![],
+    a.fns.push(FnInfo::new(
       module,
       span_start,
-    })
+      kind,
+      [this, ret, yielded_fail, yielded, arguments_elem],
+    ))
   }
 
   pub fn module_fn(&self) -> FnId {
@@ -225,7 +224,11 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn fresh(&mut self) -> VarId {
-    self.a.var()
+    let v = self.a.var();
+    if self.cur != self.module_fn {
+      self.a.fns[self.cur].locals.push(v);
+    }
+    v
   }
 
   fn str_var(&mut self, s: &str) -> VarId {
@@ -240,8 +243,11 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let v = self.fresh();
     // Seeded now, not when the enclosing function is reached: the generator reads these sets
     // (class members, accessors) and a fresh variable holding an allocation has no effect on
-    // its own.
+    // its own. Also pending, for the clones of the function (where `v` is renamed).
     self.a.seed(v, obj);
+    if self.cur != self.module_fn {
+      self.seed(v, obj);
+    }
     (obj, v)
   }
 
@@ -276,6 +282,10 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         canonical,
         DeclInfo { kind, initialized_after, case: self.case_stack.last().copied(), func: self.cur },
       );
+      if self.cur != self.module_fn {
+        let v = self.symbol_var(sym);
+        self.a.fns[self.cur].locals.push(v);
+      }
     }
   }
 
@@ -427,6 +437,32 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let v = self.expr(&s.argument);
         let thrown = self.sh.thrown;
         self.copy(v, thrown);
+        for t in self.try_throws.clone() {
+          self.copy(v, t);
+        }
+      }
+      Statement::TryStatement(s)
+        if s.handler.as_ref().is_some_and(|h| h.param.is_some())
+          && s.block.body.iter().all(inert_statement) =>
+      {
+        // Nothing in the block runs other code or reads a property, so the catch binding is
+        // what the block's own `throw`s throw, or an Error the engine raises.
+        let local = self.fresh();
+        self.try_throws.push(local);
+        self.statements(&s.block.body);
+        self.try_throws.pop();
+        let handler = s.handler.as_ref().expect("checked above");
+        let param = handler.param.as_ref().expect("checked above");
+        let (_, error) = self.alloc(ObjKind::Object, handler.span.start);
+        self.copy(local, error);
+        // A default in the pattern runs before the binding is initialised.
+        let saved = self.tdz_until.replace(param.pattern.span().end);
+        self.bind_pattern(&param.pattern, error, DeclKind::Let);
+        self.tdz_until = saved;
+        self.statements(&handler.body.body);
+        if let Some(finalizer) = &s.finalizer {
+          self.statements(&finalizer.body);
+        }
       }
       Statement::TryStatement(s) => {
         self.statements(&s.block.body);
@@ -437,7 +473,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
             self.copy(thrown, v);
             let top = self.sh.top_host;
             self.copy(top, v);
+            let saved = self.tdz_until.replace(param.pattern.span().end);
             self.bind_pattern(&param.pattern, v, DeclKind::Let);
+            self.tdz_until = saved;
           }
           self.statements(&handler.body.body);
         }
@@ -685,6 +723,25 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         Some(l + &r)
       }
       Expression::ParenthesizedExpression(p) => Self::const_string_of(&p.expression),
+      // `['a', 'b'].join('')`: a fresh literal of constant strings joined by a constant. A
+      // patched `Array.prototype` bails the whole analysis (`store_name`), so the fold holds.
+      Expression::CallExpression(call) if call.arguments.len() <= 1 => {
+        let Expression::StaticMemberExpression(m) = &call.callee else { return None };
+        let Expression::ArrayExpression(arr) = &m.object else { return None };
+        if m.property.name.as_str() != "join" || call.optional || m.optional {
+          return None;
+        }
+        let sep = match call.arguments.first() {
+          None => ",".to_string(),
+          Some(arg) => Self::const_string_of(arg.as_expression()?)?,
+        };
+        let parts = arr
+          .elements
+          .iter()
+          .map(|e| Self::const_string_of(e.as_expression()?))
+          .collect::<Option<Vec<String>>>()?;
+        Some(parts.join(&sep))
+      }
       _ => None,
     }
   }
@@ -708,6 +765,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
     }
     let outer = self.cur;
+    self.a.fns[outer].leaf = false;
     self.cur = id;
     let this = self.a.fns[id].this;
     self.this_stack.push(this);
@@ -721,8 +779,18 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     self.generator_stack.pop();
     self.this_stack.pop();
+    self.mark_cloneable(id);
     self.cur = outer;
     v
+  }
+
+  /// See `Analysis::clone_for`.
+  fn mark_cloneable(&mut self, id: FnId) {
+    const MAX_CLONE_PENDING: usize = 80;
+    let info = &mut self.a.fns[id];
+    info.cloneable = info.leaf
+      && matches!(info.kind, FnKind::Normal | FnKind::Arrow)
+      && info.pending.len() <= MAX_CLONE_PENDING;
   }
 
   fn arrow(&mut self, f: &ArrowFunctionExpression<'_>) -> VarId {
@@ -734,7 +802,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let enclosing_this = *self.this_stack.last().unwrap();
     let this = self.a.fns[id].this;
     self.a.copy(enclosing_this, this);
+    self.a.fns[id].enclosing_this = Some(enclosing_this);
     let outer = self.cur;
+    self.a.fns[outer].leaf = false;
     self.cur = id;
     self.generator_stack.push(false);
     self.params(&f.params);
@@ -758,6 +828,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
     }
     self.generator_stack.pop();
+    self.mark_cloneable(id);
     self.cur = outer;
     v
   }
@@ -789,6 +860,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn class(&mut self, c: &Class<'_>) -> VarId {
+    self.a.fns[self.cur].leaf = false;
     let heritage = c.heritage.as_ref().map(|h| self.expr(&h.expression));
     let (proto_obj, prototype) = self.alloc(ObjKind::Object, c.span.start);
     if let Some(h) = heritage {
@@ -1001,6 +1073,11 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   #[expect(clippy::too_many_lines, reason = "one match over expression kinds")]
   pub fn expr(&mut self, expr: &Expression<'_>) -> VarId {
+    if matches!(expr, Expression::CallExpression(_)) {
+      if let Some(s) = self.const_string(expr) {
+        return self.str_var(&s);
+      }
+    }
     match expr {
       Expression::BooleanLiteral(_)
       | Expression::NullLiteral(_)
@@ -1526,5 +1603,46 @@ fn decl_kind(kind: VariableDeclarationKind) -> DeclKind {
     VariableDeclarationKind::Let
     | VariableDeclarationKind::Using
     | VariableDeclarationKind::AwaitUsing => DeclKind::Let,
+  }
+}
+/// A statement that cannot run other code, read a property or throw anything but its own
+/// `throw`s and engine errors: literals, fresh literals and bindings only.
+fn inert_statement(stmt: &Statement<'_>) -> bool {
+  match stmt {
+    Statement::ThrowStatement(s) => inert_expr(&s.argument),
+    Statement::ExpressionStatement(s) => inert_expr(&s.expression),
+    Statement::BlockStatement(b) => b.body.iter().all(inert_statement),
+    Statement::EmptyStatement(_) => true,
+    Statement::VariableDeclaration(d) => d.declarations.iter().all(|d| {
+      matches!(d.id, BindingPattern::BindingIdentifier(_)) && d.init.as_ref().is_none_or(inert_expr)
+    }),
+    _ => false,
+  }
+}
+
+fn inert_expr(expr: &Expression<'_>) -> bool {
+  match expr {
+    Expression::BooleanLiteral(_)
+    | Expression::NullLiteral(_)
+    | Expression::NumericLiteral(_)
+    | Expression::BigIntLiteral(_)
+    | Expression::StringLiteral(_)
+    | Expression::Identifier(_)
+    | Expression::FunctionExpression(_)
+    | Expression::ArrowFunctionExpression(_) => true,
+    Expression::TemplateLiteral(t) => t.expressions.is_empty(),
+    Expression::ParenthesizedExpression(p) => inert_expr(&p.expression),
+    Expression::ArrayExpression(a) => a.elements.iter().all(|e| match e {
+      ArrayExpressionElement::SpreadElement(_) => false,
+      ArrayExpressionElement::Elision(_) => true,
+      other => inert_expr(other.to_expression()),
+    }),
+    Expression::ObjectExpression(o) => o.properties.iter().all(|p| match p {
+      ObjectPropertyKind::ObjectProperty(p) => {
+        !p.computed && p.key.name().is_some_and(|n| n != "__proto__") && inert_expr(&p.value)
+      }
+      ObjectPropertyKind::SpreadProperty(_) => false,
+    }),
+    _ => false,
   }
 }

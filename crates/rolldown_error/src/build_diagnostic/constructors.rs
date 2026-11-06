@@ -452,6 +452,10 @@ impl BuildDiagnostic {
     })
   }
 
+  pub fn effect_service_shaking(reason: String) -> Self {
+    Self::new_inner(super::events::effect_service_shaking::EffectServiceShaking { reason })
+  }
+
   pub fn cannot_call_namespace(
     filename: ArcStr,
     source: ArcStr,

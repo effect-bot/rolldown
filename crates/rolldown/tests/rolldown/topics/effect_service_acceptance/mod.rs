@@ -149,8 +149,12 @@ async fn check(name: &str) {
 
   let off = build(&dir, &expect, false).await;
   let on = build(&dir, &expect, true).await;
-  let reduction = 100.0 - (on.bytes as f64 / off.bytes as f64) * 100.0;
-  println!("{name}: off {} B, on {} B ({reduction:.1}% smaller)", off.bytes, on.bytes);
+  #[expect(clippy::cast_precision_loss, reason = "bundle sizes are far below 2^52 bytes")]
+  let reduction = (on.bytes as f64 / off.bytes as f64).mul_add(-100.0, 100.0);
+  #[expect(clippy::print_stdout, reason = "the size report is the point of the run")]
+  {
+    println!("{name}: off {} B, on {} B ({reduction:.1}% smaller)", off.bytes, on.bytes);
+  }
 
   let mut failures = vec![];
 

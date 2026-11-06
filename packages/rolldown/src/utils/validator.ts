@@ -465,6 +465,12 @@ const ChecksOptionsSchema = v.strictObject({
       'Whether to emit warnings when the options of a dynamic import are not statically analyzable while `experimental.importAttributes` is on',
     ),
   ),
+  effectServiceShaking: v.pipe(
+    v.optional(v.boolean()),
+    v.description(
+      'Whether to emit warnings when `experimental.effectServiceShaking` cannot analyse a build, such as when `effect` is external',
+    ),
+  ),
 });
 isTypeTrue<IsSchemaSubType<typeof ChecksOptionsSchema, ChecksOptions>>();
 
