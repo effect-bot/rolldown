@@ -1062,9 +1062,15 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
     }
     if matches!(c.callee, Expression::Super(_)) {
-      // The parent constructor is invoked when the class is instantiated (see `heap.rs`).
-      self.args(&c.arguments);
-      return self.sh.prim;
+      // `super(...)` runs the parent constructor on this constructor's `this`, with its own
+      // arguments. Afterwards `this` is what the parent yielded: the same instance, or an object
+      // a parent constructor returned in its place (see `Analysis::construct_on`).
+      let args = self.args(&c.arguments);
+      let this = *self.this_stack.last().unwrap();
+      let Some(heritage) = self.class_stack.last().copied().flatten() else { return this };
+      let ret = self.call(heritage, Some(this), args, c.span, true);
+      self.copy(ret, this);
+      return this;
     }
     let (callee, this) = self.callee(&c.callee);
     let args = self.args(&c.arguments);

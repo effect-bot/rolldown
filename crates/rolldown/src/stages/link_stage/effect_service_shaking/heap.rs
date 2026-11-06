@@ -505,6 +505,8 @@ pub struct Analysis {
   wrap_sites: FxHashSet<Site>,
   /// One variable holding exactly one object, reused by every constraint that needs it.
   holders: FxHashMap<ObjId, VarId>,
+  /// Closures whose default `prototype` object exists (`function_prototype`).
+  default_prototypes: FxHashSet<ObjId>,
   /// Set when the analysis exceeded its allocation budget: everything is kept.
   pub budget_exceeded: bool,
   /// Rule invocations, for diagnostics.
@@ -596,6 +598,7 @@ impl Analysis {
       wrap_callbacks: FxHashMap::default(),
       wrap_sites: FxHashSet::default(),
       holders: FxHashMap::default(),
+      default_prototypes: FxHashSet::default(),
       budget_exceeded: false,
       rule_calls: FxHashMap::default(),
       rule_memo: FxHashMap::default(),
@@ -1276,6 +1279,11 @@ impl Analysis {
     match self.objs[obj].kind.clone() {
       ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
         self.objs[obj].demand.add(name);
+        if let ObjKind::Closure(f) = self.objs[obj].kind {
+          if name.as_str() == "prototype" {
+            self.function_prototype(obj, f);
+          }
+        }
         if let ObjKind::Class { prototype, .. } = self.objs[obj].kind {
           if name.as_str() == "prototype" {
             self.copy(prototype, dst);
@@ -1412,6 +1420,9 @@ impl Analysis {
       | ObjKind::Class { .. }
       | ObjKind::Namespace(_)
       | ObjKind::Builtin { .. } => {
+        if let ObjKind::Closure(f) = self.objs[obj].kind {
+          self.function_prototype(obj, f);
+        }
         self.objs[obj].demand.all();
         let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
         for f in fields {
@@ -1592,33 +1603,21 @@ impl Analysis {
           |_| ObjKind::Object,
         );
         let pv = self.proto_var(instance);
-        let prototype = self.field(callee, &ArcStr::from("prototype"));
+        let prototype = self.function_prototype(callee, f);
         self.copy(prototype, pv);
         self.call_fn(f, call, Some(instance));
         let ret = self.fns[f].ret;
         self.copy(ret, call.ret);
         self.seed(call.ret, instance);
       }
-      ObjKind::Closure(f) => self.call_fn(f, call, None),
+      ObjKind::Closure(f) => {
+        self.call_fn(f, call, None);
+      }
       ObjKind::Class { ctor, heritage, .. } if call.is_new && call.this.is_some() => {
-        // A parent constructor run on the instance a derived class is building (the arm below
-        // makes this call for every class with a heritage): it writes to that instance, not to
-        // an instance of its own, and runs its own parent on it in turn.
-        if let Some(h) = heritage {
-          let ret = self.var();
-          let parent_call = Call {
-            site: call.site,
-            this: call.this,
-            args: call.args.clone(),
-            ret,
-            is_new: true,
-            builtin: None,
-          };
-          self.constrain(h, Constraint::Call(Box::new(parent_call)));
-        }
-        if let Some(f) = ctor {
-          self.call_fn(f, call, None);
-        }
+        // A parent constructor run on the instance a derived class is building, by `super(...)`
+        // or by a derived class without a constructor: it writes to that instance, not to an
+        // instance of its own. Its result is what `this` becomes in the caller.
+        self.construct_on(ctor, heritage, call, None);
       }
       ObjKind::Class { ctor, heritage, prototype } => {
         // `new C(...)` (or a bare call, treated the same): an instance per class.
@@ -1629,23 +1628,9 @@ impl Analysis {
         );
         let pv = self.proto_var(instance);
         self.copy(prototype, pv);
-        if let Some(h) = heritage {
-          // The parent constructor runs on the same instance.
-          let this = self.holder(instance);
-          let ret = self.var();
-          let parent_call = Call {
-            site: call.site,
-            this: Some(this),
-            args: call.args.clone(),
-            ret,
-            is_new: true,
-            builtin: None,
-          };
-          self.constrain(h, Constraint::Call(Box::new(parent_call)));
-        }
-        if let Some(f) = ctor {
-          self.call_fn(f, call, Some(instance));
-        }
+        let this = self.holder(instance);
+        let on_instance = Call { this: Some(this), ..call.clone() };
+        self.construct_on(ctor, heritage, &on_instance, Some(instance));
         self.seed(call.ret, instance);
       }
       ObjKind::Builtin { rule, data, this: bound, .. } => {
@@ -1844,7 +1829,63 @@ impl Analysis {
     id
   }
 
-  pub fn call_fn(&mut self, f: FnId, call: &Call, instance: Option<ObjId>) {
+  /// Runs a class's construction on `call.this`: its constructor, or for a derived class
+  /// without one, its parent's construction with the same arguments (as JavaScript's implicit
+  /// `constructor(...args) { super(...args) }` does). `call.ret` receives what the construction
+  /// yields besides the instance: an object a constructor returns replaces the instance, and in
+  /// a derived constructor `this` is whatever `super(...)` yielded (`generate.rs` copies
+  /// `super`'s result into `this`). `instance` is the object `new` allocated, if this is the
+  /// outermost construction.
+  fn construct_on(
+    &mut self,
+    ctor: Option<FnId>,
+    heritage: Option<VarId>,
+    call: &Call,
+    instance: Option<ObjId>,
+  ) {
+    match (ctor, heritage) {
+      (Some(f), _) => {
+        let f = self.call_fn(f, call, instance);
+        let (ret, this) = (self.fns[f].ret, self.fns[f].this);
+        self.copy(ret, call.ret);
+        if heritage.is_some() {
+          self.copy(this, call.ret);
+        }
+      }
+      (None, Some(h)) => {
+        let parent_call = Call {
+          site: call.site,
+          this: call.this,
+          args: call.args.clone(),
+          ret: call.ret,
+          is_new: true,
+          builtin: None,
+        };
+        self.constrain(h, Constraint::Call(Box::new(parent_call)));
+      }
+      (None, None) => {}
+    }
+  }
+
+  /// `F.prototype` of an ordinary function: a default object until code replaces it, as
+  /// JavaScript creates one with every function that can be a constructor.
+  pub fn function_prototype(&mut self, closure: ObjId, f: FnId) -> VarId {
+    let field = self.field(closure, &ArcStr::from("prototype"));
+    if matches!(self.fns[f].kind, FnKind::Normal | FnKind::Generator)
+      && self.default_prototypes.insert(closure)
+    {
+      let proto = self.site_obj(
+        Site { module: self.fns[f].module, start: closure.raw(), sub: 0 },
+        204,
+        |_| ObjKind::Object,
+      );
+      self.seed(field, proto);
+    }
+    field
+  }
+
+  /// Calls `f`, or its clone for this call site, and returns the function that ran.
+  pub fn call_fn(&mut self, f: FnId, call: &Call, instance: Option<ObjId>) -> FnId {
     let f = if instance.is_none() { self.clone_for(f, call) } else { f };
     self.activate(f);
     let (params, rest, this_var, ret, kind, arguments_elem) = {
@@ -1938,6 +1979,7 @@ impl Analysis {
         self.seed(call.ret, it);
       }
     }
+    f
   }
 
   pub fn escape_args(&mut self, call: &Call, flavour: Flavour) {
