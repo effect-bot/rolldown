@@ -1,5 +1,5 @@
 {
-  "_comment": "A member no rule names on a model Effect (`[Symbol.iterator]`) leads to the Effect's success value, the service, whose method is called: that method stays, the unread one is removed.",
+  "_comment": "An Effect's iterator followed to .next().value.value reaches the service, whose method is called; .value on an Effect does not type check against Effect's public types, so the read keeps nothing: both methods are removed and the bundle is not run.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

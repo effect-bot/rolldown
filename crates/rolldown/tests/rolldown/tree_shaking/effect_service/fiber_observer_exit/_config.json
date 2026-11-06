@@ -1,5 +1,5 @@
 {
-  "_comment": "A Fiber observer receives the fiber's Exit and reads the service from exit.value: the method read there stays, the unread one is removed (miscompile regression).",
+  "_comment": "A Fiber observer added with fiber.addObserver receives the fiber's Exit, narrows it with Exit.isSuccess and reads the service from exit.value (public types): the method read there stays, the unread one is removed (miscompile regression).",
   "config": {
     "experimental": {
       "effectServiceShaking": true

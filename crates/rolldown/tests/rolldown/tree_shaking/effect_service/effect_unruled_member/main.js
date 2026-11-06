@@ -3,8 +3,10 @@ import * as Context from 'effect/Context';
 import * as Effect from 'effect/Effect';
 import * as Layer from 'effect/Layer';
 
-// An Effect's iterator is a member no rule names; following it reaches the
-// Effect's success value, the service, whose method is then called.
+// Following an Effect's iterator to `.next().value.value` reaches the Effect's
+// success value, the service, whose method is then called. `.value` on the
+// yielded Effect does not type check against Effect's public types, so the pass
+// assumes this does not happen (Tim's decision) and the read keeps nothing.
 const Store = Context.Service('test/UnruledMemberStore');
 const StoreLayer = Layer.succeed(
   Store,

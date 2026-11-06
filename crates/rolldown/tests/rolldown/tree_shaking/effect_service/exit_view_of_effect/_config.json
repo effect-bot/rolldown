@@ -1,5 +1,5 @@
 {
-  "_comment": "Effect.succeed is an Exit at run time, and Exit.isExit/isSuccess plus .value read the service through that public view: the method read there stays, the unread one is removed (miscompile regression).",
+  "_comment": "Effect.succeed is an Exit at run time; reading the service through Exit.isExit/isSuccess plus .value on the Effect does not type check against Effect's public types, so the read keeps nothing: both methods are removed and the bundle is not run.",
   "config": {
     "experimental": {
       "effectServiceShaking": true
