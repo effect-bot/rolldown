@@ -61,6 +61,16 @@ impl LinkStage<'_> {
     effect::register(&mut a);
 
     let module_count = self.module_table.modules.len();
+    // Module indices follow the order modules finished loading, which differs between builds of
+    // the same input, and the solve is order-sensitive (first-come clones and rule invocations).
+    // Every walk that allocates variables or objects, or adds constraints, therefore goes in
+    // execution order, with exports in name order. See
+    // internal-docs/effect-service-shaking/implementation.md (Determinism).
+    let mut order: Vec<ModuleIdx> = self.module_table.modules.iter().map(Module::idx).collect();
+    order.sort_by(|x, y| {
+      let (x, y) = (&self.module_table.modules[*x], &self.module_table.modules[*y]);
+      x.exec_order().cmp(&y.exec_order()).then_with(|| x.stable_id().cmp(y.stable_id()))
+    });
     let prim = a.var();
     a.seed(prim, a.prim);
     let top_host = a.var();
@@ -88,7 +98,7 @@ impl LinkStage<'_> {
     };
 
     // == modules: namespaces, externals, CommonJS
-    for module in &self.module_table.modules {
+    for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       match module {
         Module::Normal(normal) => {
           let ns = a.alloc(ObjKind::Namespace(normal.idx), None);
@@ -117,7 +127,7 @@ impl LinkStage<'_> {
     let mut effect_external = false;
     let mut unsupported_version: Option<String> = None;
     let mut public_modules: Vec<(ModuleIdx, &'static [(&'static str, effect::Spec)])> = vec![];
-    for module in &self.module_table.modules {
+    for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       match module {
         Module::Normal(normal) => {
           let Some(pkg) = normal.originative_resolved_id.package_json.as_ref() else { continue };
@@ -194,13 +204,9 @@ impl LinkStage<'_> {
     }
     // Model-bound declarations that alias ordinary code, linked once every rule is bound.
     let mut links: Vec<(SymbolRef, SymbolRef)> = vec![];
-    for module in modelled.iter().copied().collect::<Vec<_>>() {
+    for module in order.iter().copied().filter(|m| modelled.contains(m)).collect::<Vec<_>>() {
       let specs = public_modules.iter().find(|(m, _)| *m == module).map(|(_, s)| *s);
-      let exports: Vec<(ArcStr, SymbolRef)> = self.metas[module]
-        .resolved_exports
-        .iter()
-        .map(|(n, e)| (ArcStr::from(n.as_str()), e.symbol_ref))
-        .collect();
+      let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(module);
       for (name, symbol) in exports {
         let spec =
           specs.and_then(|specs| specs.iter().find(|(n, _)| *n == name.as_str()).map(|(_, s)| *s));
@@ -254,7 +260,7 @@ impl LinkStage<'_> {
     }
     // == per-module facts and constraint generation
     let mut module_fns = vec![];
-    for module in &self.module_table.modules {
+    for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       let Module::Normal(normal) = module else { continue };
       let Some(ast) = self.ast_table[normal.idx].as_ref() else { continue };
       // Modelled modules sit behind rules; their bodies are never analysed.
@@ -315,14 +321,10 @@ impl LinkStage<'_> {
     }
 
     // == namespace objects hold every export
-    for module in &self.module_table.modules {
+    for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       let Module::Normal(normal) = module else { continue };
       let ns = sh.namespace_objs[&normal.idx];
-      let exports: Vec<(ArcStr, SymbolRef)> = self.metas[normal.idx]
-        .resolved_exports
-        .iter()
-        .map(|(n, e)| (ArcStr::from(n.as_str()), e.symbol_ref))
-        .collect();
+      let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(normal.idx);
       for (name, symbol) in exports {
         let v = sh.symbol_var(&mut a, symbol);
         let f = a.field(ns, &name);
@@ -337,9 +339,8 @@ impl LinkStage<'_> {
     // == entry exports escape to the consumer
     for idx in self.user_defined_entry_modules.iter().copied().collect::<Vec<_>>() {
       let Module::Normal(normal) = &self.module_table.modules[idx] else { continue };
-      let exports: Vec<SymbolRef> =
-        self.metas[idx].resolved_exports.values().map(|e| e.symbol_ref).collect();
-      for symbol in exports {
+      let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(idx);
+      for (_, symbol) in exports {
         let v = sh.symbol_var(&mut a, symbol);
         a.constrain(v, Constraint::Escape(Flavour::Ext, None));
       }
@@ -461,6 +462,18 @@ impl LinkStage<'_> {
         eprintln!("[effect-service-shaking] removed {name} at {module}:{start}");
       }
     }
+  }
+
+  /// A module's exports in name order: `resolved_exports` is a hash map whose iteration order
+  /// follows its insertion history, and the walks over it allocate variables.
+  fn sorted_exports(&self, module: ModuleIdx) -> Vec<(ArcStr, SymbolRef)> {
+    let mut exports: Vec<(ArcStr, SymbolRef)> = self.metas[module]
+      .resolved_exports
+      .iter()
+      .map(|(n, e)| (ArcStr::from(n.as_str()), e.symbol_ref))
+      .collect();
+    exports.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+    exports
   }
 
   /// A public export and the declarations it aliases: `export const map = internal.map`
