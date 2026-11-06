@@ -548,8 +548,9 @@ pub struct Analysis {
   pub effect_key_strings: VarId,
   /// Rule id of `effect:default`, once registered.
   pub default_rule: Option<u16>,
-  /// The bundled `Schedule.toStep` (stable public API), which the `Effect.repeat` and
-  /// `Effect.retry` rules use to step a Schedule. `None` when `effect/Schedule` is not bundled.
+  /// The bundled `Schedule.toStep` (stable public API), which the `Effect.repeat`,
+  /// `Effect.retry` and `Effect.retryOrElse` rules use to step a Schedule. `None` when
+  /// `effect/Schedule` is not bundled.
   pub schedule_to_step: Option<VarId>,
   worklist: Vec<VarId>,
   /// Constraints registered since the last solver step, to be applied to the objects their

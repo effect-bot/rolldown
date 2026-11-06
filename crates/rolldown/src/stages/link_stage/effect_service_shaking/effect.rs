@@ -49,8 +49,8 @@ pub enum Spec {
   PipeableClass,
 }
 
-/// The public Schedule module, and the stable export `Effect.repeat` and `Effect.retry` step a
-/// Schedule with.
+/// The public Schedule module, and the stable export `Effect.repeat`, `Effect.retry` and
+/// `Effect.retryOrElse` step a Schedule with.
 pub const SCHEDULE_MODULE: &str = "/dist/Schedule.js";
 pub const SCHEDULE_TO_STEP: &str = "toStep";
 
@@ -194,7 +194,7 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("ensuring", Spec::Rule("effect:Effect.passthrough")),
       ("onInterrupt", Spec::Rule("effect:Effect.passthrough")),
       ("retry", Spec::Rule("effect:Effect.retry")),
-      ("retryOrElse", Spec::Rule("effect:Effect.orElseSucceed")),
+      ("retryOrElse", Spec::Rule("effect:Effect.retryOrElse")),
       ("repeat", Spec::Rule("effect:Effect.repeat")),
       ("forever", Spec::Rule("effect:Effect.passthrough")),
       ("timeout", Spec::Rule("effect:Effect.passthrough")),
@@ -1086,6 +1086,26 @@ pub fn register(a: &mut Analysis) {
     let schedule = policy_schedule(a, c.site, x);
     let (_, failure) = step_schedule(a, c.site, schedule, fl);
     a.copy(failure, of);
+    a.copy(out, c.ret);
+  });
+  dual!(a, "effect:Effect.retryOrElse", 3, |a, c| {
+    // `retryOrElse(self, policy, orElse)` succeeds with `self`'s success, or, once the
+    // policy's Schedule is exhausted, with what `orElse(error, out)` succeeds with, where
+    // `out` is the Schedule's last output. The Schedule is stepped with `self`'s failure.
+    let e = self_effect(a, c);
+    let policy = arg(a, c, 1);
+    let or_else = arg(a, c, 2);
+    let s = success_of(a, e);
+    let fl = failure_of(a, e);
+    let (out, os, of) = new_effect(a, c.site, 1);
+    a.copy(s, os);
+    let (output, failure) = step_schedule(a, c.site, policy, fl);
+    a.copy(failure, of);
+    let r = invoke(a, c.site, or_else, None, vec![fl, output]);
+    let rs = success_of(a, r);
+    a.copy(rs, os);
+    let rf = failure_of(a, r);
+    a.copy(rf, of);
     a.copy(out, c.ret);
   });
   a.rule("effect:Effect.wrapSuccess", |a, c| {
