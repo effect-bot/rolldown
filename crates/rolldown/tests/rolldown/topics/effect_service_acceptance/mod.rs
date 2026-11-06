@@ -21,6 +21,10 @@
 //! Byte sizes of both bundles are printed for every program so that the
 //! baseline can be read from `cargo test ... -- effect_service_acceptance --nocapture`.
 //!
+//! `solve_is_deterministic` builds one program several times into
+//! `dist/deterministic` and compares what the pass reports about each solve
+//! (see its doc comment).
+//!
 //! The builds run in the test process, so every program runs under
 //! `rolldown_testing::memory_guard`. If the analysis runs away, the process
 //! stops at `ROLLDOWN_TEST_MAX_RSS_MB` (6 GiB by default) instead of
@@ -69,8 +73,9 @@ struct Build {
   warnings: Vec<String>,
 }
 
-async fn build(dir: &Path, expect: &Expect, enabled: bool) -> Build {
-  let out = dir.join("dist").join(if enabled { "on" } else { "off" });
+/// Bundles the program into `dist/<out>`.
+async fn build(dir: &Path, expect: &Expect, enabled: bool, out: &str) -> Build {
+  let out = dir.join("dist").join(out);
   let _ = std::fs::remove_dir_all(&out);
   let mut bundler = Bundler::new(BundlerOptions {
     input: Some(vec![InputItem {
@@ -147,8 +152,8 @@ async fn check(name: &str) {
     serde_json::from_str(&std::fs::read_to_string(dir.join("expect.json")).expect("expect.json"))
       .expect("expect.json should match the schema in mod.rs");
 
-  let off = build(&dir, &expect, false).await;
-  let on = build(&dir, &expect, true).await;
+  let off = build(&dir, &expect, false, "off").await;
+  let on = build(&dir, &expect, true, "on").await;
   #[expect(clippy::cast_precision_loss, reason = "bundle sizes are far below 2^52 bytes")]
   let reduction = (on.bytes as f64 / off.bytes as f64).mul_add(-100.0, 100.0);
   #[expect(clippy::print_stdout, reason = "the size report is the point of the run")]
@@ -236,4 +241,92 @@ async fn mixed_effect_bundled_library_external() {
 #[tokio::test]
 async fn mixed_library_bundled_effect_external() {
   check("mixed_library_bundled_effect_external").await;
+}
+
+/// The fields of the pass's `effect service shaking` debug event, except the
+/// timings: what the solve produced (`vars`, `objs`, `steps`, `removed`).
+type Report = Vec<(String, String)>;
+
+/// Every solve reported in the process, with the thread its build ran on.
+#[derive(Default)]
+struct SolveReports(std::sync::Mutex<Vec<(std::thread::ThreadId, Report)>>);
+
+struct Fields(Report);
+
+impl tracing::field::Visit for Fields {
+  fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+    self.0.push((field.name().to_string(), format!("{value:?}")));
+  }
+}
+
+impl tracing::Subscriber for SolveReports {
+  fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.target().contains("effect_service_shaking")
+  }
+  fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+    tracing::span::Id::from_u64(1)
+  }
+  fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+  fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+  fn event(&self, event: &tracing::Event<'_>) {
+    let mut fields = Fields(vec![]);
+    event.record(&mut fields);
+    if fields.0.iter().any(|(name, value)| name == "message" && value == "effect service shaking") {
+      fields.0.retain(|(name, _)| !matches!(name.as_str(), "message" | "solve_ms" | "total_ms"));
+      self.0.lock().unwrap().push((std::thread::current().id(), fields.0));
+    }
+  }
+  fn enter(&self, _: &tracing::span::Id) {}
+  fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The process-wide recorder of solves. It is the global subscriber: a
+/// subscriber scoped to the test thread misses the event whenever another test
+/// thread reaches the pass first, because `tracing` then caches the event as
+/// disabled.
+fn solve_reports() -> &'static std::sync::Arc<SolveReports> {
+  static REPORTS: std::sync::OnceLock<std::sync::Arc<SolveReports>> = std::sync::OnceLock::new();
+  REPORTS.get_or_init(|| {
+    let reports = std::sync::Arc::new(SolveReports::default());
+    tracing::subscriber::set_global_default(std::sync::Arc::clone(&reports))
+      .expect("no other global tracing subscriber should be set");
+    reports
+  })
+}
+
+/// The same input gives the same analysis. `node_file_system` is bundled
+/// several times with the pass on: every build must emit the same bundle and
+/// the same solve (variables, objects, solver steps, removals). A solve that
+/// depends on module load order flips programs near the allocation budget
+/// between removing methods and keeping everything.
+#[tokio::test]
+async fn solve_is_deterministic() {
+  const BUILDS: usize = 5;
+  let _memory_guard =
+    rolldown_testing::memory_guard::guard("effect_service_acceptance::solve_is_deterministic");
+  let dir = PathBuf::from(PROGRAMS).join("node_file_system");
+  let expect = Expect::default();
+  let reports = solve_reports();
+  // The builds run on this thread; other tests may build at the same time.
+  let thread = std::thread::current().id();
+  let mut bundles = vec![];
+  for _ in 0..BUILDS {
+    let on = build(&dir, &expect, true, "deterministic").await;
+    bundles.push(std::fs::read_to_string(&on.bundle).unwrap());
+  }
+  let reports: Vec<_> = reports
+    .0
+    .lock()
+    .unwrap()
+    .iter()
+    .filter(|(id, _)| *id == thread)
+    .map(|(_, report)| report.clone())
+    .collect();
+  assert_eq!(reports.len(), BUILDS, "every build should report one solve");
+  for (i, bundle) in bundles.iter().enumerate().skip(1) {
+    assert!(bundle == &bundles[0], "build {i} emits a different bundle than build 0");
+  }
+  for (i, report) in reports.iter().enumerate().skip(1) {
+    assert_eq!(report, &reports[0], "build {i} solves differently than build 0");
+  }
 }

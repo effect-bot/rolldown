@@ -1,0 +1,10 @@
+{
+  "_comment": "On a Pipeable value, x.pipe(f, g, h) is h(g(f(x))): only h's input, g's plain row, is enumerated, and it does not hold the service f returns. writeOne is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

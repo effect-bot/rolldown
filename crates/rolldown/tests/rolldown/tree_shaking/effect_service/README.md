@@ -8,7 +8,7 @@ Run them with:
 cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service
 ```
 
-2 red, 111 green.
+2 red, 114 green.
 
 ### Memory cap
 
@@ -85,6 +85,8 @@ The analysis runs inside the test process, so a solve that never terminates woul
 | `opaque_loader_reach`                       | green | Runtime-compiled code receives one service, so that key keeps every method; the keys provided alongside and elsewhere lose their unread methods. No build-wide bailout. Uses the real effect package from the repository devDependencies.                             |
 | `per_key_separate_values`                   | green | One key's service holds the Context but only compares it, another holds plain data that is enumerated: no Context is enumerated, so the unread method goes. Uses the real effect package from the repository devDependencies.                                         |
 | `per_key_shared_allocation`                 | green | Retention: the provided value is plain data, but the program later stores the ambient Context into the same allocation and enumerates it through the service. Uses the real effect package from the repository devDependencies.                                       |
+| `pipe_spread_steps`                         | green | On a Pipeable value, x.pipe(...steps) runs the steps in turn: the second step gets the service the first returns and calls writeOne, which is kept.                                                                                                                   |
+| `pipe_steps_ordered`                        | green | On a Pipeable value, x.pipe(f, g, h) is h(g(f(x))): only h's input, g's plain row, is enumerated, and it does not hold the service f returns. writeOne is removed.                                                                                                    |
 | `piped_provider_context`                    | green | Retention: a provider applied through pipe (effect.pipe(Layer.effect(Box))) builds a service holding the ambient Context, which is enumerated. Uses the real effect package from the repository devDependencies.                                                      |
 | `promise_then_resolution`                   | green | Promise resolution of a service (returned from an async function and from Effect.runPromise) reads `then`, which the program observes being called: `then` stays, the uncalled method is removed.                                                                     |
 | `prototype_read_alias`                      | green | Builtin prototypes compared against and used as a prototype, never written: the unread method goes. Uses the real effect package from the repository devDependencies.                                                                                                 |
@@ -129,3 +131,4 @@ The analysis runs inside the test process, so a solve that never terminates woul
 | `update_service_context`                    | green | Effect.updateService replaces a service with one holding the Context; the program enumerates it, so Store's entries bail and updateUnused stays.                                                                                                                      |
 | `with_fiber_enumeration`                    | green | An Effect.withFiber closure enumerates fiber.context and calls fiberPing on every service: fiberPing is demanded of every key, other unread methods are removed.                                                                                                      |
 | `with_fiber_inspect`                        | green | A withFiber closure formats fiber.context with util.inspect: formatting reads only [inspect.custom]/toJSON on the entries (Tim's decision), so the unread ordinary method is removed. The printed method list may shrink; the program asserts only on the key string. |
+| `wrap_callback_site_isolation`              | green | Two Effect.all results are mapped with the same builtin (Object). The builtin runs once per wrap, so enumerating the plain-data result does not reach the service: writeOne is removed.                                                                               |

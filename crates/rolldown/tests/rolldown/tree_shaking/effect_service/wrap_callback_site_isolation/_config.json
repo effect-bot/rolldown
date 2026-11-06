@@ -1,0 +1,10 @@
+{
+  "_comment": "Two Effect.all results are mapped with the same builtin (Object). The builtin runs once per wrap, so enumerating the plain-data result does not reach the service: writeOne is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

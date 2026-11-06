@@ -1,0 +1,10 @@
+{
+  "_comment": "On a Pipeable value, x.pipe(...steps) runs the steps in turn: the second step gets the service the first returns and calls writeOne, which is kept.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
