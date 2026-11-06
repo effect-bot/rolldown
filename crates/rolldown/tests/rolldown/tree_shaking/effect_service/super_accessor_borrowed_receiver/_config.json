@@ -1,0 +1,10 @@
+{
+  "_comment": "A method using `super.x` keeps its home object for the lookup but runs with whatever `this` it is called with: a getter and a setter reached through `super` from a method borrowed with `.call` onto an object that does not inherit from the class. The methods reached stay, the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
