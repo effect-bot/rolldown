@@ -115,6 +115,8 @@ pub enum Walk {
 pub const REDACTABLE_KEY: &str = "@@for:~effect/Redactable";
 pub const EQUAL_KEY: &str = "~effect/Equal";
 pub const HASH_KEY: &str = "~effect/Hash";
+/// Effect's TypeId, the member its `Effect` type requires.
+pub const EFFECT_TYPE_ID: &str = "~effect/Effect";
 
 impl Walk {
   /// The methods the walk calls on each object, and how many arguments each receives (each
@@ -618,6 +620,11 @@ pub struct Analysis {
   accessors: FxHashMap<ObjId, Vec<Accessor>>,
   /// Declared types from `.d.ts` files, by index (`Constraint::FilterCopy`).
   tys: Vec<super::dts::Ty>,
+  /// The type `Effect` (`effect_type`), once interned.
+  effect_ty: Option<u32>,
+  /// For each variable receiving what an object run as an effect yields, the variable whose
+  /// objects are read wholesale into it (`success_of`).
+  effect_gates: FxHashMap<VarId, VarId>,
   /// Type bounds of exported functions of `effect`'s ordinary modules, by (module, span start):
   /// a type index per parameter and for the return value (`None` is open).
   fn_bounds: FxHashMap<(ModuleIdx, u32), FnBounds>,
@@ -759,6 +766,8 @@ impl Analysis {
       heirs: FxHashMap::default(),
       accessors: FxHashMap::default(),
       tys: vec![],
+      effect_ty: None,
+      effect_gates: FxHashMap::default(),
       fn_bounds: FxHashMap::default(),
       lazy_bounds: FxHashMap::default(),
       dts: super::dts::Dts::default(),
@@ -1458,20 +1467,16 @@ impl Analysis {
       },
       Constraint::Inherits(heir) => self.inherit(*heir, obj),
       Constraint::FilterCopy { dst, ty } => {
-        if self.admits(*ty, obj) {
-          self.seed(*dst, obj);
-        } else if matches!(
+        if matches!(
           self.objs[obj].kind,
           ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. }
-        ) {
+        ) && !self.admits(*ty, obj)
+        {
           // A summary may stand for a value the type admits, such as a scalar or a key: it
           // becomes an unknown scalar, which carries no service but stays any key.
           self.seed(*dst, self.top_host);
         } else {
-          let waiting = self.rejected.entry(obj).or_default();
-          if !waiting.contains(&(*ty, *dst)) {
-            waiting.push((*ty, *dst));
-          }
+          self.filter(obj, *ty, *dst);
         }
       }
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
@@ -2303,6 +2308,19 @@ impl Analysis {
     }
   }
 
+  /// `obj` flows into `dst` if the declared type `ty` admits it; otherwise it waits in
+  /// `rejected` until a change to its members admits it (`recheck`).
+  fn filter(&mut self, obj: ObjId, ty: u32, dst: VarId) {
+    if self.admits(ty, obj) {
+      self.seed(dst, obj);
+    } else {
+      let waiting = self.rejected.entry(obj).or_default();
+      if !waiting.contains(&(ty, dst)) {
+        waiting.push((ty, dst));
+      }
+    }
+  }
+
   /// Re-checks the edges waiting for `obj`; returns whether any admitted it.
   fn recheck(&mut self, obj: ObjId) -> bool {
     let Some(waiting) = self.rejected.remove(&obj) else { return false };
@@ -2585,12 +2603,39 @@ impl Analysis {
         self.seed(dst, self.top_ext);
       }
       ObjKind::Object | ObjKind::Array => {
-        // A user object used as an effect (Effectable, Yieldable): what it yields is what its
-        // fields hold, at worst.
-        self.load_unknown(obj, dst);
+        // A user object used as an effect (Effectable): what it yields is what its fields hold,
+        // at worst. Effect's combinators take an `Effect`, whose type requires the
+        // `~effect/Effect` member, so an object that can't have it is not run: it waits like any
+        // value a declared type rejects (design section 8). Schedule's own code hands a
+        // callback's result to `Effect.map` only once `isEffect` holds, for example.
+        let ty = self.effect_type();
+        let gate = match self.effect_gates.get(&dst) {
+          Some(g) => *g,
+          None => {
+            let g = self.var();
+            self.constrain(g, Constraint::Load { key: Key::Unknown, dst });
+            self.effect_gates.insert(dst, g);
+            g
+          }
+        };
+        self.filter(obj, ty, gate);
       }
       _ => {}
     }
+  }
+
+  /// The declared type `Effect`: an object with the `~effect/Effect` member (its TypeId).
+  fn effect_type(&mut self) -> u32 {
+    if let Some(t) = self.effect_ty {
+      return t;
+    }
+    self.tys.push(super::dts::Ty {
+      members: vec![vec![EFFECT_TYPE_ID.to_string()]],
+      ..super::dts::Ty::default()
+    });
+    let t = u32::try_from(self.tys.len() - 1).expect("too many declared types");
+    self.effect_ty = Some(t);
+    t
   }
 
   /// What an effect fails with, as handlers see it. Services never enter the error channel
