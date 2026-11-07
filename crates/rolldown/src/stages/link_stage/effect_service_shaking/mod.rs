@@ -751,6 +751,18 @@ impl LinkStage<'_> {
       for (file, name, key) in &constructors {
         eprintln!("[effect-service-shaking] service constructor {file}#{name} -> {key}");
       }
+      if debug {
+        let mut called: Vec<String> = a
+          .typed_called_modules
+          .iter()
+          .map(|m| {
+            let id = self.module_table[*m].id().as_str();
+            id.rsplit_once("/dist/").map_or(id, |(_, f)| f).to_string()
+          })
+          .collect();
+        called.sort();
+        eprintln!("[effect-service-shaking] type-modelled modules called: {called:?}");
+      }
       for k in &forced_keys {
         eprintln!("[effect-service-shaking] constructor key kept whole: {k}");
       }

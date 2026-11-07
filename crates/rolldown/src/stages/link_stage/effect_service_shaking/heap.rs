@@ -861,7 +861,8 @@ pub struct Analysis {
   pub taint_log: FxHashMap<String, usize>,
   /// Debug: which calls write each pool.
   pool_writers: FxHashMap<ModuleIdx, FxHashSet<String>>,
-  /// The type-modelled modules whose exports the program calls.
+  /// The type-modelled modules whose code the program calls: an export, a method read off one,
+  /// or a value one of its calls returned.
   pub typed_called_modules: FxHashSet<ModuleIdx>,
   /// Stand-ins (`StandIn`), and the one of each type-modelled call site.
   stand_ins: FxHashMap<ObjId, StandIn>,
@@ -2977,10 +2978,10 @@ impl Analysis {
       e.1.insert(callee.raw());
     }
     let module = self.typed_module(callee);
-    if export != NO_EXPORT {
-      if let Some(m) = module {
-        self.typed_called_modules.insert(m);
-      }
+    // Any call into a module's type-modelled code may run its unseen reads: through an export,
+    // a method read off one, or a value one of its calls made (the consumer check in `mod.rs`).
+    if let Some(m) = module {
+      self.typed_called_modules.insert(m);
     }
     // One result per source call site and export: the clones of a function share it, and so do
     // the values a method call is made on (a result per receiver would chain without bound when
