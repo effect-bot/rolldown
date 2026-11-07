@@ -1,0 +1,10 @@
+{
+  "_comment": "A Schedule's output is the string naming a method of a service the program holds: Effect.repeat returns it, and retryOrElse hands it to its fallback. The service is never a Schedule input, output or Done value, only the scalar is: each named method stays, the unread ones are removed and the bundle runs. Guards that untracked Schedule outputs keep scalar keys.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
