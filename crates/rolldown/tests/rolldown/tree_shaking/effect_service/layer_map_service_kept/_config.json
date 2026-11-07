@@ -1,0 +1,10 @@
+{
+  "_comment": "Guard: a class extending LayerMap.Service is not a service key (LayerMap.Service builds its class as a function given Context.Service's prototype), so the pass prunes nothing of its service. The program provides the LayerMap through the class's layer and calls only invalidate; get, contextEffect and contextEffectOption must stay, and the bundle must run.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

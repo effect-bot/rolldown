@@ -5,14 +5,15 @@ import path from 'node:path';
 // Names are checked before the program runs, so each case is reported on its
 // own rather than only as the bundle's first failure.
 const code = fs.readFileSync(path.join(import.meta.dirname, 'dist/main.js'), 'utf8');
-const kept = [['subclassUsed', /(?<![.\w$])subclassUsed\s*:/]];
-const removed = [['subclassUnused', /\bsubclassUnused\b/]];
+// Services from this constructor are not pruned: every method stays.
+const kept = [
+  ['guardUsed', /guard used marker/],
+  ['guardUnused', /guard unused marker/],
+  ['check', /(?<![.\w$])check\s*:/],
+];
 const failures = [];
 for (const [name, pattern] of kept) {
   if (!pattern.test(code)) failures.push(`${name} should be kept`);
-}
-for (const [name, pattern] of removed) {
-  if (pattern.test(code)) failures.push(`${name} should be removed`);
 }
 assert.deepStrictEqual(failures, []);
 

@@ -1,0 +1,10 @@
+{
+  "_comment": "Guard: a class extending HttpApiMiddleware.Service is not a service key (HttpApiMiddleware.Service returns its own subclass of a Context.Service class, so the user class is an indirect subclass), so the pass prunes nothing of its service. The service is a security middleware with two schemes; the program provides it and calls only guardUsed, which reads Tokens.check, a direct key's method. Both scheme handlers (checked by their marker strings) and check must stay, and the bundle must run.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
