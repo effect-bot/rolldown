@@ -111,9 +111,13 @@ pub struct Shared<'l> {
   pub lazy_by_module: FxHashMap<ModuleIdx, Vec<FnId>>,
   /// Resolves an unresolved global name to a variable, via the host table.
   pub resolve_global: fn(&mut Analysis, &mut FxHashMap<ArcStr, VarId>, &str) -> VarId,
-  /// Canonical symbols declared as a key constructor's result (`const K = Context.Service(..)`),
-  /// for the key-class test.
+  /// Canonical symbols declared, by a `const` that is never reassigned, as a key constructor's
+  /// result (`const K = Context.Service(..)`), for the key-class test.
   pub key_symbols: FxHashSet<SymbolRef>,
+  /// Canonical symbols bound to effect's own `Context.Service`/`Context.Reference` rules.
+  pub key_ctor_symbols: FxHashSet<SymbolRef>,
+  /// Modules exporting one of those under its own name (`Context.Service` through a namespace).
+  pub key_ctor_members: FxHashSet<(ModuleIdx, &'static str)>,
 }
 
 impl Shared<'_> {
@@ -688,7 +692,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
       if let (BindingPattern::BindingIdentifier(id), Some(init)) = (&decl.id, &decl.init) {
         if let Some(symbol) = id.symbol_id.get() {
-          if super::effect::key_declaration(init).is_some() {
+          if d.kind == VariableDeclarationKind::Const && self.key_constructor_call(init) {
             let canonical = self.sh.symbols.canonical_ref_for((self.m.module, symbol).into());
             self.sh.key_symbols.insert(canonical);
           }
@@ -1000,27 +1004,50 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     v
   }
 
-  /// Whether a class's heritage is directly a key constructor: `Context.Service<..>()("id")`,
-  /// `Context.Reference(..)`, or a binding declared as one. Such a key class is generated; any
-  /// other class is a hole (`class_hole`).
+  /// Whether a class's heritage is directly a key constructor: a call of effect's own
+  /// `Context.Service`/`Context.Reference` (`Context.Service<..>()("id")`), or a binding a `const`
+  /// declares as one. Both are resolved by symbol, never by spelling. Such a key class is
+  /// generated; any other class, including a subclass of a key class, is a hole (`class_hole`).
   fn key_heritage(&self, c: &Class<'_>) -> bool {
     let Some(h) = &c.heritage else { return false };
-    if super::effect::key_declaration(&h.expression).is_some() {
-      return true;
+    match &h.expression {
+      Expression::Identifier(id) => {
+        self.canonical_of(id).is_some_and(|s| self.sh.key_symbols.contains(&s))
+      }
+      e => self.key_constructor_call(e),
     }
-    let Expression::Identifier(id) = &h.expression else { return false };
-    let Some(symbol) =
-      id.reference_id.get().and_then(|r| self.m.scoping.get_reference(r).symbol_id())
-    else {
+  }
+
+  /// `e` calls effect's own `Context.Service`/`Context.Reference`, in one of the forms
+  /// `effect::key_declaration` accepts, with the callee resolved by symbol: an import of the
+  /// constructor, or a member of a namespace import of a module exporting it.
+  fn key_constructor_call(&self, e: &Expression<'_>) -> bool {
+    if super::effect::key_declaration(e).is_none() {
       return false;
-    };
-    let canonical = self.sh.symbols.canonical_ref_for((self.m.module, symbol).into());
-    self.sh.key_symbols.contains(&canonical)
-      || self
-        .sh
-        .rule_symbols
-        .get(&canonical)
-        .is_some_and(|o| matches!(self.a.objs[*o].kind, ObjKind::Key { .. }))
+    }
+    let mut callee = e;
+    while let Expression::CallExpression(call) = callee {
+      callee = &call.callee;
+    }
+    match callee {
+      Expression::Identifier(id) => {
+        self.canonical_of(id).is_some_and(|s| self.sh.key_ctor_symbols.contains(&s))
+      }
+      Expression::StaticMemberExpression(m) => {
+        let Expression::Identifier(ns) = &m.object else { return false };
+        let Some(s) = self.canonical_of(ns) else { return false };
+        let Some(module) = self.sh.namespace_syms.get(&s) else { return false };
+        ["Service", "Reference"].iter().any(|n| {
+          *n == m.property.name.as_str() && self.sh.key_ctor_members.contains(&(*module, *n))
+        })
+      }
+      _ => false,
+    }
+  }
+
+  fn canonical_of(&self, id: &IdentifierReference<'_>) -> Option<SymbolRef> {
+    let symbol = id.reference_id.get().and_then(|r| self.m.scoping.get_reference(r).symbol_id())?;
+    Some(self.sh.symbols.canonical_ref_for((self.m.module, symbol).into()))
   }
 
   /// A class that is not a key class is a hole (Tim's class rule: a service that reaches class

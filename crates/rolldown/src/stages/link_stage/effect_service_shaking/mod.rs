@@ -101,6 +101,8 @@ impl LinkStage<'_> {
       lazy_by_module: FxHashMap::default(),
       resolve_global: host::resolve_global,
       key_symbols: FxHashSet::default(),
+      key_ctor_symbols: FxHashSet::default(),
+      key_ctor_members: FxHashSet::default(),
     };
 
     // == modules: namespaces, externals, CommonJS
@@ -462,6 +464,27 @@ impl LinkStage<'_> {
         eprintln!("[effect-service-shaking] module {i} = {}", m.id());
       }
     }
+    // == key constructors, for the key-class test (`Gen::key_heritage`): the symbols bound to
+    // effect's own `Context.Service`/`Context.Reference` rules, and each module exporting one
+    // under that name (a namespace import of it reaches the constructor by member).
+    for (symbol, obj) in &sh.rule_symbols {
+      let ObjKind::Builtin { rule, .. } = a.objs[*obj].kind else { continue };
+      if ["effect:Context.Service", "effect:Context.Reference"]
+        .iter()
+        .any(|r| a.rule_id(r) == Some(rule))
+      {
+        sh.key_ctor_symbols.insert(*symbol);
+      }
+    }
+    for module in order.iter().copied() {
+      for name in ["Service", "Reference"] {
+        let Some(export) = self.metas[module].resolved_exports.get(name) else { continue };
+        if sh.key_ctor_symbols.contains(&self.symbols.canonical_ref_for(export.symbol_ref)) {
+          sh.key_ctor_members.insert((module, name));
+        }
+      }
+    }
+
     // == per-module facts and constraint generation
     let mut module_fns = vec![];
     for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
