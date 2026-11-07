@@ -9,8 +9,8 @@ use oxc_ecmascript::{
 };
 use oxc_semantic::{ScopeFlags, Scoping};
 use oxc_span::{ContentEq, GetSpan, GetSpanMut, SPAN};
-use oxc_syntax::symbol::SymbolId;
-use rustc_hash::FxHashMap;
+use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     TraverseCtx, generated::ancestor::Ancestor, is_terminated::IsTerminated, keep_var::KeepVar,
@@ -135,7 +135,11 @@ impl<'a> PeepholeOptimizations {
     /// body referenced. When the sweep removed anything, those symbols'
     /// declarations in this block are checked again, through a worklist, so a
     /// chain declared in any order goes in this pass, and each declaration is
-    /// rechecked only when a removal may have orphaned it.
+    /// rechecked only when a removal may have orphaned it. A recheck skips the
+    /// references earlier checks passed. The work is therefore linear in the
+    /// block's declarations, the symbols removals free and the references to
+    /// its declared symbols, each weighted by scope depth ("Work bound" in
+    /// `vendor/oxc_minifier/PATCHED.md`).
     ///
     /// A removed declarator whose initializer has side effects leaves them in
     /// its place, as `remove_unused_expression` reduced them, splitting the
@@ -223,22 +227,96 @@ impl<'a> PeepholeOptimizations {
                 declared.remove(&symbol_id);
             }
         }
-        while let Some(symbol_id) = removals.freed.pop() {
-            ctx.state.count_orphan_removal_step();
-            let Some(&(stmt_index, decl_index)) = declared.get(&symbol_id) else { continue };
-            let removed = match &mut stmts[stmt_index] {
-                Statement::FunctionDeclaration(_) => {
-                    Self::remove_orphaned_function(stmts, stmt_index, removals, ctx)
+        // Each symbol is queued at most once at a time. A queued declaration
+        // is first checked through its reference cursor, which only moves
+        // forward: within a pass a dropped reference stays dropped, and a
+        // symbol's reference list only grows at the end. A live reference
+        // found there keeps the declaration, as the removal predicates would,
+        // until a later removal frees it again. Otherwise the predicate runs
+        // once and the declaration is done with: it is removed, or kept for a
+        // reason no later removal changes (`using`, an implicitly observable
+        // symbol, a class name that must be kept, a script root, direct
+        // `eval`). See "Work bound" in `vendor/oxc_minifier/PATCHED.md`.
+        let mut worklist: Vec<SymbolId> = Vec::new();
+        let mut queued: FxHashSet<SymbolId> = FxHashSet::default();
+        let mut cursors: FxHashMap<SymbolId, usize> = FxHashMap::default();
+        loop {
+            for symbol_id in removals.freed.drain(..) {
+                if declared.contains_key(&symbol_id) && queued.insert(symbol_id) {
+                    worklist.push(symbol_id);
                 }
-                Statement::VariableDeclaration(var_decl) => Self::remove_orphaned_declarator(
-                    var_decl, stmt_index, decl_index, removals, ctx,
-                ),
-                _ => false,
-            };
-            if removed {
-                declared.remove(&symbol_id);
             }
+            let Some(symbol_id) = worklist.pop() else { break };
+            ctx.state.count_orphan_removal_step();
+            queued.remove(&symbol_id);
+            let Some(&(stmt_index, decl_index)) = declared.get(&symbol_id) else { continue };
+            let cursor = cursors.entry(symbol_id).or_default();
+            let kept = match &stmts[stmt_index] {
+                Statement::FunctionDeclaration(_) => {
+                    !ctx.state.symbols.function_is_dead(symbol_id)
+                        && Self::has_live_reference_outside(symbol_id, None, cursor, ctx)
+                }
+                Statement::VariableDeclaration(var_decl) => {
+                    let own_scope = var_decl.declarations[decl_index].init.as_ref().and_then(
+                        |init| match init {
+                            Expression::FunctionExpression(function) => function.scope_id.get(),
+                            Expression::ArrowFunctionExpression(arrow) => arrow.scope_id.get(),
+                            _ => None,
+                        },
+                    );
+                    Self::has_live_reference_outside(symbol_id, own_scope, cursor, ctx)
+                }
+                _ => true,
+            };
+            if kept {
+                continue;
+            }
+            match &mut stmts[stmt_index] {
+                Statement::FunctionDeclaration(_) => {
+                    Self::remove_orphaned_function(stmts, stmt_index, removals, ctx);
+                }
+                Statement::VariableDeclaration(var_decl) => {
+                    Self::remove_orphaned_declarator(
+                        var_decl, stmt_index, decl_index, removals, ctx,
+                    );
+                }
+                _ => {}
+            }
+            declared.remove(&symbol_id);
         }
+    }
+
+    /// Whether a reference to `symbol_id` at or after `*cursor` is live and,
+    /// when `own_scope` is given, outside that scope. Such a reference makes
+    /// both `symbol_is_unused_by_count` and
+    /// `self_recursive_function_declarator_is_unused` false. Moves `*cursor`
+    /// past the references that are not, which stay so for the rest of the
+    /// pass: a dropped reference stays dropped, and a reference's scope does
+    /// not change.
+    fn has_live_reference_outside(
+        symbol_id: SymbolId,
+        own_scope: Option<ScopeId>,
+        cursor: &mut usize,
+        ctx: &TraverseCtx<'a>,
+    ) -> bool {
+        let scoping = ctx.scoping();
+        let reference_ids = scoping.get_resolved_reference_ids(symbol_id);
+        let removed = &ctx.state.pass_changes.removed_references;
+        while let Some(&reference_id) = reference_ids.get(*cursor) {
+            ctx.state.count_orphan_removal_step();
+            if !removed.contains(reference_id.index())
+                && own_scope.is_none_or(|own_scope| {
+                    !scoping
+                        .scope_ancestors(scoping.get_reference(reference_id).scope_id())
+                        .inspect(|_| ctx.state.count_orphan_removal_step())
+                        .any(|scope_id| scope_id == own_scope)
+                })
+            {
+                return true;
+            }
+            *cursor += 1;
+        }
+        false
     }
 
     /// Remove the function declaration at `stmt_index` if nothing live

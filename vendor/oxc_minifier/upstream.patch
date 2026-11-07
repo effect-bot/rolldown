@@ -1,5 +1,5 @@
 diff --git a/crates/oxc_minifier/src/peephole/minimize_statements.rs b/crates/oxc_minifier/src/peephole/minimize_statements.rs
-index 86cdeac0..030e8064 100644
+index 86cdeac0..d0faa9c3 100644
 --- a/crates/oxc_minifier/src/peephole/minimize_statements.rs
 +++ b/crates/oxc_minifier/src/peephole/minimize_statements.rs
 @@ -2,13 +2,15 @@ use std::iter;
@@ -15,8 +15,8 @@ index 86cdeac0..030e8064 100644
 -use oxc_semantic::ScopeFlags;
 +use oxc_semantic::{ScopeFlags, Scoping};
  use oxc_span::{ContentEq, GetSpan, GetSpanMut, SPAN};
-+use oxc_syntax::symbol::SymbolId;
-+use rustc_hash::FxHashMap;
++use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
++use rustc_hash::{FxHashMap, FxHashSet};
  
  use crate::{
      TraverseCtx, generated::ancestor::Ancestor, is_terminated::IsTerminated, keep_var::KeepVar,
@@ -29,7 +29,7 @@ index 86cdeac0..030e8064 100644
          // Drop a trailing unconditional jump statement if applicable
          if let Some(last_stmt) = new_stmts.last()
              && Self::can_remove_termination_statement(last_stmt, ctx)
-@@ -117,6 +121,222 @@ impl<'a> PeepholeOptimizations {
+@@ -117,6 +121,315 @@ impl<'a> PeepholeOptimizations {
          *stmts = new_stmts;
      }
  
@@ -47,7 +47,11 @@ index 86cdeac0..030e8064 100644
 +    /// body referenced. When the sweep removed anything, those symbols'
 +    /// declarations in this block are checked again, through a worklist, so a
 +    /// chain declared in any order goes in this pass, and each declaration is
-+    /// rechecked only when a removal may have orphaned it.
++    /// rechecked only when a removal may have orphaned it. A recheck skips the
++    /// references earlier checks passed. The work is therefore linear in the
++    /// block's declarations, the symbols removals free and the references to
++    /// its declared symbols, each weighted by scope depth
++    /// (`OrphanRemovalWorkBound`).
 +    ///
 +    /// A removed declarator whose initializer has side effects leaves them in
 +    /// its place, as `remove_unused_expression` reduced them, splitting the
@@ -63,6 +67,8 @@ index 86cdeac0..030e8064 100644
 +        {
 +            return;
 +        }
++        #[cfg(debug_assertions)]
++        let work_bound = OrphanRemovalWorkBound::start(stmts, ctx);
 +        let mut removals = OrphanRemovals::default();
 +        for stmt_index in (0..stmts.len()).rev() {
 +            match &mut stmts[stmt_index] {
@@ -84,11 +90,15 @@ index 86cdeac0..030e8064 100644
 +            }
 +        }
 +        if removals.removed.is_empty() {
++            #[cfg(debug_assertions)]
++            work_bound.check(&removals, ctx);
 +            return;
 +        }
 +        if !removals.freed.is_empty() {
 +            Self::remove_declarations_orphaned_by_removals(stmts, &mut removals, ctx);
 +        }
++        #[cfg(debug_assertions)]
++        work_bound.check(&removals, ctx);
 +        Self::rebuild_statements_after_orphan_removals(stmts, removals, ctx);
 +    }
 +
@@ -129,21 +139,96 @@ index 86cdeac0..030e8064 100644
 +                declared.remove(&symbol_id);
 +            }
 +        }
-+        while let Some(symbol_id) = removals.freed.pop() {
-+            let Some(&(stmt_index, decl_index)) = declared.get(&symbol_id) else { continue };
-+            let removed = match &mut stmts[stmt_index] {
-+                Statement::FunctionDeclaration(_) => {
-+                    Self::remove_orphaned_function(stmts, stmt_index, removals, ctx)
++        // Each symbol is queued at most once at a time. A queued declaration
++        // is first checked through its reference cursor, which only moves
++        // forward: within a pass a dropped reference stays dropped, and a
++        // symbol's reference list only grows at the end. A live reference
++        // found there keeps the declaration, as the removal predicates would,
++        // until a later removal frees it again. Otherwise the predicate runs
++        // once and the declaration is done with: it is removed, or kept for a
++        // reason no later removal changes (`using`, an implicitly observable
++        // symbol, a class name that must be kept, a script root, direct
++        // `eval`). See `OrphanRemovalWorkBound`.
++        let mut worklist: Vec<SymbolId> = Vec::new();
++        let mut queued: FxHashSet<SymbolId> = FxHashSet::default();
++        let mut cursors: FxHashMap<SymbolId, usize> = FxHashMap::default();
++        loop {
++            for symbol_id in removals.freed.drain(..) {
++                if declared.contains_key(&symbol_id) && queued.insert(symbol_id) {
++                    worklist.push(symbol_id);
 +                }
-+                Statement::VariableDeclaration(var_decl) => Self::remove_orphaned_declarator(
-+                    var_decl, stmt_index, decl_index, removals, ctx,
-+                ),
-+                _ => false,
-+            };
-+            if removed {
-+                declared.remove(&symbol_id);
 +            }
++            let Some(symbol_id) = worklist.pop() else { break };
++            ctx.state.count_orphan_removal_step();
++            queued.remove(&symbol_id);
++            let Some(&(stmt_index, decl_index)) = declared.get(&symbol_id) else { continue };
++            let cursor = cursors.entry(symbol_id).or_default();
++            let kept = match &stmts[stmt_index] {
++                Statement::FunctionDeclaration(_) => {
++                    !ctx.state.symbols.function_is_dead(symbol_id)
++                        && Self::has_live_reference_outside(symbol_id, None, cursor, ctx)
++                }
++                Statement::VariableDeclaration(var_decl) => {
++                    let own_scope = var_decl.declarations[decl_index].init.as_ref().and_then(
++                        |init| match init {
++                            Expression::FunctionExpression(function) => function.scope_id.get(),
++                            Expression::ArrowFunctionExpression(arrow) => arrow.scope_id.get(),
++                            _ => None,
++                        },
++                    );
++                    Self::has_live_reference_outside(symbol_id, own_scope, cursor, ctx)
++                }
++                _ => true,
++            };
++            if kept {
++                continue;
++            }
++            match &mut stmts[stmt_index] {
++                Statement::FunctionDeclaration(_) => {
++                    Self::remove_orphaned_function(stmts, stmt_index, removals, ctx);
++                }
++                Statement::VariableDeclaration(var_decl) => {
++                    Self::remove_orphaned_declarator(
++                        var_decl, stmt_index, decl_index, removals, ctx,
++                    );
++                }
++                _ => {}
++            }
++            declared.remove(&symbol_id);
 +        }
++    }
++
++    /// Whether a reference to `symbol_id` at or after `*cursor` is live and,
++    /// when `own_scope` is given, outside that scope. Such a reference makes
++    /// both `symbol_is_unused_by_count` and
++    /// `self_recursive_function_declarator_is_unused` false. Moves `*cursor`
++    /// past the references that are not, which stay so for the rest of the
++    /// pass: a dropped reference stays dropped, and a reference's scope does
++    /// not change.
++    fn has_live_reference_outside(
++        symbol_id: SymbolId,
++        own_scope: Option<ScopeId>,
++        cursor: &mut usize,
++        ctx: &TraverseCtx<'a>,
++    ) -> bool {
++        let scoping = ctx.scoping();
++        let reference_ids = scoping.get_resolved_reference_ids(symbol_id);
++        let removed = &ctx.state.pass_changes.removed_references;
++        while let Some(&reference_id) = reference_ids.get(*cursor) {
++            ctx.state.count_orphan_removal_step();
++            if !removed.contains(reference_id.index())
++                && own_scope.is_none_or(|own_scope| {
++                    !scoping
++                        .scope_ancestors(scoping.get_reference(reference_id).scope_id())
++                        .inspect(|_| ctx.state.count_orphan_removal_step())
++                        .any(|scope_id| scope_id == own_scope)
++                })
++            {
++                return true;
++            }
++            *cursor += 1;
++        }
++        false
 +    }
 +
 +    /// Remove the function declaration at `stmt_index` if nothing live
@@ -155,7 +240,11 @@ index 86cdeac0..030e8064 100644
 +        ctx: &mut TraverseCtx<'a>,
 +    ) -> bool {
 +        let Statement::FunctionDeclaration(function) = &stmts[stmt_index] else { return false };
-+        if !Self::function_declaration_is_unused(function, ctx) {
++        ctx.state.count_orphan_removal_step();
++        if !ctx
++            .state
++            .count_orphan_removal_scans(|| Self::function_declaration_is_unused(function, ctx))
++        {
 +            return false;
 +        }
 +        removals.collect_referenced_symbols(
@@ -180,7 +269,11 @@ index 86cdeac0..030e8064 100644
 +    ) -> bool {
 +        let kind = var_decl.kind;
 +        let decl = &mut var_decl.declarations[decl_index];
-+        if !Self::should_remove_unused_declarator(decl, kind, ctx) {
++        ctx.state.count_orphan_removal_step();
++        if !ctx
++            .state
++            .count_orphan_removal_scans(|| Self::should_remove_unused_declarator(decl, kind, ctx))
++        {
 +            return false;
 +        }
 +        if let Some(mut init) = decl.init.take() {
@@ -252,7 +345,7 @@ index 86cdeac0..030e8064 100644
      /// Some parsers cannot parse long conditional expressions.
      /// See <https://bugzilla.mozilla.org/show_bug.cgi?id=2033215>
      fn conditional_expression_count_exceeded(expr: &Expression<'a>) -> bool {
-@@ -1943,3 +2163,44 @@ impl<'a> VisitJs<'a> for FindNestedBreak {
+@@ -1943,3 +2256,133 @@ impl<'a> VisitJs<'a> for FindNestedBreak {
          }
      }
  }
@@ -268,6 +361,9 @@ index 86cdeac0..030e8064 100644
 +    /// Symbols referenced from removed code, whose declarations may now be
 +    /// unused. A superset: it also lists references kept in a residue.
 +    freed: Vec<SymbolId>,
++    /// Debug-only: how many symbols were ever pushed to `freed`.
++    #[cfg(debug_assertions)]
++    notified: usize,
 +}
 +
 +impl OrphanRemovals<'_> {
@@ -278,7 +374,93 @@ index 86cdeac0..030e8064 100644
 +        walk: impl FnOnce(&mut ReferencedSymbols<'_, '_>),
 +        ctx: &TraverseCtx<'_>,
 +    ) {
++        #[cfg(debug_assertions)]
++        let before = self.freed.len();
 +        walk(&mut ReferencedSymbols { scoping: ctx.scoping(), symbols: &mut self.freed });
++        #[cfg(debug_assertions)]
++        {
++            self.notified += self.freed.len() - before;
++        }
++    }
++}
++
++/// Debug-only check that `remove_declarations_orphaned_this_pass` stays
++/// within its work bound.
++///
++/// The steps counted are each removal-predicate call and worklist pop, and,
++/// inside those predicates, each reference visited in `live_reference_ids`
++/// and each scope-ancestor step of the self-recursive declarator check. The
++/// bound is
++///
++/// `2 × declarations + notifications × (2 + W) + 3 × Σ (2 + walk(r))`,
++///
++/// the sum over every resolved reference `r` to a symbol the block declares,
++/// `walk(r)` its scope-ancestor walk and `W` the longest one. A
++/// notification is one symbol pushed to `OrphanRemovals::freed`. A rescan of
++/// the same references on every notification goes over it.
++///
++/// The bound allows each declaration two predicate calls and each
++/// notification one check that visits one reference and walks its scopes. It
++/// also allows three passes over every reference, each visiting it at most
++/// twice and walking its scopes once. Without debug assertions the counting
++/// compiles to nothing.
++#[cfg(debug_assertions)]
++struct OrphanRemovalWorkBound {
++    declarations: usize,
++    symbols: Vec<SymbolId>,
++}
++
++#[cfg(debug_assertions)]
++impl OrphanRemovalWorkBound {
++    /// The passes over each declaration's references the bound allows.
++    const REFERENCE_PASSES: usize = 3;
++
++    fn start(stmts: &[Statement<'_>], ctx: &TraverseCtx<'_>) -> Self {
++        ctx.state.start_orphan_removal_work();
++        let mut declarations = 0;
++        let mut symbols = Vec::new();
++        for stmt in stmts {
++            match stmt {
++                Statement::FunctionDeclaration(function) => {
++                    declarations += 1;
++                    symbols.extend(function.id.as_ref().and_then(|id| id.symbol_id.get()));
++                }
++                Statement::VariableDeclaration(var_decl) => {
++                    for decl in &var_decl.declarations {
++                        declarations += 1;
++                        if let BindingPattern::BindingIdentifier(id) = &decl.id {
++                            symbols.extend(id.symbol_id.get());
++                        }
++                    }
++                }
++                _ => {}
++            }
++        }
++        Self { declarations, symbols }
++    }
++
++    /// Reference lists only grow within a pass, so reading them at the end
++    /// counts every reference a predicate could have visited.
++    fn check(self, removals: &OrphanRemovals<'_>, ctx: &TraverseCtx<'_>) {
++        let scoping = ctx.scoping();
++        let mut reference_cost = 0;
++        let mut longest_walk = 0;
++        for &symbol_id in &self.symbols {
++            for &reference_id in scoping.get_resolved_reference_ids(symbol_id) {
++                let walk =
++                    scoping.scope_ancestors(scoping.get_reference(reference_id).scope_id()).count();
++                reference_cost += 2 + walk;
++                longest_walk = longest_walk.max(walk);
++            }
++        }
++        let bound = 2 * self.declarations
++            + removals.notified * (2 + longest_walk)
++            + Self::REFERENCE_PASSES * reference_cost;
++        let work = ctx.state.orphan_removal_work();
++        debug_assert!(
++            work <= bound,
++            "Removing orphaned declarations took {work} steps, over the bound of {bound}"
++        );
 +    }
 +}
 +
@@ -298,7 +480,7 @@ index 86cdeac0..030e8064 100644
 +    }
 +}
 diff --git a/crates/oxc_minifier/src/peephole/remove_unused_declaration.rs b/crates/oxc_minifier/src/peephole/remove_unused_declaration.rs
-index c43075fb..b37d13df 100644
+index c43075fb..c87fd47e 100644
 --- a/crates/oxc_minifier/src/peephole/remove_unused_declaration.rs
 +++ b/crates/oxc_minifier/src/peephole/remove_unused_declaration.rs
 @@ -2,7 +2,7 @@ use super::{PeepholeOptimizations, remove_unused_expression::ClassRemovability};
@@ -310,7 +492,7 @@ index c43075fb..b37d13df 100644
  
  impl<'a> PeepholeOptimizations {
      pub(super) fn can_remove_unused_declarators(ctx: &TraverseCtx<'a>) -> bool {
-@@ -16,9 +16,30 @@ impl<'a> PeepholeOptimizations {
+@@ -16,9 +16,32 @@ impl<'a> PeepholeOptimizations {
      /// pair `is_implicitly_observable` with their own count thresholds,
      /// because some runtime semantics can observe a binding independently of
      /// resolved references.
@@ -334,15 +516,17 @@ index c43075fb..b37d13df 100644
 +        ctx: &TraverseCtx<'a>,
 +    ) -> impl Iterator<Item = ReferenceId> {
 +        let removed = &ctx.state.pass_changes.removed_references;
++        let state = &ctx.state;
 +        ctx.scoping()
 +            .get_resolved_reference_ids(symbol_id)
 +            .iter()
 +            .copied()
++            .inspect(move |_| state.count_orphan_removal_scan_step())
 +            .filter(move |reference_id| !removed.contains(reference_id.index()))
      }
  
      /// Function declarations additionally consume graph deadness, allowing
-@@ -58,9 +79,9 @@ impl<'a> PeepholeOptimizations {
+@@ -58,9 +81,10 @@ impl<'a> PeepholeOptimizations {
              return false;
          }
  
@@ -351,10 +535,11 @@ index c43075fb..b37d13df 100644
              ctx.scoping()
 -                .scope_ancestors(reference.scope_id())
 +                .scope_ancestors(ctx.scoping().get_reference(reference_id).scope_id())
++                .inspect(|_| ctx.state.count_orphan_removal_scan_step())
                  .any(|scope_id| scope_id == function_scope_id)
          })
      }
-@@ -180,21 +201,27 @@ impl<'a> PeepholeOptimizations {
+@@ -180,21 +204,27 @@ impl<'a> PeepholeOptimizations {
  
      pub fn remove_unused_function_declaration(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
          let Statement::FunctionDeclaration(f) = stmt else { return };
@@ -391,8 +576,109 @@ index c43075fb..b37d13df 100644
      pub fn remove_unused_class_declaration(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
          let Statement::ClassDeclaration(c) = stmt else { return };
          if ctx.options().unused == CompressOptionsUnused::Keep {
+diff --git a/crates/oxc_minifier/src/state.rs b/crates/oxc_minifier/src/state.rs
+index c5c9b1df..f8f0ed5c 100644
+--- a/crates/oxc_minifier/src/state.rs
++++ b/crates/oxc_minifier/src/state.rs
+@@ -108,6 +108,24 @@ pub struct MinifierState<'a> {
+     /// Per-pass change accumulator populated by typed mutation helpers and
+     /// consumed by `compression_pass` after Normalize and every peephole pass.
+     pub(crate) pass_changes: PassChanges<'a>,
++
++    /// Debug-only work count of `remove_declarations_orphaned_this_pass`,
++    /// checked by `OrphanRemovalWorkBound` in `peephole/minimize_statements.rs`.
++    #[cfg(debug_assertions)]
++    pub(crate) orphan_removal_work: OrphanRemovalWork,
++}
++
++/// Steps counted for the debug-only work bound of
++/// `remove_declarations_orphaned_this_pass` (see `OrphanRemovalWorkBound`).
++#[cfg(debug_assertions)]
++#[derive(Default)]
++pub struct OrphanRemovalWork {
++    /// Steps counted since the last [`MinifierState::start_orphan_removal_work`].
++    steps: std::cell::Cell<usize>,
++    /// Whether a removal predicate called by that function is running, so
++    /// that its reference visits and scope-ancestor steps count. The same
++    /// predicates called from elsewhere do not count.
++    scanning: std::cell::Cell<bool>,
+ }
+ 
+ impl<'a> MinifierState<'a> {
+@@ -129,7 +147,71 @@ impl<'a> MinifierState<'a> {
+                 this_initialized_at: None,
+             }),
+             pass_changes: PassChanges::new(scoping.references_len(), allocator),
++            #[cfg(debug_assertions)]
++            orphan_removal_work: OrphanRemovalWork::default(),
++        }
++    }
++
++    /// Debug-only: restart the step count of
++    /// `remove_declarations_orphaned_this_pass`.
++    #[cfg(debug_assertions)]
++    pub(crate) fn start_orphan_removal_work(&self) {
++        self.orphan_removal_work.steps.set(0);
++    }
++
++    /// Debug-only: the steps counted since
++    /// [`Self::start_orphan_removal_work`].
++    #[cfg(debug_assertions)]
++    pub(crate) fn orphan_removal_work(&self) -> usize {
++        self.orphan_removal_work.steps.get()
++    }
++
++    /// Count one worklist or predicate step of
++    /// `remove_declarations_orphaned_this_pass`. A no-op without debug
++    /// assertions.
++    #[inline]
++    #[cfg_attr(
++        not(debug_assertions),
++        expect(clippy::unused_self, reason = "the counter exists only in debug builds")
++    )]
++    pub(crate) fn count_orphan_removal_step(&self) {
++        #[cfg(debug_assertions)]
++        self.orphan_removal_work.steps.set(self.orphan_removal_work.steps.get() + 1);
++    }
++
++    /// Count one reference visit or scope-ancestor step, if it happens in a
++    /// predicate run through [`Self::count_orphan_removal_scans`]. A no-op
++    /// without debug assertions.
++    #[inline]
++    #[cfg_attr(
++        not(debug_assertions),
++        expect(clippy::unused_self, reason = "the counter exists only in debug builds")
++    )]
++    pub(crate) fn count_orphan_removal_scan_step(&self) {
++        #[cfg(debug_assertions)]
++        if self.orphan_removal_work.scanning.get() {
++            self.count_orphan_removal_step();
++        }
++    }
++
++    /// Run a removal predicate of `remove_declarations_orphaned_this_pass`,
++    /// counting its reference visits and scope-ancestor steps in debug
++    /// builds. The predicate's result is unchanged.
++    #[inline]
++    #[cfg_attr(
++        not(debug_assertions),
++        expect(clippy::unused_self, reason = "the counter exists only in debug builds")
++    )]
++    pub(crate) fn count_orphan_removal_scans<T>(&self, predicate: impl FnOnce() -> T) -> T {
++        #[cfg(debug_assertions)]
++        {
++            let outer = self.orphan_removal_work.scanning.replace(true);
++            let result = predicate();
++            self.orphan_removal_work.scanning.set(outer);
++            result
+         }
++        #[cfg(not(debug_assertions))]
++        predicate()
+     }
+ 
+     /// Whether `Normalize`'s member-write scan should seed persistent metadata,
 diff --git a/crates/oxc_minifier/tests/peephole/remove_unused_declaration.rs b/crates/oxc_minifier/tests/peephole/remove_unused_declaration.rs
-index cb6fe741..ad59209a 100644
+index cb6fe741..31db8285 100644
 --- a/crates/oxc_minifier/tests/peephole/remove_unused_declaration.rs
 +++ b/crates/oxc_minifier/tests/peephole/remove_unused_declaration.rs
 @@ -661,13 +661,13 @@ fn recursive_function_with_var_redeclaration() {
@@ -413,7 +699,7 @@ index cb6fe741..ad59209a 100644
  }
  
  // ---- Export observability ----
-@@ -1117,3 +1117,115 @@ fn remove_unused_import_defer_statements() {
+@@ -1117,3 +1117,141 @@ fn remove_unused_import_defer_statements() {
          },
      );
  }
@@ -526,6 +812,32 @@ index cb6fe741..ad59209a 100644
 +    test_options(
 +        "const a = 1, b = (t(), () => a), c = 2; export { c };",
 +        "t(); const c = 2; export { c };",
++        &CompressOptions::dce(),
++    );
++}
++
++// Dead code sharing a callee that stays live goes in one pass, and each
++// removal does not rescan the callee's references: in debug builds the work
++// bound of `remove_declarations_orphaned_this_pass` fires otherwise.
++#[test]
++fn remove_dead_code_sharing_a_live_callee() {
++    let fan_in =
++        (0..64).map(|i| format!("const a{i} = () => common(); const b{i} = () => a{i}();"));
++    let link = |i: usize| match i {
++        63 => "const l63 = () => common();".to_string(),
++        _ => format!("const l{i} = () => (l{}(), common());", i + 1),
++    };
++    let chain = (1..64).step_by(2).chain([0]).chain((2..64).step_by(2)).map(link);
++    let source = std::iter::once("const common = () => g();".to_string())
++        .chain(fan_in)
++        .chain(chain)
++        .chain(std::iter::once("common();".to_string()))
++        .collect::<Vec<_>>()
++        .join("\n");
++    test_options_with_iterations(
++        &source,
++        "const common = () => g(); common();",
++        1,
 +        &CompressOptions::dce(),
 +    );
 +}

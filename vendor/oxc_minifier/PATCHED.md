@@ -49,6 +49,9 @@ The patch has two parts:
   symbols' declarations in the block are checked again through a worklist,
   so a chain declared in any order goes in the same pass, and each
   declaration is rechecked only when a removal may have orphaned it. A
+  symbol waits in the worklist at most once at a time, and a recheck resumes
+  a per-symbol cursor over its references instead of rescanning them (see
+  "Work bound" below). A
   removed declarator whose initializer has side effects leaves them where it
   was, reduced by `remove_unused_expression` as in the forward walk; the
   declaration is split around it, so `const a = 1, b = (f(), () => a), c = 2`
@@ -67,17 +70,21 @@ earlier links), `dead_chain_mixed_order` (24 links declared 0, 2, …, 22, 23,
 21, …, 1) and `dead_chain_effectful_inits` (12 links
 `(tick(n), () => link(n-1)())`, whose ticks must all run, in order). The
 last two used to go over the pass limit, with and without the first version
-of this patch.
+of this patch. `dead_chains_share_live_callee` (dead code sharing live
+callees) checks the work bound below.
 
 `upstream.patch` is the same change against oxc's `crates_v0.157.0` tag, with
-tests. Upstream's `cargo test -p oxc_minifier` passes with it (750 passed, 26
-ignored), and `cargo clippy -p oxc_minifier --all-targets -- -D warnings` is
-clean. The new tests cover chains in either direction, out of order, through
+tests and the work bound. Upstream's `cargo test -p oxc_minifier` passes with
+it (751 passed, 26 ignored), and `cargo clippy -p oxc_minifier --all-targets --
+-D warnings` is clean. Its code comments point to `OrphanRemovalWorkBound`
+instead of this file. The new tests cover chains in either direction, out of order, through
 object methods, default parameters and mixed function and `var`
 declarations, and chains with effectful initializers, whose effects stay in
 order, including a declaration split around one. A 12-link effectful chain
 takes two passes, as one effectful dead declarator already does; the second
 only settles the kept expression.
+`remove_dead_code_sharing_a_live_callee` is the work-bound regression test:
+fan-in and an out-of-order chain sharing one live callee, cleared in one pass.
 `recursive_function_var_redeclaration_converges_on_count_pass` changes its
 expectations. `function f() { f() } var f;` now converges in one pass, not
 two, and a capped run removes `var f` as well. `tasks/minsize` sizes, minified
@@ -118,15 +125,31 @@ lists only grow within a pass, so the bound reads them at the end. Without
 debug assertions the counting compiles to nothing, and the predicates'
 results are unchanged.
 
-The worklist as patched goes over this bound. Suppose dead code shares a
-callee that stays live. Each removal notifies the callee again, and each check
-rescans the callee's references from the start, past every reference dropped
-so far. The work therefore grows with the square of the dead code.
+The worklist stays within it as follows:
+
+- A symbol waits in the worklist at most once at a time.
+- Each declaration keeps a cursor over its symbol's references, which only
+  moves forward: within a pass a dropped reference stays dropped, and
+  reference lists only grow at the end. A recheck resumes from the cursor and
+  skips dropped references and, for a function-valued declarator, references
+  inside its own function. If it finds a live reference, the declaration stays
+  in the worklist's map, as the removal predicates would keep it, until a later
+  removal frees it again.
+- Otherwise the removal predicate runs once, and the declaration leaves the
+  map whatever the result. A declaration it keeps is kept for a reason no
+  later removal changes: `using`, an implicitly observable symbol, a class
+  name that must be kept, a script root or direct `eval`.
+
+The cursor's reference visits and scope-ancestor steps are counted too.
+Before this, each check rescanned a live callee's references from the start,
+past every reference dropped so far. Each removal notified the callee again,
+so with dead code sharing a callee that stays live the work grew with the
+square of the dead code. Deduplicating the worklist alone does not fix this:
+an out-of-order chain removes one link per check and notifies the callee
+again each time.
 `crates/rolldown/tests/rolldown/dce/dead_chains_share_live_callee` (fan-in and
 an out-of-order chain sharing two live callees, one called 16 scopes deep)
-does 141,555 steps against a bound of 30,106. It is red until a check no longer
-rescans references it has already passed. `upstream.patch` does not contain
-the bound yet.
+took 141,555 steps against a bound of 30,106 before, and passes now.
 
 ## Removing this patch
 
@@ -136,8 +159,8 @@ fix:
 1. Delete the `[patch.crates-io]` entry, the `exclude` entry in the root
    `Cargo.toml`, and this directory.
 2. Bump `oxc`.
-3. Keep `dead_arrow_chain`, `dead_chain_mixed_order` and
-   `dead_chain_effectful_inits` green.
+3. Keep `dead_arrow_chain`, `dead_chain_mixed_order`,
+   `dead_chain_effectful_inits` and `dead_chains_share_live_callee` green.
 
 When bumping `oxc` before then, rebase the patch onto the new
 `oxc_minifier`. The patched crate must keep the same version as the one
