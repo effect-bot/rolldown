@@ -1,0 +1,10 @@
+{
+  "_comment": "The error channel carries only strings; its handlers still run, so the services they capture are read: Effect.catch, Effect.catchDefect, Effect.mapError, Effect.tapError, Exit.match's failure branch and a Cause.map callback each call a captured service's method, and a service thrown and caught in plain JavaScript keeps the method its catch block calls. Each read method stays; each unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

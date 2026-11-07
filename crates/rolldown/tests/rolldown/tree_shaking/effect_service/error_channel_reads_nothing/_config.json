@@ -1,0 +1,10 @@
+{
+  "_comment": "Services never enter Effect's error channel (Tim's decision). The program breaks that on purpose, one service per path: Effect.catch of a failure, Effect.catchDefect of a defect, a value thrown in Effect.try, a failure re-raised by Fiber.join, Exit.cause read with Cause.findError, a Cause.map callback's input, and a Context in the failure channel. Reads through the error channel keep nothing, so all their methods are removed and the bundle is not run; the directly read control keeps its method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

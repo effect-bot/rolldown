@@ -1,13 +1,13 @@
 import assert from 'node:assert';
-import * as Cause from 'effect/Cause';
 import * as Context from 'effect/Context';
 import * as Effect from 'effect/Effect';
 import { format, formatJson } from 'effect/Formatter';
 import * as Layer from 'effect/Layer';
 
-// Effect's own formatting is treated like console.log: the built-in logger,
-// Cause.pretty of an error whose cause is the Walked service and a span
-// attribute walk it without reading its methods, so its unread method goes.
+// Effect's own formatting is treated like console.log: the built-in logger and
+// a span attribute walk the Walked service without reading its methods, so its
+// unread method goes. (No service goes into a Cause: services never enter the
+// error channel.)
 // Printed defines toString and toJSON, which Formatter.format and formatJson
 // call: those stay, its unread method goes.
 const Walked = Context.Service('test/FormattingWalked');
@@ -28,14 +28,7 @@ const program = Effect.gen(function* () {
   const walked = yield* Walked;
   const printed = yield* Printed;
   yield* Effect.log(walked).pipe(Effect.withSpan('format', { attributes: { walked } }));
-  const pretty = Cause.pretty(Cause.fail(new Error('boom', { cause: walked })));
-  return [
-    walked.readOne(),
-    printed.readTwo(),
-    format(printed),
-    formatJson(printed),
-    pretty.includes('boom'),
-  ];
+  return [walked.readOne(), printed.readTwo(), format(printed), formatJson(printed)];
 });
 
 const saved = console.log;
@@ -45,5 +38,5 @@ const result = await Effect.runPromise(
 ).finally(() => {
   console.log = saved;
 });
-assert.deepStrictEqual(result, ['r', 't', 'printed', '"json"', true]);
+assert.deepStrictEqual(result, ['r', 't', 'printed', '"json"']);
 assert.strictEqual(lines.length, 1);

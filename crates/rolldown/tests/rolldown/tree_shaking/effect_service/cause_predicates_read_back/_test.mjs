@@ -6,11 +6,11 @@ import path from 'node:path';
 // own rather than only as the bundle's first failure.
 const code = fs.readFileSync(path.join(import.meta.dirname, 'dist/main.js'), 'utf8');
 const failures = [];
-for (const name of ['viaIsCause', 'viaIsReason', 'viaIsDone', 'viaFailReason']) {
+for (const name of ['viaIsCause', 'viaIsReason', 'viaIsDone']) {
   if (!new RegExp(`(?<![.\\w$])${name}\\s*[:(]`).test(code))
     failures.push(`${name} should be kept`);
 }
-for (const name of ['isCauseUnused', 'isReasonUnused', 'isDoneUnused', 'tagUnused']) {
+for (const name of ['isCauseUnused', 'isReasonUnused', 'isDoneUnused']) {
   if (new RegExp(`\\b${name}\\b`).test(code)) failures.push(`${name} should be removed`);
 }
 assert.deepStrictEqual(failures, []);

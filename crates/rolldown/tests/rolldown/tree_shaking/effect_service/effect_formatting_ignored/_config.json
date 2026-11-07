@@ -1,5 +1,5 @@
 {
-  "_comment": "Effect's own formatting is treated like user formatting (Tim's decision): Formatter.format, formatJson, the built-in logger, Cause.pretty of an error whose cause is the service and a span attribute walk a service's keys, which keeps nothing, so its unread method is removed; toString and toJSON, which Formatter.format and formatJson call, stay.",
+  "_comment": "Effect's own formatting is treated like user formatting (Tim's decision): Formatter.format, formatJson, the built-in logger and a span attribute walk a service's keys, which keeps nothing, so its unread method is removed; toString and toJSON, which Formatter.format and formatJson call, stay.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

@@ -1,5 +1,5 @@
 {
-  "_comment": "Cause's stable predicates read one property and call nothing. The brand checks isCause, isReason and isDone on a service (an unknown value) keep only the method the program then calls; isFailReason, isDieReason and hasFails read `_tag`, and the error read back through the reason keeps its method. Each service's unread method is removed.",
+  "_comment": "Cause's brand checks isCause, isReason and isDone test a key on an unknown value and call nothing: each service passed to one keeps only the method the program then calls, and loses its unread method. No service goes into a Cause (services never enter the error channel).",
   "config": {
     "experimental": {
       "effectServiceShaking": true
