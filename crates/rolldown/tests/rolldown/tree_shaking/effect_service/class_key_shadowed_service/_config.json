@@ -1,0 +1,10 @@
+{
+  "_comment": "A class extends Fake.Service()(\"id\"), spelled like a key constructor but on a plain object: it is ordinary class code, so the service its method closes over keeps every method. Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

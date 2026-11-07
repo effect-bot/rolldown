@@ -1,0 +1,10 @@
+{
+  "_comment": "A class extends a binding declared as a key constructor's result and then reassigned to an ordinary class: it is ordinary class code, so the service its method closes over keeps every method. Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
