@@ -1,0 +1,10 @@
+{
+  "_comment": "An async function returns a thenable service (through Inspectable.toJson), so the host adopts it. Its then resolves with a nested thenable whose then stores a function on the reject function the host passes and calls it: the method that function calls stays, the unread one is removed and the bundle runs. Guards that host adoption passes a reject function, not a primitive.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

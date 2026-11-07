@@ -1,0 +1,10 @@
+{
+  "_comment": "Promise.prototype.finally awaits what its callback returns, here a thenable service, before settling with the original value. The service's then resolves with a nested thenable whose then calls another method of the service: that method stays, the unread one is removed, the original value survives and the bundle runs. Guards that finally adopts its callback's result.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
