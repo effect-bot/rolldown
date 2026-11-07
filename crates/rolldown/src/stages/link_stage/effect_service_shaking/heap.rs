@@ -3321,7 +3321,8 @@ impl Analysis {
           vars.extend(ob.spread_from.iter().copied());
           vars.extend(ob.unknown_stores.iter().copied());
         }
-        ObjKind::Typed { slot, .. } => vars.push(*slot),
+        // A summary may be an effect function (`HttpBody.file` as a `toJSON`): code.
+        ObjKind::Typed { slot, .. } if !code => vars.push(*slot),
         ObjKind::Promise { value } => vars.push(*value),
         _ => {
           if code {
@@ -3520,11 +3521,17 @@ impl Analysis {
       return;
     }
     self.admission_stats.1 += 1;
-    if matches!(
-      self.objs[obj].kind,
-      ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Builtin { .. }
-    ) {
-      self.escape(obj, Flavour::Ext, None);
+    match self.objs[obj].kind {
+      ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
+        self.escape(obj, Flavour::Ext, None);
+      }
+      // A summary, Effect or promise that holds no prunable service yet may come to hold one
+      // (its slot, success or value grows): what it holds goes to unseen code as it arrives, so
+      // a service reaching it later bails.
+      ObjKind::Typed { .. } | ObjKind::Wrap(_) => self.escape(obj, Flavour::Ext, None),
+      ObjKind::Effect { success, .. } => self.constrain(success, Constraint::EscapeOut),
+      ObjKind::Promise { value } => self.constrain(value, Constraint::EscapeOut),
+      _ => {}
     }
   }
 
@@ -4159,9 +4166,15 @@ impl Analysis {
   /// code; anything else is called.
   fn protocol_method_call(&mut self, obj: ObjId, call: &Call) {
     if matches!(self.objs[obj].kind, ObjKind::Typed { .. }) {
+      // Its module's code runs: a consumer for the constructor-key check. What it returns is
+      // opaque.
+      if let Some(m) = self.typed_module(obj) {
+        self.typed_called_modules.insert(m);
+      }
       if let Some(this) = call.this {
         self.constrain(this, Constraint::Escape(Flavour::Ext, None));
       }
+      self.seed(call.ret, self.top_ext);
     } else {
       self.call(obj, call);
     }
