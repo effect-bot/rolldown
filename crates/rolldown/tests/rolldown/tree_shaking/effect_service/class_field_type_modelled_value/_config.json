@@ -1,0 +1,10 @@
+{
+  "_comment": "A service wrapped in an Option outside any class body, stored in a field of a class instance: a value holding the service reaches class code, so its key bails and every method stays, though none is read.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
