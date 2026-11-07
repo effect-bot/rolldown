@@ -213,6 +213,17 @@ const INERT_PROTOCOL_METHODS: &[&str] = &[
   "Array.prototype.entries",
   "Array.prototype.@@iterator",
 ];
+/// How a value crossed into class code (`Constraint::ClassEscape`), for the report.
+pub const CLASS_HANDED: u8 = 0;
+pub const CLASS_STORED: u8 = 1;
+pub const CLASS_REFERENCED: u8 = 2;
+pub const CLASS_TYPED_NEW: u8 = 3;
+pub const CLASS_HOW: [&str; 4] = [
+  "is handed to class code",
+  "is stored in a class, its prototype or an instance",
+  "is referenced from a class body",
+  "is handed to the constructor of a class effect exports",
+];
 /// Effect's TypeId, the member its `Effect` type requires.
 pub const EFFECT_TYPE_ID: &str = "~effect/Effect";
 
@@ -473,6 +484,18 @@ pub enum Constraint {
   /// Every key named by these strings keeps all its methods (a key handed to type-modelled
   /// code, which may provide or read it).
   BailKeys,
+  /// The value crosses into the body of a class (`ObjId`), which the pass does not analyse
+  /// (`Analysis::class_escape`); the `u8` is how, for the report (`CLASS_HOW`).
+  ClassEscape(ObjId, u8),
+  /// A reference from the body of a class (`ObjId`) to the binding this variable holds, read
+  /// through the member names (`ns.sub.x`): a namespace is followed member by member, anything
+  /// else crosses into the class whole.
+  ClassRef(ObjId, Vec<ArcStr>),
+  /// On a `Reflect.get`/`Reflect.set` target: if it is class-related, the receiver variable
+  /// crosses into the class, whose accessors run with it as `this`.
+  ClassReceiver(VarId),
+  /// On the right side of `x instanceof R`: `R[Symbol.hasInstance](x)` runs.
+  HasInstance(VarId, Site),
   /// A callable reaching an adopted object's `then` (`Analysis::adopt`): the object bails.
   ThenableBail(ObjId),
   /// A callable reaching an adopted object's `then`: the await yields an unknown value.
@@ -574,12 +597,16 @@ impl Constraint {
         C::CallFn(Box::new(c))
       }
       C::BailKeys => C::BailKeys,
+      C::ClassReceiver(r) => C::ClassReceiver(v(*r)),
+      C::HasInstance(x, site) => C::HasInstance(v(*x), s(*site)),
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
       C::Accessor(acc) => C::Accessor(Accessor {
         this: v(acc.this),
         setter: acc.setter.as_ref().map(|(name, param)| (name.clone(), v(*param))),
       }),
       C::Inherits(_)
+      | C::ClassEscape(..)
+      | C::ClassRef(..)
       | C::EscapeReceiver(..)
       | C::EscapeIfOpaque(..)
       | C::Demand(_)
@@ -860,6 +887,16 @@ pub struct Analysis {
   pub reflect_receivers: Vec<(VarId, VarId)>,
   /// Arguments of `new` on a type-modelled value (a class `effect` exports).
   typed_new_args: FxHashSet<VarId>,
+  /// Per hole class (a class body the pass does not analyse): the one opaque value standing
+  /// for everything its code makes, and back.
+  pub opaque_of: FxHashMap<ObjId, ObjId>,
+  pub opaque_class: FxHashMap<ObjId, ObjId>,
+  /// Objects that crossed into a class body: the class and how (`CLASS_HOW`), first only.
+  pub class_escaped: FxHashMap<ObjId, (ObjId, u8)>,
+  /// `Reflect.get`/`Reflect.set` receivers waiting on a target that may become class-related.
+  pending_receivers: FxHashMap<ObjId, Vec<VarId>>,
+  /// Class-related objects of each hole class: the class, its prototype, and their heirs.
+  pub hole_related: FxHashMap<ObjId, ObjId>,
   /// (result, receiver) pairs of method calls already joined (`typed_call`).
   typed_receivers: FxHashSet<(ObjId, ObjId)>,
   /// Each call's handed-values variable, translated for slots (`slot_in`).
@@ -1120,6 +1157,11 @@ impl Analysis {
       class_vars: vec![],
       reflect_receivers: vec![],
       typed_new_args: FxHashSet::default(),
+      opaque_of: FxHashMap::default(),
+      opaque_class: FxHashMap::default(),
+      class_escaped: FxHashMap::default(),
+      pending_receivers: FxHashMap::default(),
+      hole_related: FxHashMap::default(),
       prim_ty: None,
       hash_pool: None,
       json_pool: None,
@@ -1405,6 +1447,11 @@ impl Analysis {
     }
     self.heirs.entry(ancestor).or_default().push(heir);
     self.recheck(heir);
+    // An object inheriting from a hole class or its prototype is that class's instance.
+    if let Some(&class) = self.hole_related.get(&ancestor) {
+      self.hole_related.insert(heir, class);
+      self.class_escape(heir, class, CLASS_STORED);
+    }
     if let Some(accessors) = self.accessors.get(&ancestor).cloned() {
       for acc in &accessors {
         self.run_accessor_on(heir, acc);
@@ -1802,6 +1849,9 @@ impl Analysis {
         _ => self.seed(*dst, obj),
       },
       Constraint::Escape(flavour, site) => self.escape(obj, *flavour, *site),
+      Constraint::ClassEscape(class, how) => self.class_escape(obj, *class, *how),
+      c @ (Constraint::ClassRef(..) | Constraint::ClassReceiver(_)) => self.apply_class(obj, c),
+      Constraint::HasInstance(x, site) => self.has_instance(obj, *x, *site),
       Constraint::Protocol(protocol) => {
         let bit = match protocol {
           Protocol::Json => PROTO_JSON,
@@ -2070,7 +2120,9 @@ impl Analysis {
           return;
         }
         let full = format!("{module}.{name}");
-        if let Some(id) = self.rule_id(&full) {
+        if self.opaque_class.contains_key(&obj) {
+          self.seed(dst, obj);
+        } else if let Some(id) = self.rule_id(&full) {
           let b = self.builtin(id, None, None);
           self.seed(dst, b);
         } else {
@@ -2253,11 +2305,17 @@ impl Analysis {
         if let Some(Flavour::Ext) = self.objs[obj].escaped {
           self.constrain(src, Constraint::Escape(Flavour::Ext, None));
         }
+        if let Some(&(class, _)) = self.class_escaped.get(&obj) {
+          self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
+        }
         let field = self.field(obj, name);
         self.copy(src, field);
       }
       ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
-        self.constrain(src, Constraint::Escape(flavour, None));
+        match self.opaque_class.get(&obj) {
+          Some(&class) => self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED)),
+          None => self.constrain(src, Constraint::Escape(flavour, None)),
+        }
       }
       ObjKind::Typed { .. } if self.is_stand_in(obj) => {
         self.taint_by(obj, &format!("store {name}"));
@@ -2301,6 +2359,9 @@ impl Analysis {
         if let Some(Flavour::Ext) = self.objs[obj].escaped {
           self.constrain(src, Constraint::Escape(Flavour::Ext, None));
         }
+        if let Some(&(class, _)) = self.class_escaped.get(&obj) {
+          self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
+        }
         // Direction 2's admission lever: a value stored under an unknown name reaches every
         // field, so only what may hold a service flows as itself; the rest is stood for.
         let src = if self.admission { self.admitted_store(src) } else { src };
@@ -2316,7 +2377,10 @@ impl Analysis {
         }
       }
       ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
-        self.constrain(src, Constraint::Escape(flavour, None));
+        match self.opaque_class.get(&obj) {
+          Some(&class) => self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED)),
+          None => self.constrain(src, Constraint::Escape(flavour, None)),
+        }
       }
       ObjKind::Typed { .. } if self.is_stand_in(obj) => self.taint_by(obj, "unknown store"),
       // A value written onto a summary joins what it holds through the admission filter.
@@ -2336,6 +2400,25 @@ impl Analysis {
   }
 
   fn call(&mut self, callee: ObjId, call: &Call) {
+    let class = self.opaque_class.get(&callee).copied().or_else(|| {
+      matches!(self.objs[callee].kind, ObjKind::Class { .. })
+        .then(|| self.opaque_of.contains_key(&callee).then_some(callee))
+        .flatten()
+    });
+    if let Some(class) = class {
+      // A hole class or what its code made: the call runs class code with its arguments and
+      // `this`, and yields the class's opaque value.
+      for a in &call.args {
+        let (Arg::Var(v) | Arg::Spread(v)) = a;
+        self.constrain(*v, Constraint::ClassEscape(class, CLASS_HANDED));
+      }
+      if let Some(this) = call.this {
+        self.constrain(this, Constraint::ClassEscape(class, CLASS_HANDED));
+      }
+      let op = self.opaque(class);
+      self.seed(call.ret, op);
+      return;
+    }
     match self.objs[callee].kind.clone() {
       ObjKind::Closure(f) if call.is_new && call.this.is_none() => {
         // `new F(...)` on a function constructor: an instance per function, whose prototype is
@@ -3057,6 +3140,7 @@ impl Analysis {
       for a in &call.args {
         let (Arg::Var(v) | Arg::Spread(v)) = a;
         self.typed_new_args.insert(*v);
+        self.constrain(*v, Constraint::ClassEscape(callee, CLASS_TYPED_NEW));
       }
     }
     let module = self.typed_module(callee);
@@ -4706,6 +4790,9 @@ impl Analysis {
   }
 
   pub fn top_of(&self, obj: ObjId) -> ObjId {
+    if self.opaque_class.contains_key(&obj) {
+      return obj;
+    }
     match self.objs[obj].kind {
       ObjKind::Top(Flavour::Ext) | ObjKind::External { flavour: Flavour::Ext, .. } => self.top_ext,
       _ => self.top_host,
@@ -4738,7 +4825,8 @@ impl Analysis {
         // An effect built by code the pass can't see runs in this runtime. It reaches services
         // only through the Context it runs with, which is not a path (issue, "Code the pass
         // can't see"): nothing bails, and what it yields is unknown.
-        self.seed(dst, self.top_ext);
+        let t = self.top_of(obj);
+        self.seed(dst, t);
       }
       ObjKind::Object | ObjKind::Array => {
         // A user object used as an effect (Effectable): what it yields is what its fields hold,
@@ -5238,6 +5326,229 @@ impl Analysis {
     }
   }
 
+  /// A class whose body the pass does not analyse (a hole, `generate.rs`): `class` and its
+  /// `prototype` object are class-related, and what crosses into them is class code's.
+  pub fn hole(&mut self, class: ObjId, prototype: ObjId) {
+    self.hole_related.insert(class, class);
+    self.hole_related.insert(prototype, class);
+    self.opaque(class);
+    self.class_escape(class, class, CLASS_STORED);
+    self.class_escape(prototype, class, CLASS_STORED);
+    // Objects already inheriting from them.
+    for o in [class, prototype] {
+      if let Some(heirs) = self.heirs.get(&o).cloned() {
+        for h in heirs {
+          self.hole_related.insert(h, class);
+          self.class_escape(h, class, CLASS_STORED);
+        }
+      }
+    }
+  }
+
+  /// The one value standing for everything the code of `class` makes: it behaves as a value
+  /// from code the pass can't see (`top_ext`), except that what it is handed or given crosses
+  /// into the class (`ClassEscape`), and reads and calls on it yield itself.
+  pub fn opaque(&mut self, class: ObjId) -> ObjId {
+    if let Some(o) = self.opaque_of.get(&class) {
+      return *o;
+    }
+    let site = self.objs[class].site;
+    let o =
+      self.alloc(ObjKind::External { flavour: Flavour::Ext, name: ArcStr::from("class") }, site);
+    self.opaque_of.insert(class, o);
+    self.opaque_class.insert(o, class);
+    o
+  }
+
+  /// `Constraint::ClassEscape`: `obj` crosses into the body of `class`. Tim's rule makes class
+  /// code a boundary: a service that reaches it keeps every method. It is the `Ext` escape, but
+  /// class code runs in this runtime: a key it holds can be yielded (the key bails), a function
+  /// it holds runs with its opaque value as arguments and `this`, and an Effect it holds runs.
+  /// Each object crosses once, whatever other flavour it escaped with before.
+  pub fn class_escape(&mut self, obj: ObjId, class: ObjId, how: u8) {
+    if self.class_escaped.contains_key(&obj) {
+      return;
+    }
+    self.class_escaped.insert(obj, (class, how));
+    let op = self.opaque(class);
+    let esc = Constraint::ClassEscape(class, how);
+    match self.objs[obj].kind.clone() {
+      ObjKind::Object
+      | ObjKind::Array
+      | ObjKind::Class { .. }
+      | ObjKind::Closure(_)
+      | ObjKind::Namespace => {
+        self.objs[obj].demand.all();
+        self.touch_namespace(obj, None);
+        let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
+        for f in fields {
+          self.constrain(f, esc.clone());
+        }
+        let elem = self.elem(obj);
+        self.constrain(elem, esc.clone());
+        // Fields class code writes may hold anything it made.
+        self.seed(elem, op);
+        if !self.objs[obj].unknown_stores.contains(&elem) {
+          self.objs[obj].unknown_stores.push(elem);
+        }
+        self.recheck_tree(obj);
+        for src in self.objs[obj].spread_from.clone() {
+          self.constrain(src, esc.clone());
+        }
+        if let ObjKind::Class { prototype, ctor, heritage } = self.objs[obj].kind {
+          self.constrain(prototype, esc.clone());
+          if let Some(f) = ctor {
+            self.class_fn(f, class, op);
+          }
+          if let Some(h) = heritage {
+            self.constrain(h, esc);
+          }
+        }
+        if let ObjKind::Closure(f) = self.objs[obj].kind {
+          self.class_fn(f, class, op);
+        }
+        if let Some(receivers) = self.pending_receivers.remove(&obj) {
+          for r in receivers {
+            self.constrain(r, Constraint::ClassEscape(class, CLASS_HANDED));
+          }
+        }
+      }
+      // Class code can yield a key it holds: the key bails.
+      ObjKind::Key { strings, .. } => self.constrain(strings, Constraint::BailKeys),
+      ObjKind::Effect { success, .. } => self.constrain(success, esc),
+      ObjKind::Promise { value } | ObjKind::Wrap(value) => self.constrain(value, esc),
+      ObjKind::Typed { slot, export } => {
+        // A type-modelled function class code holds may run: its module's unseen reads count
+        // (the constructor-key check in `mod.rs`).
+        if self.typed_callable(export) {
+          if let Some(m) = self.typed_module(obj) {
+            self.typed_called_modules.insert(m);
+          }
+        }
+        self.constrain(slot, esc);
+      }
+      ObjKind::Iterator(f) => {
+        self.activate(f);
+        let ret = self.fns[f].ret;
+        self.constrain(ret, esc);
+      }
+      // Effect's containers are no path to a service without a key, which bails on its own;
+      // builtins, primitives and values from unseen code hold nothing of the program's.
+      _ => {}
+    }
+  }
+
+  /// The class-hole constraints (`Constraint::ClassEscape` and the rest).
+  fn apply_class(&mut self, obj: ObjId, c: &Constraint) {
+    match c {
+      Constraint::ClassEscape(class, how) => self.class_escape(obj, *class, *how),
+      Constraint::ClassRef(class, path) => self.class_ref(obj, *class, path),
+      Constraint::ClassReceiver(receiver) => self.class_receiver(obj, *receiver),
+      Constraint::HasInstance(x, site) => self.has_instance(obj, *x, *site),
+      _ => {}
+    }
+  }
+
+  /// A function class code holds: class code may call it, with the class's opaque value as its
+  /// arguments and `this`, and what that call returns or yields goes back into the class. The
+  /// call is one of its own (a clone per class where the function allows one), so values the
+  /// function returns to other callers stay theirs.
+  fn class_fn(&mut self, f: FnId, class: ObjId, op: ObjId) {
+    let arg = self.var();
+    self.seed(arg, op);
+    let this = self.var();
+    self.seed(this, op);
+    let nparams = self.fns[f].params.len();
+    let mut args = vec![Arg::Var(arg); nparams];
+    args.push(Arg::Spread(self.opaque_array(class, op)));
+    let ret = self.var();
+    let site = self.objs[class].site.unwrap_or(protocol_site(41));
+    let call = Call { site, this: Some(this), args, ret, is_new: false, builtin: None };
+    let ran = self.call_fn(f, &call, None);
+    self.constrain(ret, Constraint::ClassEscape(class, CLASS_HANDED));
+    let yielded = self.fns[ran].yielded;
+    self.constrain(yielded, Constraint::ClassEscape(class, CLASS_HANDED));
+  }
+
+  /// An array of the class's opaque value, for the arguments class code passes beyond the
+  /// declared parameters.
+  fn opaque_array(&mut self, class: ObjId, op: ObjId) -> VarId {
+    let site = self.objs[class].site.unwrap_or(protocol_site(41));
+    let arr = self.site_obj(site, 205, |_| ObjKind::Array);
+    let elem = self.elem(arr);
+    self.seed(elem, op);
+    let v = self.var();
+    self.seed(v, arr);
+    v
+  }
+
+  fn typed_callable(&self, export: u32) -> bool {
+    if export == NO_EXPORT {
+      return true;
+    }
+    let e = &self.typed_exports[export as usize];
+    match &e.dts {
+      Some(dts) => self.dts.generic_positions(dts, &e.name, 0).is_some(),
+      None => true,
+    }
+  }
+
+  /// `Constraint::ClassRef`: a class body references the binding holding `obj`, through `path`.
+  fn class_ref(&mut self, obj: ObjId, class: ObjId, path: &[ArcStr]) {
+    match (&self.objs[obj].kind, path.split_first()) {
+      (ObjKind::Namespace, Some((name, rest))) => {
+        let member = self.var();
+        self.load_name(obj, name, member);
+        self.constrain(member, Constraint::ClassRef(class, rest.to_vec()));
+      }
+      _ => self.class_escape(obj, class, CLASS_REFERENCED),
+    }
+  }
+
+  /// `Constraint::ClassReceiver`: `obj` is a `Reflect.get`/`Reflect.set` target.
+  fn class_receiver(&mut self, obj: ObjId, receiver: VarId) {
+    match self.hole_related.get(&obj) {
+      Some(&class) => self.constrain(receiver, Constraint::ClassEscape(class, CLASS_HANDED)),
+      None => self.pending_receivers.entry(obj).or_default().push(receiver),
+    }
+  }
+
+  /// `Constraint::HasInstance`: `x instanceof obj` runs `obj[Symbol.hasInstance](x)`. On a hole
+  /// class that is class code receiving `x`; on code the pass can't see, `x` is handed over; on
+  /// a class or function of the program, its own static runs if it has one. Host builtins and
+  /// type-modelled values have the default check (their public types declare none), which
+  /// only reads the prototype chain.
+  fn has_instance(&mut self, obj: ObjId, x: VarId, site: Site) {
+    if let Some(&class) = self.hole_related.get(&obj) {
+      self.constrain(x, Constraint::ClassEscape(class, CLASS_HANDED));
+      return;
+    }
+    if let Some(&class) = self.opaque_class.get(&obj) {
+      self.constrain(x, Constraint::ClassEscape(class, CLASS_HANDED));
+      return;
+    }
+    match self.objs[obj].kind {
+      ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
+        self.constrain(x, Constraint::Escape(flavour, Some(site)));
+      }
+      ObjKind::Closure(_) | ObjKind::Class { .. } | ObjKind::Object => {
+        let method = self.var();
+        self.load_name(obj, &ArcStr::from("@@hasInstance"), method);
+        let holder = self.holder(obj);
+        let call = Call {
+          site,
+          this: Some(holder),
+          args: vec![Arg::Var(x)],
+          ret: self.var(),
+          is_new: false,
+          builtin: None,
+        };
+        self.constrain(method, Constraint::CallFn(Box::new(call)));
+      }
+      _ => {}
+    }
+  }
+
   /// Tim's class rule (issue, "When a method is kept"): a service that reaches class code, or
   /// a value holding one, bails its key. Class code is the body of a class that is not a key
   /// class: its constructor, methods, accessors, field initialisers, static blocks and
@@ -5262,6 +5573,58 @@ impl Analysis {
   /// field wrapped in `Option.some` must bail, and the pool is the only record of it. Returns
   /// each bailed key with the class (or reason) it reached.
   pub fn class_bail(&mut self) -> Vec<(ArcStr, String)> {
+    let mut bailed = self.hole_bails();
+    for (k, _) in &bailed {
+      self.never_prune.insert(k.clone());
+    }
+    bailed.extend(self.class_walk_bail());
+    bailed
+  }
+
+  /// The keys the class holes bailed during the solve, with how each crossed into class code.
+  fn hole_bails(&self) -> Vec<(ArcStr, String)> {
+    let site = |c: ObjId| self.objs[c].site;
+    let mut out: Vec<(ArcStr, String)> = vec![];
+    let mut push = |k: &ArcStr, why: String| {
+      if !out.iter().any(|(b, _)| b == k) {
+        out.push((k.clone(), why));
+      }
+    };
+    let mut keys: Vec<(&ArcStr, &VarId)> = self.key_values.iter().collect();
+    keys.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in keys {
+      if self.never_prune.contains(k) {
+        continue;
+      }
+      for o in &self.vars[*v].pts {
+        // Only an object of the program's crosses into class code as a service; values from
+        // code the pass can't see provide nothing it prunes.
+        let holder = matches!(
+          self.objs[*o].kind,
+          ObjKind::Object | ObjKind::Array | ObjKind::Class { .. } | ObjKind::Closure(_)
+        );
+        if let Some(&(c, how)) = self.class_escaped.get(o).filter(|_| holder) {
+          push(k, format!("{} (class at {:?})", CLASS_HOW[how as usize], site(c)));
+        } else if let Some(&c) = self.opaque_class.get(o) {
+          push(k, format!("is a class instance (class at {:?})", site(c)));
+        }
+      }
+    }
+    for (o, (c, how)) in &self.class_escaped {
+      if let ObjKind::Key { strings, .. } = self.objs[*o].kind {
+        for st in &self.vars[strings].pts {
+          if let ObjKind::Str(name) = &self.objs[*st].kind {
+            if self.key_values.contains_key(name) {
+              push(name, format!("its key {} (class at {:?})", CLASS_HOW[*how as usize], site(*c)));
+            }
+          }
+        }
+      }
+    }
+    out
+  }
+
+  fn class_walk_bail(&mut self) -> Vec<(ArcStr, String)> {
     let mut keys_of: FxHashMap<ObjId, Vec<ArcStr>> = FxHashMap::default();
     for (k, v) in &self.key_values {
       if self.never_prune.contains(k) {

@@ -152,6 +152,9 @@ pub fn plan(
         // A summary, or a value made by type-modelled `effect` code, may be any service: its
         // key keeps every method.
         ObjKind::Wrap(_) | ObjKind::Typed { .. } => d.all(),
+        // A class instance provided as the service: its methods are class code (Tim's class
+        // rule), so its key keeps every method.
+        ObjKind::External { .. } if a.opaque_class.contains_key(&obj) => d.all(),
         // Anything else adds no demand. In particular a value from code the pass can't see (an
         // external Layer may provide any key) is another implementation, not a reader of the
         // bundled providers: those are read only through the program's own variables, where

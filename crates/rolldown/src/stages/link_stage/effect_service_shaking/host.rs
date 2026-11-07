@@ -409,6 +409,7 @@ pub fn register(a: &mut Analysis) {
     if c.args.len() > 2 || c.has_spread() {
       let receiver = arg(a, c, 2);
       a.reflect_receivers.push((o, receiver));
+      a.constrain(o, Constraint::ClassReceiver(receiver));
     }
   });
   a.rule("Reflect.set", |a, c| {
@@ -420,6 +421,7 @@ pub fn register(a: &mut Analysis) {
     if c.args.len() > 3 || c.has_spread() {
       let receiver = arg(a, c, 3);
       a.reflect_receivers.push((o, receiver));
+      a.constrain(o, Constraint::ClassReceiver(receiver));
     }
   });
   a.rule("Reflect.ownKeys", |a, c| {

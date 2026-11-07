@@ -11,12 +11,13 @@ use oxc::ast::ast::{
   Argument, ArrayExpressionElement, ArrowFunctionBody, ArrowFunctionExpression,
   AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty,
   BindingIdentifier, BindingPattern, CallExpression, ChainElement, Class, ClassElement,
-  Declaration, ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft,
-  FormalParameters, Function, IdentifierReference, ImportDeclarationSpecifier,
-  MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, Program, PropertyKey, PropertyKind,
-  SimpleAssignmentTarget, Statement, VariableDeclaration, VariableDeclarationKind,
+  ComputedMemberExpression, Declaration, ExportDefaultDeclarationKind, Expression,
+  ForStatementInit, ForStatementLeft, FormalParameters, Function, IdentifierReference,
+  ImportDeclarationSpecifier, MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, Program,
+  PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement, StaticMemberExpression,
+  VariableDeclaration, VariableDeclarationKind,
 };
-use oxc::semantic::Scoping;
+use oxc::semantic::{ReferenceId, Scoping};
 use oxc::span::GetSpan;
 use oxc::syntax::operator::{AssignmentOperator, BinaryOperator};
 use oxc_index::IndexVec;
@@ -110,6 +111,9 @@ pub struct Shared<'l> {
   pub lazy_by_module: FxHashMap<ModuleIdx, Vec<FnId>>,
   /// Resolves an unresolved global name to a variable, via the host table.
   pub resolve_global: fn(&mut Analysis, &mut FxHashMap<ArcStr, VarId>, &str) -> VarId,
+  /// Canonical symbols declared as a key constructor's result (`const K = Context.Service(..)`),
+  /// for the key-class test.
+  pub key_symbols: FxHashSet<SymbolRef>,
 }
 
 impl Shared<'_> {
@@ -326,8 +330,11 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn reference_var(&mut self, ident: &IdentifierReference<'_>) -> VarId {
-    let symbol =
-      ident.reference_id.get().and_then(|id| self.m.scoping.get_reference(id).symbol_id());
+    self.reference_parts(ident.reference_id.get(), ident.name.as_str(), ident.span.start)
+  }
+
+  fn reference_parts(&mut self, reference: Option<ReferenceId>, name: &str, start: u32) -> VarId {
+    let symbol = reference.and_then(|id| self.m.scoping.get_reference(id).symbol_id());
     match symbol {
       Some(symbol) => {
         let sym: SymbolRef = (self.m.module, symbol).into();
@@ -352,24 +359,21 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         }
         self.symbol_var(sym)
       }
-      None => {
-        let name = ident.name.as_str();
-        match name {
-          "undefined" | "NaN" | "Infinity" => self.sh.prim,
-          "arguments" => {
-            if self.this_stack.len() > 1 {
-              let elem = self.a.fns[self.cur].arguments_elem;
-              let (arr, v) = self.alloc(ObjKind::Array, ident.span.start);
-              let arr_elem = self.a.elem(arr);
-              self.copy(elem, arr_elem);
-              v
-            } else {
-              self.sh.top_host
-            }
+      None => match name {
+        "undefined" | "NaN" | "Infinity" => self.sh.prim,
+        "arguments" => {
+          if self.this_stack.len() > 1 {
+            let elem = self.a.fns[self.cur].arguments_elem;
+            let (arr, v) = self.alloc(ObjKind::Array, start);
+            let arr_elem = self.a.elem(arr);
+            self.copy(elem, arr_elem);
+            v
+          } else {
+            self.sh.top_host
           }
-          _ => (self.sh.resolve_global)(self.a, &mut self.sh.globals, name),
         }
-      }
+        _ => (self.sh.resolve_global)(self.a, &mut self.sh.globals, name),
+      },
     }
   }
 
@@ -688,6 +692,14 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
           }
         }
       }
+      if let (BindingPattern::BindingIdentifier(id), Some(init)) = (&decl.id, &decl.init) {
+        if let Some(symbol) = id.symbol_id.get() {
+          if super::effect::key_declaration(init).is_some() {
+            let canonical = self.sh.symbols.canonical_ref_for((self.m.module, symbol).into());
+            self.sh.key_symbols.insert(canonical);
+          }
+        }
+      }
       let value = match &decl.init {
         Some(init) => self.expr(init),
         None => self.sh.prim,
@@ -996,7 +1008,84 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     v
   }
 
+  /// Whether a class's heritage is directly a key constructor: `Context.Service<..>()("id")`,
+  /// `Context.Reference(..)`, or a binding declared as one. Such a key class is generated; any
+  /// other class is a hole (`class_hole`).
+  fn key_heritage(&self, c: &Class<'_>) -> bool {
+    let Some(h) = &c.heritage else { return false };
+    if super::effect::key_declaration(&h.expression).is_some() {
+      return true;
+    }
+    let Expression::Identifier(id) = &h.expression else { return false };
+    let Some(symbol) =
+      id.reference_id.get().and_then(|r| self.m.scoping.get_reference(r).symbol_id())
+    else {
+      return false;
+    };
+    let canonical = self.sh.symbols.canonical_ref_for((self.m.module, symbol).into());
+    self.sh.key_symbols.contains(&canonical)
+      || self
+        .sh
+        .rule_symbols
+        .get(&canonical)
+        .is_some_and(|o| matches!(self.a.objs[*o].kind, ObjKind::Key { .. }))
+  }
+
+  /// A class that is not a key class is a hole (Tim's class rule: a service that reaches class
+  /// code bails). Its body is not generated. The class and its prototype are objects, with the
+  /// prototype linked to the heritage's, so `instanceof`, `Object.create(C.prototype)` and
+  /// heirs work; everything that crosses into them, or that the body references from outside,
+  /// crosses into class code (`Analysis::class_escape`), and everything that comes out is the
+  /// class's opaque value.
+  fn class_hole(&mut self, c: &Class<'_>) -> VarId {
+    self.a.fns[self.cur].leaf = false;
+    let heritage = c.heritage.as_ref().map(|h| self.expr(&h.expression));
+    let (proto_obj, prototype) = self.alloc(ObjKind::Object, c.span.start);
+    if let Some(h) = heritage {
+      let parent_proto = self.load(h, Key::Name(ArcStr::from("prototype")));
+      let pv = self.a.proto_var(proto_obj);
+      self.copy(parent_proto, pv);
+    }
+    let class_obj = self
+      .a
+      .alloc(ObjKind::Class { ctor: None, heritage, prototype }, Some(self.site(c.span.start)));
+    let cv = self.fresh();
+    self.seed(cv, class_obj);
+    self.store(prototype, Key::Name(ArcStr::from("constructor")), cv);
+    if let Some(h) = heritage {
+      let pv = self.a.proto_var(class_obj);
+      self.copy(h, pv);
+    }
+    if let Some(id) = &c.id {
+      if let Some(bv) = self.binding_var(id) {
+        self.a.copy(cv, bv);
+      }
+    }
+    self.a.hole(class_obj, proto_obj);
+    // What the body references from outside crosses into it: a namespace member by member.
+    let mut refs = FreeRefs {
+      scoping: self.m.scoping,
+      class_scope: c.scope_id.get(),
+      refs: vec![],
+      unsafe_lookup: false,
+    };
+    oxc::ast_visit::Visit::visit_class_body(&mut refs, &c.body);
+    if refs.unsafe_lookup {
+      self.a.bail_everything(
+        "a class body references Context.getOrUndefinedUnsafe, which reaches a service by its key string",
+      );
+    }
+    for (reference, name, start, path) in refs.refs {
+      let v = self.reference_parts(reference, &name, start);
+      self.constrain(v, Constraint::ClassRef(class_obj, path));
+    }
+    cv
+  }
+
   fn class_body(&mut self, c: &Class<'_>) -> VarId {
+    if !self.key_heritage(c) {
+      return self.class_hole(c);
+    }
     self.a.fns[self.cur].leaf = false;
     let heritage = c.heritage.as_ref().map(|h| self.expr(&h.expression));
     let (proto_obj, prototype) = self.alloc(ObjKind::Object, c.span.start);
@@ -1340,6 +1429,12 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let l = self.expr(&b.left);
         let r = self.expr(&b.right);
         match b.operator {
+          BinaryOperator::Instanceof => {
+            // `x instanceof R` runs `R[Symbol.hasInstance](x)` (`Analysis::has_instance`).
+            let site = self.site(b.span.start);
+            self.constrain(r, Constraint::HasInstance(l, site));
+            self.sh.prim
+          }
           BinaryOperator::In => {
             // `k in o` reads `k` on `o`.
             let key = self.key_of_expr(&b.left);
@@ -1835,5 +1930,67 @@ fn inert_expr(expr: &Expression<'_>) -> bool {
       ObjectPropertyKind::SpreadProperty(_) => false,
     }),
     _ => false,
+  }
+}
+
+/// The references a class body makes to bindings declared outside it (`Gen::class_hole`):
+/// for each, its reference, name, position and the static member names read through it
+/// (`ns.sub.x` is `ns` with `["sub", "x"]`). Whether a reference is free is decided by its
+/// resolved symbol's scope, never by spelling: a parameter or local that shadows an outer name
+/// is local. Unresolved names are globals, and free.
+struct FreeRefs<'s> {
+  scoping: &'s Scoping,
+  class_scope: Option<oxc::syntax::scope::ScopeId>,
+  refs: Vec<(Option<ReferenceId>, String, u32, Vec<ArcStr>)>,
+  unsafe_lookup: bool,
+}
+
+impl FreeRefs<'_> {
+  fn record(&mut self, id: &IdentifierReference<'_>, path: Vec<ArcStr>) {
+    if id.name.as_str() == "getOrUndefinedUnsafe" {
+      self.unsafe_lookup = true;
+    }
+    let reference = id.reference_id.get();
+    let symbol = reference.and_then(|r| self.scoping.get_reference(r).symbol_id());
+    if let (Some(symbol), Some(class_scope)) = (symbol, self.class_scope) {
+      let scope = self.scoping.symbol_scope_id(symbol);
+      if self.scoping.scope_ancestors(scope).any(|s| s == class_scope) {
+        return;
+      }
+    }
+    self.refs.push((reference, id.name.to_string(), id.span.start, path));
+  }
+}
+
+impl<'a> oxc::ast_visit::Visit<'a> for FreeRefs<'_> {
+  fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+    self.record(it, vec![]);
+  }
+
+  fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
+    if it.property.name.as_str() == "getOrUndefinedUnsafe" {
+      self.unsafe_lookup = true;
+    }
+    let mut path = vec![ArcStr::from(it.property.name.as_str())];
+    let mut object = &it.object;
+    while let Expression::StaticMemberExpression(m) = object {
+      path.push(ArcStr::from(m.property.name.as_str()));
+      object = &m.object;
+    }
+    if let Expression::Identifier(id) = object {
+      path.reverse();
+      self.record(id, path);
+    } else {
+      oxc::ast_visit::walk::walk_static_member_expression(self, it);
+    }
+  }
+
+  fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
+    if let Expression::StringLiteral(s) = &it.expression {
+      if s.value == "getOrUndefinedUnsafe" {
+        self.unsafe_lookup = true;
+      }
+    }
+    oxc::ast_visit::walk::walk_computed_member_expression(self, it);
   }
 }

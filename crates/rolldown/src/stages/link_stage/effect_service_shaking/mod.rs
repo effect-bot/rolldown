@@ -100,6 +100,7 @@ impl LinkStage<'_> {
       lazy_refs: vec![],
       lazy_by_module: FxHashMap::default(),
       resolve_global: host::resolve_global,
+      key_symbols: FxHashSet::default(),
     };
 
     // == modules: namespaces, externals, CommonJS
