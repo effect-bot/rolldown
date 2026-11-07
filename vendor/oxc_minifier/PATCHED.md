@@ -54,6 +54,27 @@ candidate rules are unchanged.
 
 The regression test is `crates/rolldown/tests/rolldown/dce/dead_arrow_chain`.
 
+## Known gaps
+
+Two chains still need more passes than the guard allows, so the debug assertion
+still fires in both `minify: true` and `minify: 'dceOnly'`. Release builds stop
+early and keep part of the chain. Both gaps are in the unpatched 0.157.0 too.
+
+- Links declared out of order (`dce/dead_chain_mixed_order`: 24 links,
+  declared 0, 2, …, 22, 23, 21, …, 1). The forward walk and the reverse sweep
+  each clear the links that are in order for them, about two per pass, and leave
+  orphans behind the walk that has passed them.
+- Links whose initializers have side effects (`dce/dead_chain_effectful_inits`:
+  `const linkN = (tick(N), () => linkN-1())`, 12 such links). The reverse sweep
+  skips them, so only the forward walk removes them, one link per pass. A fix
+  must still call every `tick`, in source order.
+
+Both tests are red. A fix needs an order-independent closure: when a declaration
+is removed, the symbols its dropped references pointed to are checked again,
+until none changes. A fixed number of extra sweeps only covers more orders.
+Removing an effectful declarator must keep its side effects as a statement in
+the same place. Raising the iteration limit only moves the threshold.
+
 `upstream.patch` is the same change against oxc's `crates_v0.157.0` tag, with
 tests. Upstream's `cargo test -p oxc_minifier` passes with it: 748 tests,
 plus two new ones for chains in either direction, object methods, default
@@ -71,7 +92,7 @@ fix:
 1. Delete the `[patch.crates-io]` entry, the `exclude` entry in the root
    `Cargo.toml`, and this directory.
 2. Bump `oxc`.
-3. Keep `dead_arrow_chain` green.
+3. Keep `dead_arrow_chain` green, and the `dead_chain_*` tests once they pass.
 
 When bumping `oxc` before then, rebase the patch onto the new
 `oxc_minifier`. The patched crate must keep the same version as the one

@@ -1,0 +1,14 @@
+{
+  "_comment": "Regression test for an oxc_minifier convergence gap, without the Effect pass. A chain of 13 unused const arrow functions in declaration order, where links 1 to 12 are initialised with (tick(n), () => link(n-1)()). The vendored patch's reverse sweep (vendor/oxc_minifier/PATCHED.md) skips declarators whose initialiser has side effects, so each pass removes one link, the loop is still changing at its 12th pass and the debug assertion 'Ran loop more than 10 times' fires. Runs in dead-code-elimination-only mode (minify: dceOnly) and full compression (minify: true); treeshake is off so the chain reaches chunk minification. Every tick call must still run, in source order, and no arrow may stay. Red until such a chain is removed within the pass limit with its side effects kept in place.",
+  "config": {
+    "treeshake": false,
+    "minify": "dceOnly"
+  },
+  "configVariants": [
+    {
+      "minify": true,
+      "_snapshot": false
+    }
+  ],
+  "snapshot": false
+}

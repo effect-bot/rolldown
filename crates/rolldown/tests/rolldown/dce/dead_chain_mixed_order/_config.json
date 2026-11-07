@@ -1,0 +1,14 @@
+{
+  "_comment": "Regression test for an oxc_minifier convergence gap, without the Effect pass. A chain of 24 unused const arrow functions, declared in the order 0, 2, …, 22, 23, 21, …, 1. The vendored patch (vendor/oxc_minifier/PATCHED.md) removes a chain whose links are declared in order in one pass: a forward walk, then a reverse sweep for orphans. Here each pass removes about two links, so the loop is still changing at its 12th pass and the debug assertion 'Ran loop more than 10 times' fires. Runs in dead-code-elimination-only mode (minify: dceOnly) and full compression (minify: true); treeshake is off so the chain reaches chunk minification. The program must run and no link may stay. Red until dead declarations are removed in any order within the pass limit.",
+  "config": {
+    "treeshake": false,
+    "minify": "dceOnly"
+  },
+  "configVariants": [
+    {
+      "minify": true,
+      "_snapshot": false
+    }
+  ],
+  "snapshot": false
+}
