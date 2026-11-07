@@ -15,6 +15,7 @@
 
 #![expect(clippy::print_stderr, reason = "the opt-in debug report")]
 
+mod dts;
 mod effect;
 mod generate;
 mod heap;
@@ -433,12 +434,44 @@ impl LinkStage<'_> {
       }
     }
 
+    // == type bounds: the exported functions of `effect`'s ordinary modules, bounded by the
+    // `.d.ts` next to each (design section 8). Their bounds are resolved when first called.
+    for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
+      let Module::Normal(normal) = module else { continue };
+      if modelled.contains(&normal.idx) {
+        continue;
+      }
+      let is_effect = normal
+        .originative_resolved_id
+        .package_json
+        .as_ref()
+        .is_some_and(|pkg| pkg.name() == Some("effect"));
+      let Some(js) = normal.id.as_str().strip_suffix(".js").filter(|_| is_effect) else { continue };
+      let dts_path = std::path::PathBuf::from(format!("{js}.d.ts"));
+      if !dts_path.exists() {
+        continue;
+      }
+      let Some(ast) = self.ast_table[normal.idx].as_ref() else { continue };
+      for (name, span, nparams) in exported_functions(ast.program()) {
+        a.lazy_bounds.insert((normal.idx, span), (dts_path.clone(), name, nparams));
+      }
+    }
+
     // == solve
     for f in module_fns {
       a.activate(f);
     }
     phase!("solving");
     a.solve();
+    if debug {
+      eprintln!(
+        "[effect-service-shaking] type bounds: {} exported functions resolved, {} not called; {} .d.ts files, {} ms",
+        a.bounded_functions(),
+        a.lazy_bounds.len(),
+        a.dts.files_parsed.get(),
+        a.dts.resolve_ns.get() / 1_000_000
+      );
+    }
 
     let solved = start.elapsed();
     phase!("solved: {}", a.histogram());
@@ -724,4 +757,79 @@ fn find_top_level_init<'a>(
     }
   }
   None
+}
+
+/// The exported functions of a module: export name, the span start of the function that runs
+/// (for `dual(arity, body)`, the body), and its parameter count.
+fn exported_functions(program: &oxc::ast::ast::Program<'_>) -> Vec<(ArcStr, u32, usize)> {
+  fn function_of(e: &Expression<'_>) -> Option<(u32, usize)> {
+    match e.without_parentheses() {
+      Expression::ArrowFunctionExpression(f) => Some((f.span.start, f.params.items.len())),
+      Expression::FunctionExpression(f) => Some((f.span.start, f.params.items.len())),
+      Expression::CallExpression(c) => {
+        let is_dual = match &c.callee {
+          Expression::Identifier(i) => i.name.as_str() == "dual",
+          Expression::StaticMemberExpression(m) => m.property.name.as_str() == "dual",
+          _ => false,
+        };
+        if !is_dual {
+          return None;
+        }
+        match c.arguments.get(1)?.as_expression()?.without_parentheses() {
+          Expression::ArrowFunctionExpression(f) => Some((f.span.start, f.params.items.len())),
+          Expression::FunctionExpression(f) => Some((f.span.start, f.params.items.len())),
+          _ => None,
+        }
+      }
+      _ => None,
+    }
+  }
+  let mut locals: FxHashMap<&str, (u32, usize)> = FxHashMap::default();
+  let mut exported: Vec<(ArcStr, &str)> = vec![];
+  for stmt in &program.body {
+    let (decl, is_export) = match stmt {
+      Statement::ExportDeclaration(e) => (&e.declaration, true),
+      Statement::ExportNamedDeclaration(e) => {
+        for sp in &e.specifiers {
+          if let oxc::ast::ast::ModuleExportName::IdentifierReference(local) = &sp.local {
+            exported.push((ArcStr::from(sp.exported.name().as_str()), local.name.as_str()));
+          }
+        }
+        continue;
+      }
+      _ => match stmt.as_declaration() {
+        Some(d) => (d, false),
+        None => continue,
+      },
+    };
+    match decl {
+      oxc::ast::ast::Declaration::VariableDeclaration(v) => {
+        for d in &v.declarations {
+          if let (oxc::ast::ast::BindingPattern::BindingIdentifier(id), Some(init)) =
+            (&d.id, &d.init)
+          {
+            if let Some(f) = function_of(init) {
+              locals.insert(id.name.as_str(), f);
+              if is_export {
+                exported.push((ArcStr::from(id.name.as_str()), id.name.as_str()));
+              }
+            }
+          }
+        }
+      }
+      oxc::ast::ast::Declaration::FunctionDeclaration(f) => {
+        if let Some(id) = &f.id {
+          locals.insert(id.name.as_str(), (f.span.start, f.params.items.len()));
+          if is_export {
+            exported.push((ArcStr::from(id.name.as_str()), id.name.as_str()));
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  exported
+    .into_iter()
+    .filter_map(|(name, local)| locals.get(local).map(|&(span, n)| (name, span, n)))
+    .collect()
 }

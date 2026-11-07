@@ -2566,6 +2566,7 @@ dependencies = [
  "rolldown_workspace",
  "rustc-hash",
  "saphyr",
+ "self_cell",
  "serde",
  "serde_json",
  "smallvec",

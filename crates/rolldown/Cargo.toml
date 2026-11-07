@@ -21,6 +21,7 @@ experimental = []
 [dependencies]
 anyhow = { workspace = true }
 append-only-vec = { workspace = true }
+self_cell = { workspace = true }
 arcstr = { workspace = true }
 dashmap = { workspace = true }
 bitflags = { workspace = true }

@@ -67,6 +67,10 @@ impl Site {
 
 pub type Rule = fn(&mut Analysis, &Call);
 
+/// The type bounds of a function: a declared type per parameter and for the return value, as
+/// indices into `Analysis::tys` (`None` is open).
+type FnBounds = (Vec<Option<u32>>, Option<u32>);
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Flavour {
   /// From an external or unresolvable module, or an entry's caller: may be anything, including
@@ -301,6 +305,12 @@ pub enum Constraint {
   /// into the variable; opaque values may be any string, so they name every key; containers (the
   /// `[key, value]` pairs) and other values cannot match a string key and are skipped.
   MapKeys(VarId),
+  /// A type-bounded edge (`Analysis::bounded_copy`): the objects the declared type `ty` admits
+  /// flow into `dst`; the others wait until a change to them could make them admissible.
+  FilterCopy {
+    dst: VarId,
+    ty: u32,
+  },
   /// On a variable whose objects a walk reaches (`Analysis::walk`).
   Walk {
     walk: Walk,
@@ -370,6 +380,7 @@ impl Constraint {
       C::ProtoOf(x) => C::ProtoOf(v(*x)),
       C::SetProto(x) => C::SetProto(v(*x)),
       C::MapKeys(x) => C::MapKeys(v(*x)),
+      C::FilterCopy { dst, ty } => C::FilterCopy { dst: v(*dst), ty: *ty },
       C::Walk { walk, pool, arg, site } => {
         C::Walk { walk: *walk, pool: v(*pool), arg: v(*arg), site: s(*site) }
       }
@@ -605,6 +616,19 @@ pub struct Analysis {
   heirs: FxHashMap<ObjId, Vec<ObjId>>,
   /// The class accessors declared on each object.
   accessors: FxHashMap<ObjId, Vec<Accessor>>,
+  /// Declared types from `.d.ts` files, by index (`Constraint::FilterCopy`).
+  tys: Vec<super::dts::Ty>,
+  /// Type bounds of exported functions of `effect`'s ordinary modules, by (module, span start):
+  /// a type index per parameter and for the return value (`None` is open).
+  fn_bounds: FxHashMap<(ModuleIdx, u32), FnBounds>,
+  /// Exported functions whose bounds are resolved when first called: their `.d.ts`, export name
+  /// and parameter count.
+  pub lazy_bounds: FxHashMap<(ModuleIdx, u32), (std::path::PathBuf, ArcStr, usize)>,
+  /// The `.d.ts` files read so far.
+  pub dts: super::dts::Dts,
+  /// Objects a bounded edge rejected, with the edges that wait for them: a later field,
+  /// prototype, unknown store, spread source, accessor or escape can make them admissible.
+  rejected: FxHashMap<ObjId, Vec<(u32, VarId)>>,
   /// Set when the analysis exceeded its allocation budget: everything is kept.
   pub budget_exceeded: bool,
   /// Objects each walk pool has walked.
@@ -734,6 +758,11 @@ impl Analysis {
       inherits: FxHashSet::default(),
       heirs: FxHashMap::default(),
       accessors: FxHashMap::default(),
+      tys: vec![],
+      fn_bounds: FxHashMap::default(),
+      lazy_bounds: FxHashMap::default(),
+      dts: super::dts::Dts::default(),
+      rejected: FxHashMap::default(),
       budget_exceeded: false,
       walked: FxHashSet::default(),
       format_pool: None,
@@ -948,6 +977,7 @@ impl Analysis {
     }
     let v = self.var();
     self.objs[obj].fields.insert(name.clone(), v);
+    self.recheck_tree(obj);
     let loads = self.objs[obj].unknown_loads.clone();
     for dst in loads {
       self.copy(v, dst);
@@ -1011,6 +1041,7 @@ impl Analysis {
       return;
     }
     self.heirs.entry(ancestor).or_default().push(heir);
+    self.recheck(heir);
     if let Some(accessors) = self.accessors.get(&ancestor).cloned() {
       for acc in &accessors {
         self.run_accessor_on(heir, acc);
@@ -1028,6 +1059,7 @@ impl Analysis {
       return;
     }
     list.push(acc.clone());
+    self.recheck_tree(target);
     if let Some(heirs) = self.heirs.get(&target).cloned() {
       for heir in heirs {
         self.run_accessor_on(heir, acc);
@@ -1239,6 +1271,9 @@ impl Analysis {
     loop {
       if self.over_budget() {
         self.budget_exceeded = true;
+        if self.debug {
+          self.report_demand_at_stop();
+        }
         self.bail_reasons.push(self.histogram());
         self.bail_everything("the analysis exceeded its allocation budget; every method is kept");
         self.worklist.clear();
@@ -1283,6 +1318,11 @@ impl Analysis {
       }
       let Some(var) = self.worklist.pop() else {
         if self.activation_queue.is_empty() && self.new_constraints.is_empty() {
+          // Rejected objects are re-checked as they change; this pass only confirms that
+          // nothing became admissible without an event before the solve ends.
+          if self.recheck_all() {
+            continue;
+          }
           break;
         }
         continue;
@@ -1417,6 +1457,23 @@ impl Analysis {
         _ => {}
       },
       Constraint::Inherits(heir) => self.inherit(*heir, obj),
+      Constraint::FilterCopy { dst, ty } => {
+        if self.admits(*ty, obj) {
+          self.seed(*dst, obj);
+        } else if matches!(
+          self.objs[obj].kind,
+          ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. }
+        ) {
+          // A summary may stand for a value the type admits, such as a scalar or a key: it
+          // becomes an unknown scalar, which carries no service but stays any key.
+          self.seed(*dst, self.top_host);
+        } else {
+          let waiting = self.rejected.entry(obj).or_default();
+          if !waiting.contains(&(*ty, *dst)) {
+            waiting.push((*ty, *dst));
+          }
+        }
+      }
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
       Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
       Constraint::IfEffect { src, dst } => {
@@ -1787,6 +1844,7 @@ impl Analysis {
         self.copy(src, elem);
         if !self.objs[obj].unknown_stores.contains(&src) {
           self.objs[obj].unknown_stores.push(src);
+          self.recheck_tree(obj);
         }
         let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
         for f in fields {
@@ -2105,6 +2163,190 @@ impl Analysis {
   }
 
   /// Calls `f`, or its clone for this call site, and returns the function that ran.
+  /// Debug: what each key's provided objects demand when the budget stops the solve, before
+  /// everything is kept. This is the state of an unfinished solve, not a result.
+  fn report_demand_at_stop(&self) {
+    let mut keys: Vec<(&ArcStr, &VarId)> = self.key_values.iter().collect();
+    keys.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, var) in keys {
+      for o in &self.vars[*var].pts {
+        if !matches!(self.objs[*o].kind, ObjKind::Object) {
+          continue;
+        }
+        let demand = match &self.objs[*o].demand {
+          Demand::None => String::new(),
+          Demand::All => "all".to_string(),
+          Demand::Names(names) => {
+            let mut v: Vec<&str> = names.iter().map(ArcStr::as_str).collect();
+            v.sort_unstable();
+            v.join(",")
+          }
+        };
+        eprintln!(
+          "[effect-service-shaking] at the budget stop: key {key} object {} has {} fields, demand {demand}",
+          o.index(),
+          self.objs[*o].fields.len()
+        );
+      }
+    }
+  }
+
+  /// How many exported functions had their type bounds resolved.
+  pub fn bounded_functions(&self) -> usize {
+    self.fn_bounds.len()
+  }
+
+  /// The type bounds of `f` (or the function it clones), resolving them on first use.
+  fn bounds_of(&mut self, f: FnId) -> Option<FnBounds> {
+    let key = (self.fns[f].module, self.fns[f].span_start);
+    if let Some((path, name, nparams)) = self.lazy_bounds.remove(&key) {
+      let b = self.dts.bounds(&path, &name, nparams);
+      let mut intern = |t: Option<super::dts::Ty>| {
+        t.map(|t| {
+          self.tys.push(t);
+          u32::try_from(self.tys.len() - 1).expect("too many declared types")
+        })
+      };
+      let params = b.params.into_iter().map(&mut intern).collect();
+      let ret = intern(b.ret);
+      self.fn_bounds.insert(key, (params, ret));
+    }
+    self.fn_bounds.get(&key).cloned()
+  }
+
+  /// `src` flows into `dst`, filtered by the declared type `ty` if there is one.
+  fn bounded_copy(&mut self, src: VarId, dst: VarId, ty: Option<u32>) {
+    match ty {
+      Some(ty) => self.constrain(src, Constraint::FilterCopy { dst, ty }),
+      None => self.copy(src, dst),
+    }
+  }
+
+  /// Whether a value of the declared type `ty` may be this abstract object (Effect's public
+  /// types bound value flow, design section 8). Anything the object could still turn into
+  /// counts: an object with unknown stores, spread sources, accessors or an escape passes a
+  /// member check.
+  fn admits(&self, ty: u32, obj: ObjId) -> bool {
+    let t = &self.tys[ty as usize];
+    if t.open || t.any_object {
+      return true;
+    }
+    let objects = t.data_record || !t.members.is_empty();
+    match &self.objs[obj].kind {
+      ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim => true,
+      ObjKind::Closure(_)
+      | ObjKind::Builtin { .. }
+      | ObjKind::Class { .. }
+      | ObjKind::Key { .. } => t.func || !t.members.is_empty(),
+      ObjKind::Array => t.arrays || !t.members.is_empty(),
+      ObjKind::Object => {
+        if !objects {
+          return false;
+        }
+        let o = &self.objs[obj];
+        if !o.unknown_stores.is_empty() || !o.spread_from.is_empty() || o.escaped.is_some() {
+          return true;
+        }
+        // A record of primitives: a field holding a summary may hold a primitive too.
+        if t.data_record
+          && !o.fields.values().any(|f| {
+            self.vars[*f].pts.iter().any(|x| {
+              !matches!(
+                self.objs[*x].kind,
+                ObjKind::Str(_)
+                  | ObjKind::Num(_)
+                  | ObjKind::Prim
+                  | ObjKind::Wrap(_)
+                  | ObjKind::Top(_)
+                  | ObjKind::External { .. }
+              )
+            })
+          })
+        {
+          return true;
+        }
+        t.members.iter().any(|alt| alt.iter().all(|m| self.has_member(obj, m, 0)))
+      }
+      // A summary may be a value of any type that admits more than primitives.
+      ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. } => {
+        t.func || t.arrays || objects
+      }
+      // Effect's objects are objects: only an object-admitting type can hold one.
+      _ => objects,
+    }
+  }
+
+  /// Whether the object may have the member: an own field, a field on its prototype chain, an
+  /// accessor declared on it or an ancestor, an unknown store, a spread source (`Object.assign`,
+  /// `{ ...x }`) or an escape, on the object or anywhere up its chain.
+  fn has_member(&self, obj: ObjId, name: &str, depth: u32) -> bool {
+    if depth > 6 {
+      return true;
+    }
+    let o = &self.objs[obj];
+    if o.fields.contains_key(name)
+      || !o.unknown_stores.is_empty()
+      || !o.spread_from.is_empty()
+      || o.escaped.is_some()
+      || self.accessors.contains_key(&obj)
+    {
+      return true;
+    }
+    match o.proto {
+      Some(pv) => self.vars[pv].pts.iter().any(|p| match &self.objs[*p].kind {
+        ObjKind::Object | ObjKind::Array | ObjKind::Class { .. } | ObjKind::Closure(_) => {
+          self.has_member(*p, name, depth + 1)
+        }
+        _ => true,
+      }),
+      None => false,
+    }
+  }
+
+  /// Re-checks the edges waiting for `obj`; returns whether any admitted it.
+  fn recheck(&mut self, obj: ObjId) -> bool {
+    let Some(waiting) = self.rejected.remove(&obj) else { return false };
+    let mut admitted = false;
+    let mut keep = vec![];
+    for (ty, dst) in waiting {
+      if self.admits(ty, obj) {
+        self.seed(dst, obj);
+        admitted = true;
+      } else {
+        keep.push((ty, dst));
+      }
+    }
+    if !keep.is_empty() {
+      self.rejected.insert(obj, keep);
+    }
+    admitted
+  }
+
+  /// Re-checks `obj` and every object inheriting from it, after a change to its members.
+  /// (`heirs` lists every descendant of an object, not only its direct heirs.)
+  fn recheck_tree(&mut self, obj: ObjId) {
+    if self.rejected.is_empty() {
+      return;
+    }
+    self.recheck(obj);
+    let waiting: Vec<ObjId> = match self.heirs.get(&obj) {
+      Some(heirs) => heirs.iter().copied().filter(|h| self.rejected.contains_key(h)).collect(),
+      None => return,
+    };
+    for h in waiting {
+      self.recheck(h);
+    }
+  }
+
+  fn recheck_all(&mut self) -> bool {
+    let objs: Vec<ObjId> = self.rejected.keys().copied().collect();
+    let mut admitted = false;
+    for o in objs {
+      admitted |= self.recheck(o);
+    }
+    admitted
+  }
+
   pub fn call_fn(&mut self, f: FnId, call: &Call, instance: Option<ObjId>) -> FnId {
     let f = if instance.is_none() { self.clone_for(f, call) } else { f };
     self.activate(f);
@@ -2112,6 +2354,8 @@ impl Analysis {
       let info = &self.fns[f];
       (info.params.clone(), info.rest, info.this, info.ret, info.kind, info.arguments_elem)
     };
+    let bounds = self.bounds_of(f);
+    let param_ty = |i: usize| bounds.as_ref().and_then(|b| b.0.get(i).copied().flatten());
     if let Some(i) = instance {
       self.seed(this_var, i);
     } else if let Some(this) = call.this {
@@ -2136,8 +2380,8 @@ impl Analysis {
           any
         }
       };
-      for p in &params {
-        self.copy(any, *p);
+      for (i, p) in params.iter().enumerate() {
+        self.bounded_copy(any, *p, param_ty(i));
       }
       if let Some(r) = rest {
         let arr = self.rest_array(f);
@@ -2149,7 +2393,7 @@ impl Analysis {
     } else {
       for (i, p) in params.iter().enumerate() {
         if let Some(Arg::Var(v)) = call.args.get(i) {
-          self.copy(*v, *p);
+          self.bounded_copy(*v, *p, param_ty(i));
         }
       }
       if let Some(r) = rest {
@@ -2171,7 +2415,8 @@ impl Analysis {
     match kind {
       FnKind::Normal | FnKind::Arrow => {
         if instance.is_none() {
-          self.copy(ret, call.ret);
+          let ret_ty = bounds.as_ref().and_then(|b| b.1);
+          self.bounded_copy(ret, call.ret, ret_ty);
         }
       }
       FnKind::Async => {
@@ -2673,6 +2918,7 @@ impl Analysis {
         let holder = self.holder(obj);
         if !self.objs[target].spread_from.contains(&holder) {
           self.objs[target].spread_from.push(holder);
+          self.recheck_tree(target);
         }
         if !self.objs[obj].spread_into.contains(&target) {
           self.objs[obj].spread_into.push(target);
@@ -2715,6 +2961,7 @@ impl Analysis {
       return;
     }
     self.objs[obj].escaped = Some(flavour);
+    self.recheck_tree(obj);
     self.touch_namespace(obj, None);
     // Host builtins never look inside their arguments (a wrong builtin model is a compiler
     // bug): a plain object handed to one keeps its shape, and runtime objects stay sealed. Only
@@ -2740,6 +2987,7 @@ impl Analysis {
           self.seed(elem, self.top_ext);
           if !self.objs[obj].unknown_stores.contains(&elem) {
             self.objs[obj].unknown_stores.push(elem);
+            self.recheck_tree(obj);
           }
         }
         let sources = self.objs[obj].spread_from.clone();
