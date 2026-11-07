@@ -169,6 +169,14 @@ pub fn host_var(a: &mut Analysis) -> VarId {
   v
 }
 
+/// The values an enumeration of the objects in `o` hands out: every field.
+fn enumerated(a: &mut Analysis, o: VarId) -> VarId {
+  a.constrain(o, Constraint::Enumerate);
+  let values = a.var();
+  a.constrain(o, Constraint::Load { key: Key::Unknown, dst: values });
+  values
+}
+
 pub fn new_array(a: &mut Analysis, site: Site, tag: u8) -> (ObjId, VarId, VarId) {
   let arr = a.site_obj(site, tag, |_| ObjKind::Array);
   let elem = a.elem(arr);
@@ -236,16 +244,35 @@ pub fn register(a: &mut Analysis) {
       a.copy(v, c.ret);
     });
   }
-  for name in ["Object.values", "Object.entries", "Object.getOwnPropertyDescriptors"] {
-    a.rule(name, |a, c| {
-      let o = arg(a, c, 0);
-      a.constrain(o, Constraint::Enumerate);
-      let (_, v, elem) = new_array(a, c.site, 1);
-      a.constrain(o, Constraint::Load { key: Key::Unknown, dst: elem });
-      a.seed(elem, a.top_host);
-      a.copy(v, c.ret);
-    });
-  }
+  a.rule("Object.values", |a, c| {
+    let o = arg(a, c, 0);
+    let values = enumerated(a, o);
+    let (_, v, elem) = new_array(a, c.site, 1);
+    a.copy(values, elem);
+    a.copy(v, c.ret);
+  });
+  a.rule("Object.entries", |a, c| {
+    // `[key, value]` pairs.
+    let o = arg(a, c, 0);
+    let values = enumerated(a, o);
+    let (_, v, elem) = new_array(a, c.site, 1);
+    let (_, pv, pair) = new_array(a, c.site, 9);
+    a.copy(values, pair);
+    a.seed(pair, a.top_host);
+    a.copy(pv, elem);
+    a.copy(v, c.ret);
+  });
+  a.rule("Object.getOwnPropertyDescriptors", |a, c| {
+    // An object of descriptors, each holding a value under `value`.
+    let o = arg(a, c, 0);
+    let values = enumerated(a, o);
+    let (_, v) = new_object(a, c.site, 1);
+    let (desc, dv) = new_object(a, c.site, 9);
+    let value = a.field(desc, &ArcStr::from("value"));
+    a.copy(values, value);
+    a.constrain(v, Constraint::Store { key: Key::Unknown, src: dv });
+    a.copy(v, c.ret);
+  });
   a.rule("Object.assign", |a, c| {
     let target = arg(a, c, 0);
     for src in args_from(a, c, 1) {
