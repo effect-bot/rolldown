@@ -1,0 +1,10 @@
+{
+  "_comment": "Tracer.make returns the tracer it is given. Its public, generic context hook, called directly, returns what the primitive it runs evaluates to, here the service: the method called on that result stays, the unread one is removed and the bundle runs. Guards that the Tracer.make model keeps the tracer's own members.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

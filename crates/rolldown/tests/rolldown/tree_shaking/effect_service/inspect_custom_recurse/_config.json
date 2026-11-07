@@ -1,0 +1,10 @@
+{
+  "_comment": "A logged service keeps its [inspect.custom] method (the protocol exception). Node calls it with the inspector as its third argument, and the method hands that inspector a nested object whose custom inspection calls another method of the service: that method stays, the unread one is removed and the bundle runs. Guards that protocol calls get the arguments the host passes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

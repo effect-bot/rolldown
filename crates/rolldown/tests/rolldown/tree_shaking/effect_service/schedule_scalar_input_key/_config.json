@@ -1,0 +1,10 @@
+{
+  "_comment": "A Schedule's only input is the string \"used\", and its callback calls the method of a captured service that the string names. The service is never a Schedule input, output or Done value, only the scalar is: the named method stays, the unread one is removed and the bundle runs. Guards that untracked Schedule values keep scalar keys.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
