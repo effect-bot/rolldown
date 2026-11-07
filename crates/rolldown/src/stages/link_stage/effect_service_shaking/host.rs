@@ -724,27 +724,15 @@ pub fn register(a: &mut Analysis) {
   a.rule("promise.resolve", |a, c| {
     let value = c_data(c);
     let v = arg(a, c, 0);
+    // Resolving with a thenable adopts it (`AwaitOf` calls its `then`).
     let settled = await_of(a, v);
     a.copy(settled, value);
-    then_read(a, v);
-  });
-  // The resolve function the host hands a thenable's `then` (`Walk::Protocol`): resolving with
-  // a thenable calls its `then` with the same functions.
-  a.rule("protocol.resolve", |a, c| {
-    let v = arg(a, c, 0);
-    let then = load(a, v, "then");
-    let id = a.rule_id("protocol.resolve").expect("registered");
-    let resolve = a.builtin(id, None, None);
-    let rv = a.var();
-    a.seed(rv, resolve);
-    invoke(a, c.site, then, Some(v), vec![rv, rv]);
   });
   a.rule("Promise.resolve", |a, c| {
     let (_, pv, value) = new_promise(a, c.site, 10);
     let v = arg(a, c, 0);
     let settled = await_of(a, v);
     a.copy(settled, value);
-    then_read(a, v);
     a.copy(pv, c.ret);
   });
   a.rule("Promise.reject", |a, c| {
@@ -782,7 +770,6 @@ pub fn register(a: &mut Analysis) {
       let r = invoke(a, c.site, f, None, vec![value]);
       let settled = await_of(a, r);
       a.copy(settled, out);
-      then_read(a, r);
     }
     if c.args.len() > 1 {
       let g = arg(a, c, 1);
@@ -1001,11 +988,6 @@ fn c_data(c: &Call) -> VarId {
   // Rules with data are reached through `Builtin { data: Some(..) }`; the heap passes the data
   // variable as `this` when the builtin has no receiver of its own.
   c.this.expect("builtin data")
-}
-
-fn then_read(a: &mut Analysis, v: VarId) {
-  let dst = a.var();
-  a.constrain(v, Constraint::Load { key: Key::Name(ArcStr::from("then")), dst });
 }
 
 pub fn const_string_of(a: &Analysis, v: VarId) -> Option<String> {

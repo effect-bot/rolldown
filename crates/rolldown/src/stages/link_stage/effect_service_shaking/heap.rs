@@ -1444,6 +1444,10 @@ impl Analysis {
       }
       Constraint::AwaitOf(dst) => match self.objs[obj].kind {
         ObjKind::Promise { value } => self.copy(value, *dst),
+        ObjKind::Object | ObjKind::Closure(_) | ObjKind::Class { .. } => {
+          self.seed(*dst, obj);
+          self.adopt(obj);
+        }
         _ => self.seed(*dst, obj),
       },
       Constraint::Escape(flavour, site) => self.escape(obj, *flavour, *site),
@@ -2324,18 +2328,49 @@ impl Analysis {
   }
 
   /// `then(resolve, reject)`'s arguments as the host passes them: functions that resolve a
-  /// thenable they receive by calling its `then` (`protocol.resolve`).
+  /// thenable they receive by adopting it (`resolve_function`).
   fn then_args(&mut self) -> VarId {
     if let Some(v) = self.then_args {
       return v;
     }
-    let v = self.var();
-    if let Some(id) = self.rule_id("protocol.resolve") {
-      let resolve = self.builtin(id, None, None);
-      self.seed(v, resolve);
-    }
+    let settled = self.var();
+    let v = self.resolve_function(settled);
     self.then_args = Some(v);
     v
+  }
+
+  /// A host resolve function (`promise.resolve`) that settles into `value`: resolving with a
+  /// thenable adopts it in turn (`AwaitOf`).
+  fn resolve_function(&mut self, value: VarId) -> VarId {
+    let v = self.var();
+    if let Some(id) = self.rule_id("promise.resolve") {
+      let resolve = self.builtin(id, Some(value), None);
+      self.seed(v, resolve);
+    }
+    v
+  }
+
+  /// Host adoption of an object that may be a thenable (an `await`, an async function's return,
+  /// a promise resolved with it): the host calls its `then` with a resolve function, which adopts
+  /// a thenable it receives in turn, and a reject function, whose argument nothing reads. Every
+  /// adoption shares one call site and one resolve function (`then_args`): what `then` reaches
+  /// runs, while the awaited value stays the object itself, as before.
+  fn adopt(&mut self, obj: ObjId) {
+    let this = self.holder(obj);
+    let then = self.var();
+    self.constrain(this, Constraint::Load { key: Key::Name(ArcStr::from("then")), dst: then });
+    let resolve = self.then_args();
+    let reject = self.prim_arg();
+    let ret = self.var();
+    let call = Call {
+      site: protocol_site(5),
+      this: Some(this),
+      args: vec![Arg::Var(resolve), Arg::Var(reject)],
+      ret,
+      is_new: false,
+      builtin: None,
+    };
+    self.constrain(then, Constraint::Call(Box::new(call)));
   }
 
   /// `ServiceFree`: a primitive flows on; a summary (which may stand for a service) becomes an
@@ -2626,10 +2661,9 @@ impl Analysis {
           },
         );
         let ObjKind::Promise { value } = self.objs[p].kind else { unreachable!() };
+        // Returning an object from an async function resolves it, adopting a thenable
+        // (`AwaitOf`).
         self.constrain(ret, Constraint::AwaitOf(value));
-        // Returning an object from an async function resolves it: `then` is read.
-        let then = self.var();
-        self.constrain(ret, Constraint::Load { key: Key::Name(ArcStr::from("then")), dst: then });
         self.seed(call.ret, p);
       }
       FnKind::Generator | FnKind::AsyncGenerator => {
