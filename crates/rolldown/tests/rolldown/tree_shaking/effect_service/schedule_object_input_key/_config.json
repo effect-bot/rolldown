@@ -1,0 +1,10 @@
+{
+  "_comment": "A Schedule's only input is a plain object holding a string, and its callback calls the method of a captured service that the string names. The object holds no service, so assumption 4 allows it as a Schedule input: the named method stays, the unread one is removed and the bundle runs. Guards that untracked Schedule values keep the keys of service-free object inputs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
