@@ -728,6 +728,17 @@ pub fn register(a: &mut Analysis) {
     a.copy(settled, value);
     then_read(a, v);
   });
+  // The resolve function the host hands a thenable's `then` (`Walk::Protocol`): resolving with
+  // a thenable calls its `then` with the same functions.
+  a.rule("protocol.resolve", |a, c| {
+    let v = arg(a, c, 0);
+    let then = load(a, v, "then");
+    let id = a.rule_id("protocol.resolve").expect("registered");
+    let resolve = a.builtin(id, None, None);
+    let rv = a.var();
+    a.seed(rv, resolve);
+    invoke(a, c.site, then, Some(v), vec![rv, rv]);
+  });
   a.rule("Promise.resolve", |a, c| {
     let (_, pv, value) = new_promise(a, c.site, 10);
     let v = arg(a, c, 0);

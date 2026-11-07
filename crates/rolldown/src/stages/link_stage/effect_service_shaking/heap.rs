@@ -669,6 +669,7 @@ pub struct Analysis {
   ignored_pool: Option<VarId>,
   prim_arg: Option<VarId>,
   inspect_args: Option<VarId>,
+  then_args: Option<VarId>,
   prim_ty: Option<u32>,
   pub hash_pool: Option<VarId>,
   /// The program-wide pools of host serialization and inspection (`host_protocol`).
@@ -805,6 +806,7 @@ impl Analysis {
       ignored_pool: None,
       prim_arg: None,
       inspect_args: None,
+      then_args: None,
       prim_ty: None,
       hash_pool: None,
       json_pool: None,
@@ -2312,6 +2314,21 @@ impl Analysis {
     v
   }
 
+  /// `then(resolve, reject)`'s arguments as the host passes them: functions that resolve a
+  /// thenable they receive by calling its `then` (`protocol.resolve`).
+  fn then_args(&mut self) -> VarId {
+    if let Some(v) = self.then_args {
+      return v;
+    }
+    let v = self.var();
+    if let Some(id) = self.rule_id("protocol.resolve") {
+      let resolve = self.builtin(id, None, None);
+      self.seed(v, resolve);
+    }
+    self.then_args = Some(v);
+    v
+  }
+
   /// The primitives `src` holds flow into `dst`; objects don't, and a summary becomes an
   /// unknown scalar (`Constraint::FilterCopy` with a primitive-only type).
   pub fn primitives_of(&mut self, src: VarId, dst: VarId) {
@@ -2935,15 +2952,19 @@ impl Analysis {
         }
         let this = self.holder(obj);
         // The protocol walk passes each method what the host or Effect passes it: the current
-        // Context to Redactable, Node's inspector arguments to `[util.inspect.custom]`, and a
-        // primitive to the rest.
-        let protocol_args =
-          if walk == Walk::Protocol { Some((self.prim_arg(), self.inspect_args())) } else { None };
+        // Context to Redactable, Node's inspector arguments to `[util.inspect.custom]`, resolve
+        // functions to `then`, and a primitive to the rest.
+        let protocol_args = if walk == Walk::Protocol {
+          Some((self.prim_arg(), self.inspect_args(), self.then_args()))
+        } else {
+          None
+        };
         for (name, arity) in walk.protocols() {
           let arg = match protocol_args {
             Some(_) if *name == REDACTABLE_KEY => arg,
-            Some((_, inspect)) if *name == super::host::INSPECT_CUSTOM => inspect,
-            Some((prim, _)) => prim,
+            Some((_, inspect, _)) if *name == super::host::INSPECT_CUSTOM => inspect,
+            Some((_, _, then)) if *name == "then" => then,
+            Some((prim, _, _)) => prim,
             None => arg,
           };
           let method = self.protocol_call(this, name, *arity, arg, site, pool);

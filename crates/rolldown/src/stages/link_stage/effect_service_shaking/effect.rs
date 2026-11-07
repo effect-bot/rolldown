@@ -465,16 +465,17 @@ fn policy_schedule(a: &mut Analysis, site: Site, policy: VarId) -> VarId {
 }
 
 /// Steps the Schedules in `schedule` once through the bundled stable `Schedule.toStep`, and
-/// returns what the step fails with. Services never pass through a Schedule (issue,
-/// "Assumptions" 4): the step gets only the primitives of `input` (a string may still name a
-/// method a callback reads), and its output (a Pull's `[output, delay]`, or the
-/// `Done` it ends with) is not read, so neither `Effect.repeat`'s result, `retryOrElse`'s
-/// fallback nor `Schedule.CurrentMetadata` carries one. The Schedule's own code still runs, so
+/// returns `(failure, output)`. Services never pass through a Schedule (issue, "Assumptions" 4):
+/// the step gets only the primitives of `input`, and `output` holds only the primitives of what
+/// it outputs (a Pull's `[output, delay]`, or the `Done` it ends with), so a string may still
+/// name a method, but neither `Effect.repeat`'s result, `retryOrElse`'s fallback nor
+/// `Schedule.CurrentMetadata` carries a service. The Schedule's own code still runs, so
 /// the callbacks it is built from (and what they capture) count.
 /// Without a bundled `effect/Schedule`, a Schedule can only come from code the pass can't see:
 /// it is handed over.
-fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) -> VarId {
+fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) -> (VarId, VarId) {
   let failure = a.var();
+  let output = a.var();
   if let Some(to_step) = a.schedule_to_step {
     let eff = invoke(a, site, to_step, None, vec![schedule]);
     let step = success_of(a, eff);
@@ -482,15 +483,21 @@ fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) ->
     let scalars = a.var();
     a.primitives_of(input, scalars);
     let pull = invoke(a, site, step, None, vec![now, scalars]);
+    let ps = success_of(a, pull);
+    let decision = elem_of(a, ps);
+    a.primitives_of(decision, output);
     let pf = failure_of(a, pull);
     a.copy(pf, failure);
+    let done = load(a, pf, "value");
+    a.primitives_of(done, output);
     let ef = failure_of(a, eff);
     a.copy(ef, failure);
   } else {
     a.constrain(schedule, Constraint::Escape(Flavour::Ext, Some(site)));
     a.seed(failure, a.top_ext);
+    a.seed(output, a.top_host);
   }
-  failure
+  (failure, output)
 }
 
 /// A fiber running `e`: its slots hold what `e` succeeds and fails with.
@@ -1176,7 +1183,7 @@ pub fn register(a: &mut Analysis) {
   dual!(a, "effect:Effect.repeat", 2, |a, c| {
     // `repeat(self, options | schedule | ($) => schedule)`. With options it succeeds with
     // `self`'s success; with a schedule, or a builder called with `identity`, with the
-    // schedule's output, which holds no service (`step_schedule`).
+    // schedule's output, of which only primitives flow (`step_schedule`).
     let e = self_effect(a, c);
     let x = arg(a, c, 1);
     let s = success_of(a, e);
@@ -1191,8 +1198,9 @@ pub fn register(a: &mut Analysis) {
       a.copy(rf, of);
     }
     let schedule = policy_schedule(a, c.site, x);
-    let failure = step_schedule(a, c.site, schedule, s);
+    let (failure, output) = step_schedule(a, c.site, schedule, s);
     a.copy(failure, of);
+    a.copy(output, os);
     a.copy(out, c.ret);
   });
   dual!(a, "effect:Effect.retry", 2, |a, c| {
@@ -1213,14 +1221,14 @@ pub fn register(a: &mut Analysis) {
       a.copy(rf, of);
     }
     let schedule = policy_schedule(a, c.site, x);
-    let failure = step_schedule(a, c.site, schedule, fl);
+    let (failure, _) = step_schedule(a, c.site, schedule, fl);
     a.copy(failure, of);
     a.copy(out, c.ret);
   });
   dual!(a, "effect:Effect.retryOrElse", 3, |a, c| {
     // `retryOrElse(self, policy, orElse)` succeeds with `self`'s success, or, once the
     // policy's Schedule is exhausted, with what `orElse(error, out)` succeeds with, where
-    // `out` is the Schedule's last output, which holds no service (`step_schedule`).
+    // `out` is the Schedule's last output, of which only primitives flow (`step_schedule`).
     // Defects are not retried and share the failure slot with typed errors, so `self`'s
     // failure also passes through.
     let e = self_effect(a, c);
@@ -1231,10 +1239,9 @@ pub fn register(a: &mut Analysis) {
     let (out, os, of) = new_effect(a, c.site, 1);
     a.copy(s, os);
     a.copy(fl, of);
-    let failure = step_schedule(a, c.site, policy, fl);
+    let (failure, output) = step_schedule(a, c.site, policy, fl);
     a.copy(failure, of);
-    let no_output = a.var();
-    let r = invoke(a, c.site, or_else, None, vec![fl, no_output]);
+    let r = invoke(a, c.site, or_else, None, vec![fl, output]);
     let rs = success_of(a, r);
     a.copy(rs, os);
     let rf = failure_of(a, r);
