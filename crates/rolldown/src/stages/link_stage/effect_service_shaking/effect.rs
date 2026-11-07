@@ -375,17 +375,47 @@ pub const LISTED_MODULES: &[(&str, &[(&str, Spec)])] = &[
   (
     "Cause",
     &[
-      ("fail", Spec::Rule("effect:Cause.fail")),
-      ("fromReasons", Spec::Rule("effect:Cause.fromReasons")),
-      ("isCause", Spec::Rule("effect:Cause.isCause")),
-      ("isReason", Spec::Rule("effect:Cause.isReason")),
-      ("isDone", Spec::Rule("effect:Cause.isDone")),
-      ("isFailReason", Spec::Rule("effect:Cause.isTagged")),
-      ("isDieReason", Spec::Rule("effect:Cause.isTagged")),
-      ("isInterruptReason", Spec::Rule("effect:Cause.isTagged")),
-      ("hasFails", Spec::Rule("effect:Cause.hasTagged")),
-      ("hasDies", Spec::Rule("effect:Cause.hasTagged")),
-      ("hasInterrupts", Spec::Rule("effect:Cause.hasTagged")),
+      ("isCause", Spec::Rule("effect:Cause.inert")),
+      ("isReason", Spec::Rule("effect:Cause.inert")),
+      ("isFailReason", Spec::Rule("effect:Cause.inert")),
+      ("isDieReason", Spec::Rule("effect:Cause.inert")),
+      ("isInterruptReason", Spec::Rule("effect:Cause.inert")),
+      ("fromReasons", Spec::Rule("effect:Cause.inert")),
+      ("fail", Spec::Rule("effect:Cause.inert")),
+      ("die", Spec::Rule("effect:Cause.inert")),
+      ("interrupt", Spec::Rule("effect:Cause.inert")),
+      ("makeFailReason", Spec::Rule("effect:Cause.inert")),
+      ("makeDieReason", Spec::Rule("effect:Cause.inert")),
+      ("makeInterruptReason", Spec::Rule("effect:Cause.inert")),
+      ("hasInterruptsOnly", Spec::Rule("effect:Cause.inert")),
+      ("map", Spec::Rule("effect:Cause.inert")),
+      ("combine", Spec::Rule("effect:Cause.inert")),
+      ("squash", Spec::Rule("effect:Cause.inert")),
+      ("hasFails", Spec::Rule("effect:Cause.inert")),
+      ("findFail", Spec::Rule("effect:Cause.inert")),
+      ("findError", Spec::Rule("effect:Cause.inert")),
+      ("findErrorOption", Spec::Rule("effect:Cause.inert")),
+      ("hasDies", Spec::Rule("effect:Cause.inert")),
+      ("findDie", Spec::Rule("effect:Cause.inert")),
+      ("findDefect", Spec::Rule("effect:Cause.inert")),
+      ("hasInterrupts", Spec::Rule("effect:Cause.inert")),
+      ("findInterrupt", Spec::Rule("effect:Cause.inert")),
+      ("interruptors", Spec::Rule("effect:Cause.inert")),
+      ("filterInterruptors", Spec::Rule("effect:Cause.inert")),
+      ("prettyErrors", Spec::Rule("effect:Cause.inert")),
+      ("pretty", Spec::Rule("effect:Cause.inert")),
+      ("isNoSuchElementError", Spec::Rule("effect:Cause.inert")),
+      ("isDone", Spec::Rule("effect:Cause.inert")),
+      ("isTimeoutError", Spec::Rule("effect:Cause.inert")),
+      ("isIllegalArgumentError", Spec::Rule("effect:Cause.inert")),
+      ("isExceededCapacityError", Spec::Rule("effect:Cause.inert")),
+      ("isAsyncFiberError", Spec::Rule("effect:Cause.inert")),
+      ("isUnknownError", Spec::Rule("effect:Cause.inert")),
+      ("annotate", Spec::Rule("effect:Cause.inert")),
+      ("reasonAnnotations", Spec::Rule("effect:Cause.inert")),
+      ("annotations", Spec::Rule("effect:Cause.inert")),
+      ("done", Spec::Rule("effect:Cause.done")),
+      ("Done", Spec::Rule("effect:Cause.Done")),
     ],
   ),
   ("Logger", &[("make", Spec::Rule("effect:Logger.make"))]),
@@ -559,11 +589,9 @@ fn run_loggers(a: &mut Analysis, messages: &[VarId]) {
       let (options, options_var) = new_object(a, site, 1);
       let (_, message, elem) = new_array(a, site, 2);
       a.copy(pool, elem);
-      let cause = wrap(a, site, pool);
       let fb = fiber(a);
       let prim = prim_var(a);
-      for (name, value) in
-        [("message", message), ("cause", cause), ("fiber", fb), ("date", prim), ("logLevel", prim)]
+      for (name, value) in [("message", message), ("fiber", fb), ("date", prim), ("logLevel", prim)]
       {
         let field = a.field(options, &ArcStr::from(name));
         a.copy(value, field);
@@ -580,13 +608,6 @@ fn run_loggers(a: &mut Analysis, messages: &[VarId]) {
   for m in messages {
     a.copy(*m, pool);
   }
-}
-
-/// A predicate that reads `key` on its argument and returns a boolean.
-fn presence_check(a: &mut Analysis, c: &Call, key: &str) {
-  let value = arg(a, c, 0);
-  a.constrain(value, Constraint::Demand(ArcStr::from(key)));
-  a.seed(c.ret, a.prim);
 }
 
 /// The record behind `References.CurrentLogAnnotations`, and a variable holding it.
@@ -1547,10 +1568,9 @@ pub fn register(a: &mut Analysis) {
     a.copy(s, c.ret);
   });
   a.rule("Exit.cause:get", |a, c| {
-    let e = this_of(a, c);
-    let fl = failure_of(a, e);
-    let cause = a.cause_of(fl, c.site);
-    a.copy(cause, c.ret);
+    // An Exit's Cause holds no service (issue, "Assumptions" 3): reading it yields nothing.
+    let _ = c;
+    let _ = a;
   });
   dual!(a, "effect:Effect.provide", 2, |a, c| {
     let e = self_effect(a, c);
@@ -2044,45 +2064,36 @@ pub fn register(a: &mut Analysis) {
 
   // == Read-back of values Effect stores for the program
 
-  // Cause's stable predicates read one property and call nothing: the brand checks test the
-  // presence of a key on an unknown value, the reason checks read `_tag`, and `hasFails` and
-  // friends read `_tag` on each reason. Each returns a boolean.
-  a.rule("effect:Cause.isCause", |a, c| presence_check(a, c, "~effect/Cause"));
-  a.rule("effect:Cause.isReason", |a, c| presence_check(a, c, "~effect/Cause/Reason"));
-  a.rule("effect:Cause.isDone", |a, c| presence_check(a, c, "~effect/Cause/Done"));
-  a.rule("effect:Cause.isTagged", |a, c| presence_check(a, c, "_tag"));
-  a.rule("effect:Cause.hasTagged", |a, c| {
-    let cause = arg(a, c, 0);
-    let reasons = load(a, cause, "reasons");
-    let reason = elem_of(a, reasons);
-    a.constrain(reason, Constraint::Demand(ArcStr::from("_tag")));
+  // Services never enter the error channel (issue, "Assumptions" 3): Cause's functions take and
+  // return error-channel values, which hold no service. They read nothing and return a plain
+  // value; the callbacks they are given still run (with no input), so what those read counts.
+  a.rule("effect:Cause.inert", |a, c| {
+    for x in args_from(a, c, 0) {
+      let v = match x {
+        Arg::Var(v) => v,
+        Arg::Spread(v) => elem_of(a, v),
+      };
+      let callable = a.var();
+      a.constrain(v, Constraint::Callables(callable));
+      invoke(a, c.site, callable, None, vec![]);
+    }
     a.seed(c.ret, a.prim);
   });
-  a.rule("effect:Cause.fromReasons", |a, c| {
-    // `fromReasons(reasons)`: a Cause of those reasons. A reason the model reads back through a
-    // Cause is its error itself (`cause_of`), so an element may be an error as well as a reason
-    // object: the new Cause's errors are the elements and their `error` and `defect` members.
-    let reasons = arg(a, c, 0);
-    let element = elem_of(a, reasons);
-    let inner = a.var();
-    a.copy(element, inner);
-    for member in ["error", "defect"] {
-      let v = load(a, element, member);
-      a.copy(v, inner);
-    }
-    let cause = a.cause_of(inner, c.site);
-    a.copy(cause, c.ret);
+  // `Cause.done(value)` fails with a `Done` signal, which is how a Schedule (or any Pull) ends with
+  // its final output: success-side data, the one thing handlers see (`Analysis::done_failure`).
+  a.rule("effect:Cause.done", |a, c| {
+    let value = arg(a, c, 0);
+    let pool = a.done_values;
+    a.copy(value, pool);
+    let (e, _, _) = new_effect(a, c.site, 1);
+    a.copy(e, c.ret);
   });
-
-  a.rule("effect:Cause.fail", |a, c| {
-    // `Cause.fail(error)`: a Cause of the error (`cause_of`), as `Exit.cause` is. The
-    // error is read back through the Cause (`Cause.findError`, `Effect.catch` of
-    // `Effect.failCause`); nothing else is read on it.
-    let error = arg(a, c, 0);
-    let inner = a.var();
-    a.copy(error, inner);
-    let cause = a.cause_of(inner, c.site);
-    a.copy(cause, c.ret);
+  a.rule("effect:Cause.Done", |a, c| {
+    let value = arg(a, c, 0);
+    let pool = a.done_values;
+    a.copy(value, pool);
+    let (_, done) = a.done_failure();
+    a.seed(c.ret, done);
   });
   a.rule("effect:Effect.annotateLogs", |a, c| {
     // `annotateLogs(key, value)` and `annotateLogs(record)` return `self => self` with the

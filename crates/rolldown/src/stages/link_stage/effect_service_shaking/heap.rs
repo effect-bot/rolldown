@@ -621,11 +621,16 @@ pub struct Analysis {
   pub log_annotations: Option<VarId>,
   /// Everything `Effect.log` logs, handed to the installed loggers (`effect::run_loggers`).
   pub log_messages: Option<VarId>,
-  /// Wraps that stand for a Cause of their errors (`Cause.fail`, `Exit.cause`): a named read on
-  /// one also reads that member of the errors (`load_name`). Other wraps record only demand.
-  transparent_wraps: FxHashSet<ObjId>,
-  /// The members read by name through a transparent wrap, per wrap and name.
-  transparent_members: FxHashMap<(ObjId, ArcStr), VarId>,
+  /// The failure slot every model Effect shares. Services never enter the error channel
+  /// (issue, "Assumptions" 3), so nothing reads it: `failure_of` yields nothing.
+  failure_sink: VarId,
+  /// The values `Cause.done` completes a Pull with: a Schedule's output when it ends. They are
+  /// success-side data that Effect carries through the error channel, so they are the one thing
+  /// handlers receive (`done_failure`).
+  pub done_values: VarId,
+  /// The Done signal handlers see in place of a failure: a Cause whose one Fail reason's error is
+  /// a `Done` with `done_values` as its value, and that `Done` itself (built once).
+  done_failure: Option<(ObjId, ObjId)>,
   /// Rule invocations, for diagnostics.
   pub rule_calls: FxHashMap<u16, usize>,
   /// One "any argument" variable per spread call, shared by every `arg` read of that call.
@@ -708,6 +713,8 @@ impl Analysis {
     let ambient_context = alloc(ObjKind::Context { keys: ambient_keys });
     let unknown_key_values = vars.push(Var::default());
     let all_values = vars.push(Var::default());
+    let failure_sink = vars.push(Var::default());
+    let done_values = vars.push(Var::default());
     let effect_key_values = vars.push(Var::default());
     let effect_key_strings = vars.push(Var::default());
     let mut this = Self {
@@ -736,8 +743,9 @@ impl Analysis {
       primitive_converted: FxHashSet::default(),
       log_annotations: None,
       log_messages: None,
-      transparent_wraps: FxHashSet::default(),
-      transparent_members: FxHashMap::default(),
+      failure_sink,
+      done_values,
+      done_failure: None,
       rule_calls: FxHashMap::default(),
       rule_memo: FxHashMap::default(),
       spread_any: FxHashMap::default(),
@@ -896,7 +904,7 @@ impl Analysis {
   pub fn new_effect(&mut self, site: Site, tag: u8) -> (ObjId, VarId, VarId) {
     let id = self.site_obj(site, tag, |a| {
       let success = a.var();
-      let failure = a.var();
+      let failure = a.failure_sink;
       ObjKind::Effect { success, failure }
     });
     let ObjKind::Effect { success, failure } = self.objs[id].kind else { unreachable!() };
@@ -1537,30 +1545,9 @@ impl Analysis {
         }
       }
       ObjKind::Wrap(inner) => {
-        // Any access path yields the wrapped values; the read is recorded on them. Through a
-        // Cause (`Cause.fail`, `Exit.cause`) it is also a read on the errors: every member they
-        // hold under that name flows, so a method read back through it is the method and its
-        // body runs, and a data member, a bound function or a builtin reaches its use
-        // (`transparent_wraps`). A default-rule wrap does not need that: the rule already calls
-        // every callable its arguments hold.
+        // Any access path yields the wrapped values; the read is recorded on them.
         self.copy(inner, dst);
-        if self.transparent_wraps.contains(&obj) {
-          // One load per wrap and name: a wrap reached by many variables is read many times,
-          // and a load per read would mint a variable and a constraint each time.
-          let members = match self.transparent_members.get(&(obj, name.clone())) {
-            Some(v) => *v,
-            None => {
-              let members = self.var();
-              self
-                .constrain(inner, Constraint::Load { key: Key::Name(name.clone()), dst: members });
-              self.transparent_members.insert((obj, name.clone()), members);
-              members
-            }
-          };
-          self.copy(members, dst);
-        } else {
-          self.constrain(inner, Constraint::Demand(name.clone()));
-        }
+        self.constrain(inner, Constraint::Demand(name.clone()));
         self.seed(dst, obj);
       }
       ObjKind::Top(flavour) => {
@@ -2321,15 +2308,6 @@ impl Analysis {
     self.holder(w)
   }
 
-  /// A Cause of the errors in `inner` (`Cause.fail`, `Exit.cause`): a wrap whose named reads
-  /// also read the errors' members.
-  pub fn cause_of(&mut self, inner: VarId, site: Site) -> VarId {
-    let v = self.wrap_of(inner, site);
-    let w = self.wraps[&inner];
-    self.transparent_wraps.insert(w);
-    v
-  }
-
   pub fn top_of(&self, obj: ObjId) -> ObjId {
     match self.objs[obj].kind {
       ObjKind::Top(Flavour::Ext) | ObjKind::External { flavour: Flavour::Ext, .. } => self.top_ext,
@@ -2370,21 +2348,53 @@ impl Analysis {
     }
   }
 
+  /// What an effect fails with, as handlers see it. Services never enter the error channel
+  /// (issue, "Assumptions" 3), so the pass does not track failures, defects or Causes: handlers
+  /// still run, and see only the `Done` signal that carries a Schedule's final output
+  /// (`done_values`), as a Cause and as the error itself.
   fn failure_of(&mut self, obj: ObjId, dst: VarId) {
-    match self.objs[obj].kind.clone() {
-      ObjKind::Effect { failure, .. } => self.copy(failure, dst),
-      ObjKind::Iterator(f) => {
-        self.activate(f);
-        let yf = self.fns[f].yielded_fail;
-        self.copy(yf, dst);
-      }
-      ObjKind::Wrap(_) => self.seed(dst, obj),
-      ObjKind::Top(_) => {
-        let t = self.top_of(obj);
-        self.seed(dst, t);
-      }
-      _ => {}
+    if let ObjKind::Iterator(f) = self.objs[obj].kind {
+      self.activate(f);
     }
+    if matches!(
+      self.objs[obj].kind,
+      ObjKind::Effect { .. } | ObjKind::Iterator(_) | ObjKind::Wrap(_)
+    ) {
+      let (cause, done) = self.done_failure();
+      self.seed(dst, cause);
+      self.seed(dst, done);
+    }
+  }
+
+  /// The Cause and `Done` of `done_failure`.
+  pub fn done_failure(&mut self) -> (ObjId, ObjId) {
+    if let Some(objs) = self.done_failure {
+      return objs;
+    }
+    let done = self.alloc(ObjKind::Object, None);
+    let tag = self.field(done, &ArcStr::from("_tag"));
+    let s = self.str("Done");
+    self.seed(tag, s);
+    let brand = self.field(done, &ArcStr::from("~effect/Cause/Done"));
+    self.seed(brand, self.prim);
+    let value = self.field(done, &ArcStr::from("value"));
+    self.copy(self.done_values, value);
+    let reason = self.alloc(ObjKind::Object, None);
+    let tag = self.field(reason, &ArcStr::from("_tag"));
+    let s = self.str("Fail");
+    self.seed(tag, s);
+    let error = self.field(reason, &ArcStr::from("error"));
+    self.seed(error, done);
+    let reasons = self.alloc(ObjKind::Array, None);
+    let elem = self.elem(reasons);
+    self.seed(elem, reason);
+    let cause = self.alloc(ObjKind::Object, None);
+    let field = self.field(cause, &ArcStr::from("reasons"));
+    self.seed(field, reasons);
+    let brand = self.field(cause, &ArcStr::from("~effect/Cause"));
+    self.seed(brand, self.prim);
+    self.done_failure = Some((cause, done));
+    (cause, done)
   }
 
   pub fn key_use(&mut self, obj: ObjId, use_: &KeyUse) {
@@ -2528,10 +2538,8 @@ impl Analysis {
         }
       }
       // Printing an Effect (an Exit, say) prints what it holds; comparing two compares them.
-      ObjKind::Effect { success, failure } => {
-        self.constrain(success, again.clone());
-        self.constrain(failure, again);
-      }
+      // Its failures hold no service (issue, "Assumptions" 3).
+      ObjKind::Effect { success, .. } => self.constrain(success, again),
       // A wrapped value may be any of the values it wraps. A Promise has no keys of its own.
       ObjKind::Wrap(inner) => self.constrain(inner, again),
       // A printed Context or runtime prints its services. Context equality is ignored.
