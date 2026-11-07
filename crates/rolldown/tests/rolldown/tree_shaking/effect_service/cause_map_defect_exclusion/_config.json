@@ -1,0 +1,10 @@
+{
+  "_comment": "Cause.map passes only typed errors to its callback. A Cause combines a typed error with a defect that is a service; the callback calls `mapped` on its input, and the defect is recovered with Cause.findDefect and narrowed from unknown. The defect's `used` stays (soundness); its `mapped`, which only a defect passed to the callback would call, and its unread method are removed (precision).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

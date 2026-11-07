@@ -1,0 +1,10 @@
+{
+  "_comment": "Cause.map calls its callback with each typed error and makes the callback's returns the new errors. One service per case: the callback's input (data-last form), a service the callback allocates and returns, a nested field and a bound function in the callback's return, and a service in annotations Effect merges for a mapped error object it has seen before (read through `reason.annotations`). Each read method stays; each unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
