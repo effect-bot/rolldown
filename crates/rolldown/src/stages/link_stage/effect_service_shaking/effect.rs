@@ -29,6 +29,8 @@ pub const SCOPE_KEY: &str = "effect/Scope";
 pub const MEMO_MAP_KEY: &str = "effect/Layer/CurrentMemoMap";
 pub const PARENT_SPAN_KEY: &str = "effect/Tracer/ParentSpan";
 pub const FIBER_METRICS_KEY: &str = "effect/Metric/FiberRuntimeMetrics";
+/// `Schedule.CurrentMetadata` (stable), which `repeat` and `retry` provide to each attempt.
+pub const SCHEDULE_METADATA_KEY: &str = "effect/Schedule/CurrentMetadata";
 /// `Logger.CurrentLoggers` (stable): the Set of loggers `Effect.log` calls.
 pub const CURRENT_LOGGERS_KEY: &str = "effect/Logger/CurrentLoggers";
 
@@ -467,12 +469,15 @@ fn policy_schedule(a: &mut Analysis, site: Site, policy: VarId) -> VarId {
 /// Steps the Schedules in `schedule` once through the bundled stable `Schedule.toStep`, and
 /// returns `(failure, output)`. Services never pass through a Schedule (issue, "Assumptions" 4):
 /// the step gets `input` without the program's service values (`Analysis::service_free_of`:
-/// ordinary objects keep their structure, so a field may still name a method), and `output`
-/// holds only the primitives of what
-/// it outputs (a Pull's `[output, delay]`, or the `Done` it ends with), so a string may still
-/// name a method, but neither `Effect.repeat`'s result, `retryOrElse`'s fallback nor
-/// `Schedule.CurrentMetadata` carries a service. The Schedule's own code still runs, so
-/// the callbacks it is built from (and what they capture) count.
+/// ordinary objects keep their structure, so a field may still name a method), and only
+/// primitives come out, so a string may still name a method but no service leaves.
+///
+/// `output` is the scalars of the `Done` value the Schedule ends with: that is all
+/// `Effect.repeat` returns and all `retryOrElse` hands its fallback (`internal/schedule.js`'s
+/// `repeatOrElse` and `retryOrElse`). The scalars of each step's decision reach only
+/// `Schedule.CurrentMetadata`'s `output`, which every attempt can read, with the admitted input
+/// as its `input`. The Schedule's own code still runs, so the callbacks it is built from (and what
+/// they capture) count.
 /// Without a bundled `effect/Schedule`, a Schedule can only come from code the pass can't see:
 /// it is handed over.
 fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) -> (VarId, VarId) {
@@ -487,7 +492,9 @@ fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) ->
     let pull = invoke(a, site, step, None, vec![now, admitted]);
     let ps = success_of(a, pull);
     let decision = elem_of(a, ps);
-    a.primitives_of(decision, output);
+    let decided = a.var();
+    a.primitives_of(decision, decided);
+    provide_schedule_metadata(a, site, admitted, decided);
     let pf = failure_of(a, pull);
     a.copy(pf, failure);
     let done = load(a, pf, "value");
@@ -500,6 +507,19 @@ fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) ->
     a.seed(output, a.top_host);
   }
   (failure, output)
+}
+
+/// `repeat`, `retry` and `retryOrElse` provide `Schedule.CurrentMetadata` (stable) to each
+/// attempt: its `input` and `output` are what `step_schedule` lets through. Its other fields are
+/// numbers and a Duration, which the Reference's default value already supplies.
+fn provide_schedule_metadata(a: &mut Analysis, site: Site, input: VarId, output: VarId) {
+  let meta = a.site_obj(site, 24, |_| ObjKind::Object);
+  let fi = a.field(meta, &ArcStr::from("input"));
+  a.copy(input, fi);
+  let fo = a.field(meta, &ArcStr::from("output"));
+  a.copy(output, fo);
+  let v = a.key_value_var(&ArcStr::from(SCHEDULE_METADATA_KEY));
+  a.seed(v, meta);
 }
 
 /// A fiber running `e`: its slots hold what `e` succeeds and fails with.
