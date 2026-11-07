@@ -1,0 +1,10 @@
+{
+  "_comment": "An array with a callable then is a thenable: awaiting it adopts it, and it resolves with a service whose method the caller then calls. That method stays, the unread one is removed and the bundle runs. Guards that host adoption covers arrays, not only plain objects, closures and classes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
