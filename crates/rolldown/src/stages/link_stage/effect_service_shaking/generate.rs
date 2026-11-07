@@ -160,8 +160,6 @@ pub struct Gen<'a, 'l, 's> {
   class_objs: Vec<ObjId>,
   /// The lazy top-level statement being generated, if any.
   lazy_owner: Option<FnId>,
-  /// Whether the innermost class member being generated is static (for `super`).
-  static_stack: Vec<bool>,
   generator_stack: Vec<bool>,
   module_fn: FnId,
   /// End offset until which the binding being declared is uninitialised.
@@ -192,7 +190,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       class_stack: vec![],
       class_objs: vec![],
       lazy_owner: None,
-      static_stack: vec![],
       generator_stack: vec![false],
       module_fn,
       tdz_until: None,
@@ -1033,9 +1030,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     for element in &c.body.body {
       match element {
         ClassElement::MethodDefinition(m) => {
-          self.static_stack.push(m.r#static);
           let fv = self.function(&m.value, FnKind::Normal);
-          self.static_stack.pop();
           let Some(fid) = self.closure_of(fv) else { continue };
           match m.kind {
             MethodDefinitionKind::Constructor => {
@@ -1087,9 +1082,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
           if let Some(value) = &p.value {
             let old_this = self.this_stack.last().copied();
             self.this_stack.push(if p.r#static { cv } else { prototype });
-            self.static_stack.push(p.r#static);
             let v = self.expr(value);
-            self.static_stack.pop();
             self.this_stack.pop();
             let _ = old_this;
             self.store(target, key, v);
@@ -1105,9 +1098,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         }
         ClassElement::StaticBlock(b) => {
           self.this_stack.push(cv);
-          self.static_stack.push(true);
           self.statements(&b.body);
-          self.static_stack.pop();
           self.this_stack.pop();
         }
         ClassElement::TSIndexSignature(_) => {}
@@ -1209,12 +1200,22 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   /// What `super.x` looks `x` up on: the parent's prototype in instance code, the parent class
   /// itself in static code.
+  /// What `super.x` reads from: the heritage (static members) and its prototype (instance
+  /// members), of every enclosing class, since a nested class's computed keys see the outer
+  /// `super`. Class code bails what reaches it (`Analysis::class_bail`), so this need not tell
+  /// static from instance members or one class from another.
   fn super_prototype(&mut self) -> VarId {
-    match self.class_stack.last().copied().flatten() {
-      Some(h) if self.static_stack.last().copied().unwrap_or(false) => h,
-      Some(h) => self.load(h, Key::Name(ArcStr::from("prototype"))),
-      None => self.sh.top_host,
+    let heritages: Vec<VarId> = self.class_stack.iter().flatten().copied().collect();
+    if heritages.is_empty() {
+      return self.sh.top_host;
     }
+    let v = self.fresh();
+    for h in heritages {
+      self.copy(h, v);
+      let prototype = self.load(h, Key::Name(ArcStr::from("prototype")));
+      self.copy(prototype, v);
+    }
+    v
   }
 
   fn call_expression(&mut self, c: &CallExpression<'_>) -> VarId {
