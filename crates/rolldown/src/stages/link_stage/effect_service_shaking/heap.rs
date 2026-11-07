@@ -5247,7 +5247,8 @@ impl Analysis {
   /// every value class code may hold.
   ///
   /// A key bails when one of its services is reachable, through fields, elements, unknown-key
-  /// stores, spread sources and the contents of wraps, effects and promises, from:
+  /// stores, spread sources and the contents of wraps, type-modelled summaries, effects and
+  /// promises, from:
   /// - a variable of class code;
   /// - a slot of a class-related object: a non-key class, its prototype, and any object whose
   ///   prototype chain reaches that prototype (instances, `Object.create(C.prototype)`, a late
@@ -5256,9 +5257,10 @@ impl Analysis {
   ///   class's accessors run with it as `this`;
   /// - an argument of `new` on a class `effect` exports (direction 2), whose body runs unseen.
   ///
-  /// A type-modelled summary's slot is its module's pool, not the value's contents, so the
-  /// walk does not enter it: class code that takes a service out of one holds the service
-  /// itself. Returns each bailed key with the class (or reason) it reached.
+  /// The walk enters a type-modelled summary's slot too. That slot is the module's pool, not
+  /// only the value's contents, so it may bail more than the value holds: a service in a class
+  /// field wrapped in `Option.some` must bail, and the pool is the only record of it. Returns
+  /// each bailed key with the class (or reason) it reached.
   pub fn class_bail(&mut self) -> Vec<(ArcStr, String)> {
     let mut keys_of: FxHashMap<ObjId, Vec<ArcStr>> = FxHashMap::default();
     for (k, v) in &self.key_values {
@@ -5372,7 +5374,7 @@ impl Analysis {
                 .chain(&ob.unknown_stores),
             );
             match ob.kind {
-              ObjKind::Wrap(inner) => vars.push(inner),
+              ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => vars.push(inner),
               ObjKind::Effect { success, .. } => vars.push(success),
               ObjKind::Promise { value } => vars.push(value),
               _ => {}
