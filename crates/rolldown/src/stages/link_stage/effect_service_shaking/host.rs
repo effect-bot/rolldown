@@ -169,12 +169,13 @@ pub fn host_var(a: &mut Analysis) -> VarId {
   v
 }
 
-/// The values an enumeration of the objects in `o` hands out: every field.
+/// The values an enumeration of the objects in `o` hands out: every field, through the
+/// admission filter with the type model on (`Analysis::admitted_values`).
 fn enumerated(a: &mut Analysis, o: VarId) -> VarId {
   a.constrain(o, Constraint::Enumerate);
   let values = a.var();
   a.constrain(o, Constraint::Load { key: Key::Unknown, dst: values });
-  values
+  a.admitted_values(values)
 }
 
 pub fn new_array(a: &mut Analysis, site: Site, tag: u8) -> (ObjId, VarId, VarId) {
@@ -355,6 +356,7 @@ pub fn register(a: &mut Analysis) {
     let (obj, v) = new_object(a, c.site, 3);
     let pairs = elem_of(a, iter);
     let items = elem_of(a, pairs);
+    let items = a.admitted_values(items);
     let elem = a.elem(obj);
     a.copy(items, elem);
     a.copy(v, c.ret);
@@ -578,6 +580,7 @@ pub fn register(a: &mut Analysis) {
       let this = c_this(a, c);
       let (_, v, elem) = new_array(a, c.site, 8);
       let items = elem_of(a, this);
+      let items = a.admitted_values(items);
       a.copy(items, elem);
       // concat/with: arguments may be elements or arrays of them; sort: a comparator.
       for x in args_from(a, c, 0) {
@@ -612,8 +615,10 @@ pub fn register(a: &mut Analysis) {
     let this = c_this(a, c);
     let f = arg(a, c, 0);
     let items = elem_of(a, this);
+    let items = a.admitted_values(items);
     let p = prim_var(a);
     let r = invoke(a, c.site, f, None, vec![items, p, this]);
+    let r = a.admitted_values(r);
     let (_, v, elem) = new_array(a, c.site, 8);
     a.copy(r, elem);
     a.copy(v, c.ret);
@@ -622,11 +627,15 @@ pub fn register(a: &mut Analysis) {
     let this = c_this(a, c);
     let f = arg(a, c, 0);
     let items = elem_of(a, this);
+    let items = a.admitted_values(items);
     let p = prim_var(a);
     let r = invoke(a, c.site, f, None, vec![items, p, this]);
     let (_, v, elem) = new_array(a, c.site, 8);
-    a.copy(r, elem);
-    a.constrain(r, Constraint::ElemOf(elem));
+    let flat = a.var();
+    a.copy(r, flat);
+    a.constrain(r, Constraint::ElemOf(flat));
+    let flat = a.admitted_values(flat);
+    a.copy(flat, elem);
     a.copy(v, c.ret);
   });
   for name in [

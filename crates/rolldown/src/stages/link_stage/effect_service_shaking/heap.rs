@@ -3566,6 +3566,14 @@ impl Analysis {
   /// every field, so only what may hold a prunable service flows as itself; anything else goes
   /// to unseen code (`admit_typed`), and the fields hold `top_ext` for it: reading one back is
   /// reading a value from unseen code, and a service written into it later bails.
+  /// What a host builtin that copies structure hands out from `src` (direction 2's lever on
+  /// builtin copies, with the type model on): the values that may hold a prunable service as
+  /// themselves, the rest sent to unseen code and stood for by `top_ext` (`admitted_store`).
+  /// Without the type model, `src` itself.
+  pub fn admitted_values(&mut self, src: VarId) -> VarId {
+    if self.admission { self.admitted_store(src) } else { src }
+  }
+
   fn admitted_store(&mut self, src: VarId) -> VarId {
     if let Some(v) = self.unknown_store_filters.get(&src) {
       return *v;
