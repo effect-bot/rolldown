@@ -466,20 +466,22 @@ fn policy_schedule(a: &mut Analysis, site: Site, policy: VarId) -> VarId {
 
 /// Steps the Schedules in `schedule` once through the bundled stable `Schedule.toStep`, and
 /// returns what the step fails with. Services never pass through a Schedule (issue,
-/// "Assumptions" 4): the step gets no input, and its output (a Pull's `[output, delay]`, or the
+/// "Assumptions" 4): the step gets only the primitives of `input` (a string may still name a
+/// method a callback reads), and its output (a Pull's `[output, delay]`, or the
 /// `Done` it ends with) is not read, so neither `Effect.repeat`'s result, `retryOrElse`'s
 /// fallback nor `Schedule.CurrentMetadata` carries one. The Schedule's own code still runs, so
 /// the callbacks it is built from (and what they capture) count.
 /// Without a bundled `effect/Schedule`, a Schedule can only come from code the pass can't see:
 /// it is handed over.
-fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId) -> VarId {
+fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) -> VarId {
   let failure = a.var();
   if let Some(to_step) = a.schedule_to_step {
     let eff = invoke(a, site, to_step, None, vec![schedule]);
     let step = success_of(a, eff);
     let now = prim_var(a);
-    let input = a.var();
-    let pull = invoke(a, site, step, None, vec![now, input]);
+    let scalars = a.var();
+    a.primitives_of(input, scalars);
+    let pull = invoke(a, site, step, None, vec![now, scalars]);
     let pf = failure_of(a, pull);
     a.copy(pf, failure);
     let ef = failure_of(a, eff);
@@ -1189,7 +1191,7 @@ pub fn register(a: &mut Analysis) {
       a.copy(rf, of);
     }
     let schedule = policy_schedule(a, c.site, x);
-    let failure = step_schedule(a, c.site, schedule);
+    let failure = step_schedule(a, c.site, schedule, s);
     a.copy(failure, of);
     a.copy(out, c.ret);
   });
@@ -1211,7 +1213,7 @@ pub fn register(a: &mut Analysis) {
       a.copy(rf, of);
     }
     let schedule = policy_schedule(a, c.site, x);
-    let failure = step_schedule(a, c.site, schedule);
+    let failure = step_schedule(a, c.site, schedule, fl);
     a.copy(failure, of);
     a.copy(out, c.ret);
   });
@@ -1229,7 +1231,7 @@ pub fn register(a: &mut Analysis) {
     let (out, os, of) = new_effect(a, c.site, 1);
     a.copy(s, os);
     a.copy(fl, of);
-    let failure = step_schedule(a, c.site, policy);
+    let failure = step_schedule(a, c.site, policy, fl);
     a.copy(failure, of);
     let no_output = a.var();
     let r = invoke(a, c.site, or_else, None, vec![fl, no_output]);
@@ -2089,7 +2091,8 @@ pub fn register(a: &mut Analysis) {
     // `Tracer.make(options)`: a Tracer written in bundled code. Spans never carry app values
     // (assumption 2), so the runtime's calls are modelled with inert arguments: `span` runs, and
     // `end`, `attribute`, `event` and `addLinks` run on what it returns; `context` runs with no
-    // primitive. The Tracer itself holds nothing.
+    // primitive. `make` returns `options` itself, whose members stay public (a direct call of
+    // `context` returns what its primitive evaluates to).
     let options = arg(a, c, 0);
     let prim = prim_var(a);
     let span_fn = load(a, options, "span");
@@ -2102,8 +2105,7 @@ pub fn register(a: &mut Analysis) {
     let primitive = a.var();
     let fb = fiber(a);
     invoke(a, c.site, context, Some(options), vec![primitive, fb]);
-    let (_, tracer) = new_object(a, c.site, 8);
-    a.copy(tracer, c.ret);
+    a.copy(options, c.ret);
   });
   a.rule("effect:Logger.make", |a, c| {
     // `Logger.make(log)`: a logger whose `log` the runtime calls for each log (`run_loggers`).

@@ -668,6 +668,8 @@ pub struct Analysis {
   /// The program-wide pools of the protocol and hashing walks (`Walk`).
   ignored_pool: Option<VarId>,
   prim_arg: Option<VarId>,
+  inspect_args: Option<VarId>,
+  prim_ty: Option<u32>,
   pub hash_pool: Option<VarId>,
   /// The program-wide pools of host serialization and inspection (`host_protocol`).
   json_pool: Option<VarId>,
@@ -802,6 +804,8 @@ impl Analysis {
       walked: FxHashSet::default(),
       ignored_pool: None,
       prim_arg: None,
+      inspect_args: None,
+      prim_ty: None,
       hash_pool: None,
       json_pool: None,
       inspect_pool: None,
@@ -2291,6 +2295,37 @@ impl Analysis {
     pool
   }
 
+  /// `[util.inspect.custom](depth, options, inspect)`'s arguments, as `Walk::Inspect` passes
+  /// them: a primitive, host data and the `util.inspect` builtin.
+  fn inspect_args(&mut self) -> VarId {
+    if let Some(v) = self.inspect_args {
+      return v;
+    }
+    let v = self.var();
+    self.seed(v, self.prim);
+    self.seed(v, self.top_host);
+    if let Some(id) = self.rule_id("util.inspect") {
+      let inspect = self.builtin(id, None, None);
+      self.seed(v, inspect);
+    }
+    self.inspect_args = Some(v);
+    v
+  }
+
+  /// The primitives `src` holds flow into `dst`; objects don't, and a summary becomes an
+  /// unknown scalar (`Constraint::FilterCopy` with a primitive-only type).
+  pub fn primitives_of(&mut self, src: VarId, dst: VarId) {
+    let ty = match self.prim_ty {
+      Some(t) => t,
+      None => {
+        let t = self.intern_ty(super::dts::Ty { prim: true, ..super::dts::Ty::default() });
+        self.prim_ty = Some(t);
+        t
+      }
+    };
+    self.constrain(src, Constraint::FilterCopy { dst, ty });
+  }
+
   /// A variable holding a primitive, for arguments that carry nothing.
   fn prim_arg(&mut self) -> VarId {
     if let Some(v) = self.prim_arg {
@@ -2899,11 +2934,17 @@ impl Analysis {
           self.constrain(proto, again);
         }
         let this = self.holder(obj);
-        let inert = if walk == Walk::Protocol { Some(self.prim_arg()) } else { None };
+        // The protocol walk passes each method what the host or Effect passes it: the current
+        // Context to Redactable, Node's inspector arguments to `[util.inspect.custom]`, and a
+        // primitive to the rest.
+        let protocol_args =
+          if walk == Walk::Protocol { Some((self.prim_arg(), self.inspect_args())) } else { None };
         for (name, arity) in walk.protocols() {
-          let arg = match inert {
-            Some(inert) if *name != REDACTABLE_KEY => inert,
-            _ => arg,
+          let arg = match protocol_args {
+            Some(_) if *name == REDACTABLE_KEY => arg,
+            Some((_, inspect)) if *name == super::host::INSPECT_CUSTOM => inspect,
+            Some((prim, _)) => prim,
+            None => arg,
           };
           let method = self.protocol_call(this, name, *arity, arg, site, pool);
           if walk == Walk::Equal {
