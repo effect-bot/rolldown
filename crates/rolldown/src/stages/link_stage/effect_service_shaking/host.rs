@@ -797,13 +797,19 @@ pub fn register(a: &mut Analysis) {
     a.copy(pv, c.ret);
   });
   a.rule("Promise.finally", |a, c| {
+    // The callback's result is awaited (a thenable is adopted, so its `then` runs), and the
+    // promise settles with its original value: the result is not used.
     let this = c_this(a, c);
     if !c.args.is_empty() {
       let f = arg(a, c, 0);
-      invoke(a, c.site, f, None, vec![]);
+      let r = invoke(a, c.site, f, None, vec![]);
+      await_of(a, r);
     }
     a.copy(this, c.ret);
   });
+  // The reject function the host hands a thenable's `then` when it adopts it: a function object
+  // (it can hold fields), whose argument nothing reads.
+  a.rule("promise.reject", |_, _| {});
   // JSON, String, Number, Symbol, console
   a.rule("JSON.stringify", |a, c| {
     let v = arg(a, c, 0);

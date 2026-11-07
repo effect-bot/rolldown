@@ -684,6 +684,7 @@ pub struct Analysis {
   ignored_pool: Option<VarId>,
   prim_arg: Option<VarId>,
   inspect_args: Option<VarId>,
+  reject_function: Option<VarId>,
   /// Each adopted object's settle variable: what its `then` resolves with (`adopt`); for a
   /// summary, what awaiting the values it wraps gives.
   settled_by: FxHashMap<ObjId, VarId>,
@@ -828,6 +829,7 @@ impl Analysis {
       ignored_pool: None,
       prim_arg: None,
       inspect_args: None,
+      reject_function: None,
       pending_service_free: vec![],
       once_allocated: FxHashSet::default(),
       settled_by: FxHashMap::default(),
@@ -2395,9 +2397,24 @@ impl Analysis {
     v
   }
 
+  /// The reject function host adoption passes (`promise.reject`): one function object for the
+  /// program, which can hold fields; what it is called with is not read.
+  fn reject_function(&mut self) -> VarId {
+    if let Some(v) = self.reject_function {
+      return v;
+    }
+    let v = self.var();
+    if let Some(id) = self.rule_id("promise.reject") {
+      let reject = self.builtin(id, None, None);
+      self.seed(v, reject);
+    }
+    self.reject_function = Some(v);
+    v
+  }
+
   /// Host adoption of an object that may be a thenable (an `await`, an async function's return,
   /// a promise resolved with it): the host calls its `then` with a resolve function and a reject
-  /// function, whose argument nothing reads. Returns the object's settle variable: what its
+  /// function (`reject_function`), whose argument nothing reads. Returns the object's settle variable: what its
   /// `then` resolves with, which every adoption of the object receives. The resolve function is
   /// a `promise.resolve` builtin carrying that variable, so resolving with a thenable adopts it in
   /// turn and its settlement flows on. Once per object (`settled_by`); every adoption shares one
@@ -2413,7 +2430,7 @@ impl Analysis {
     let then = self.var();
     self.constrain(this, Constraint::Load { key: Key::Name(ArcStr::from("then")), dst: then });
     let resolve = self.resolve_function(settled);
-    let reject = self.prim_arg();
+    let reject = self.reject_function();
     let ret = self.var();
     let call = Call {
       site: protocol_site(5),
