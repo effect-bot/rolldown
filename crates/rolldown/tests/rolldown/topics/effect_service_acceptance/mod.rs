@@ -6,6 +6,8 @@
 //! - both runs exit 0 with identical stdout (behaviour is unchanged);
 //! - every name in `expect.json#keep` is still in the enabled bundle;
 //! - no name in `expect.json#remove` is in the enabled bundle;
+//! - each name in `expect.json#removeProperties` has fewer object-literal
+//!   definitions in the enabled bundle, even if unrelated uses keep the name;
 //! - names are matched as whole words in the bundle's code with every comment
 //!   blanked out, so a name that survives only in a JSDoc example neither
 //!   satisfies `keep` nor fails `remove`; string literals still count;
@@ -51,6 +53,9 @@ struct Expect {
   /// Names that must not be in the enabled bundle.
   #[serde(default)]
   remove: Vec<String>,
+  /// Object-literal property names whose definition count must decrease.
+  #[serde(default)]
+  remove_properties: Vec<String>,
   /// Minimum size reduction of the enabled bundle, in percent.
   #[serde(default)]
   min_reduction_percent: Option<f64>,
@@ -128,6 +133,36 @@ fn without_comments(code: &str) -> String {
   stripped
 }
 
+/// Count definitions, not reads or strings, so common names such as `remove`
+/// can guard pruning without rejecting unrelated code that uses the same name.
+fn property_counts(code: &str) -> std::collections::BTreeMap<String, usize> {
+  use oxc::ast::ast::ObjectProperty;
+  use oxc::ast_visit::{Visit, walk};
+
+  #[derive(Default)]
+  struct Properties(std::collections::BTreeMap<String, usize>);
+
+  impl<'a> Visit<'a> for Properties {
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+      if let Some(name) = property.key.static_name().and_then(|name| name.into_cow_str()) {
+        *self.0.entry(name.into_owned()).or_default() += 1;
+      }
+      walk::walk_object_property(self, property);
+    }
+  }
+
+  let allocator = oxc::allocator::Allocator::default();
+  let ret = oxc::parser::Parser::new(&allocator, code, oxc::span::SourceType::mjs()).parse();
+  assert!(
+    !ret.fatal_error && ret.diagnostics.is_empty(),
+    "the bundle should parse: {:?}",
+    ret.diagnostics
+  );
+  let mut properties = Properties::default();
+  properties.visit_program(&ret.program);
+  properties.0
+}
+
 /// Runs the acceptance program in `programs/<name>` and collects every failed
 /// expectation, so one run reports everything that is wrong with a program.
 async fn check(name: &str) {
@@ -173,6 +208,19 @@ async fn check(name: &str) {
       failures.push(format!("`{remove}` should be removed"));
     }
   }
+  if !expect.remove_properties.is_empty() {
+    let off_properties = property_counts(&std::fs::read_to_string(&off.bundle).unwrap());
+    let on_properties = property_counts(&code);
+    for name in &expect.remove_properties {
+      let off_count = off_properties.get(name).copied().unwrap_or_default();
+      let on_count = on_properties.get(name).copied().unwrap_or_default();
+      if on_count >= off_count {
+        failures.push(format!(
+          "`{name}` should lose an object-literal definition (off {off_count}, on {on_count})"
+        ));
+      }
+    }
+  }
   if let Some(min) = expect.min_reduction_percent {
     if reduction < min {
       failures.push(format!("the bundle should be at least {min}% smaller, it is {reduction:.1}%"));
@@ -192,6 +240,10 @@ async fn check(name: &str) {
 
 /// 1. The real `NodeFileSystem` with only `readFile` used, reached through
 /// `yield*`, `Effect.map`/`flatMap`, `Context.get` and `Effect.service`.
+/// The 31 unused property names are pinned in `expect.json`, including names
+/// that survive elsewhere in the bundle. Run this same test in a separate
+/// process with `ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL=1` to guard that
+/// type-modelled Effect modules preserve the constructor's pruning.
 #[tokio::test]
 async fn node_file_system() {
   check("node_file_system").await;
