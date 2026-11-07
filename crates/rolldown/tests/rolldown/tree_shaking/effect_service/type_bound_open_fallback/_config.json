@@ -1,0 +1,10 @@
+{
+  "_comment": "A parameter the type resolver cannot bound stays open: Struct.evolve's evolver is a type parameter constrained by a mapped type, so a service passed as the evolver reaches the API, which calls its count method. The method stays and the bundle runs. Guards the type-bound filter's open fallback.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "A handlers object satisfies Option.match's parameter type through members the analysis sees indirectly: a getter installed with Object.defineProperty, a class accessor, a prototype filled by Object.assign, and a store under a computed key after the call is built. Each object must still reach Option.match, so the method its onSome reads stays; each service's unread method is removed. Guards the type-bound filter's member check.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

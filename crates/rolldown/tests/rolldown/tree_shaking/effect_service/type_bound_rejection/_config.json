@@ -1,0 +1,10 @@
+{
+  "_comment": "A public type that cannot hold a service keeps the service out of the API: a variable holding a service and then a record of strings is passed as ConfigProvider.fromEnvRecord's Record<string, string | undefined>, and a variable holding a service and then a boolean is handed back by a predicate through Option.exists, declared to return a boolean, whose result's keys are read. Each read method stays; each service's unread method is removed. Guards the type-bound filter's precision on parameters and returns.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
