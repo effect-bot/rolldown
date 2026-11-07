@@ -183,6 +183,17 @@ Two consumers depend on that queue's contents:
   revert, while the failed scan's modules still exist in `module_id_to_idx`
   and the live edge list.
 
+A panicking module task fails the scan the same way. The loader counts the
+tasks it spawns and waits for one message from each, on a channel whose sender
+it holds itself (`TaskContext::tx`), so the channel never closes. A task that
+unwound used to send nothing, and the build waited forever. Each task's
+`run` now wraps its body in `catch_task_panic` (`module_loader/task_context.rs`),
+which turns the panic into a `BuildErrors` message for that module: a plugin
+hook panicking in `load` or `transform`, or code the task runs, such as the
+minifier's dead-code elimination. The default panic hook still prints the
+panic. Release builds unwind too (no `panic = "abort"`), so they get the same
+error. `errors/plugin_transform_panic` covers it.
+
 The invariant this buys: **between builds the cache is either empty
 (`snapshot` is `None`: fresh bundler, or a failed full scan reset it) or a
 valid graph any partial scan can build on.** `Bundler::incremental_bundle`

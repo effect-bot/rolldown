@@ -13,7 +13,7 @@ use rolldown_fs::FileSystem;
 
 use crate::ecmascript::ecma_module_view_factory::normalize_side_effects;
 
-use super::task_context::TaskContext;
+use super::task_context::{TaskContext, catch_task_panic};
 
 #[expect(clippy::rc_buffer)]
 pub struct ExternalModuleTask<Fs: FileSystem> {
@@ -37,7 +37,7 @@ impl<Fs: FileSystem> ExternalModuleTask<Fs> {
 
   #[tracing::instrument(name="ExternalModuleTask::run", level = "trace", skip_all, fields(module_id = %self.resolved_id.id))]
   pub async fn run(self) {
-    if let Err(errs) = self.run_inner().await {
+    if let Err(errs) = catch_task_panic(&self.resolved_id.id, self.run_inner()).await {
       self
         .ctx
         .tx

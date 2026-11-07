@@ -22,7 +22,10 @@ use crate::{
   utils::{load_source::load_source, transform_source::transform_source},
 };
 
-use super::{resolve_utils::resolve_dependencies, task_context::TaskContext};
+use super::{
+  resolve_utils::resolve_dependencies,
+  task_context::{TaskContext, catch_task_panic},
+};
 
 pub struct ModuleTaskOwner {
   source: ArcStr,
@@ -86,7 +89,8 @@ impl<Fs: FileSystem + Clone + 'static> ModuleTask<Fs> {
 
   #[tracing::instrument(name="NormalModuleTask::run", level = "trace", skip_all, fields(module_id = %self.resolved_id.id))]
   pub async fn run(mut self) {
-    if let Err(errs) = self.run_inner().await {
+    let id = self.resolved_id.id.clone();
+    if let Err(errs) = catch_task_panic(&id, self.run_inner()).await {
       self.ctx.plugin_driver.mark_context_load_modules_loaded(self.resolved_id.id.clone());
       self
         .ctx
