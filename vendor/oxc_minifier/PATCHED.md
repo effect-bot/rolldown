@@ -84,6 +84,50 @@ two, and a capped run removes `var f` as well. `tasks/minsize` sizes, minified
 and gzipped, are unchanged for all 12 libraries; antd.js needs 3 passes
 instead of 4.
 
+## Work bound
+
+In debug builds, `remove_declarations_orphaned_this_pass` checks its own
+cost (`OrphanRemovalWorkBound` in `peephole/minimize_statements.rs`; the
+counter is `OrphanRemovalWork` in `state.rs`). It counts:
+
+- each removal-predicate call it makes, and each worklist pop;
+- inside those calls, each reference that `live_reference_ids` visits, and
+  each scope-ancestor step of `self_recursive_function_declarator_is_unused`.
+  The same predicates called from anywhere else are not counted.
+
+When the block is done, it asserts that the count is at most
+
+```text
+2 × declarations + notifications × (2 + W) + 3 × Σ (2 + walk(r))
+```
+
+- `declarations` is the number of function declarations and declarators in
+  the block.
+- `notifications` is the number of symbols pushed to `OrphanRemovals::freed`,
+  one for each resolved reference in removed code.
+- The sum runs over every resolved reference `r` to a symbol the block
+  declares. `walk(r)` is the number of scopes from `r`'s scope to the root,
+  and `W` is the longest such walk.
+
+The bound allows each declaration two predicate calls and each notification
+one check that visits one reference and walks its scopes. It also allows
+three passes over every reference, each visiting it at most twice and walking
+its scopes once. Scope depth is part of the bound, so deep live references do
+not trip it, and the order the worklist runs in does not matter. Reference
+lists only grow within a pass, so the bound reads them at the end. Without
+debug assertions the counting compiles to nothing, and the predicates'
+results are unchanged.
+
+The worklist as patched goes over this bound. Suppose dead code shares a
+callee that stays live. Each removal notifies the callee again, and each check
+rescans the callee's references from the start, past every reference dropped
+so far. The work therefore grows with the square of the dead code.
+`crates/rolldown/tests/rolldown/dce/dead_chains_share_live_callee` (fan-in and
+an out-of-order chain sharing two live callees, one called 16 scopes deep)
+does 141,555 steps against a bound of 30,106. It is red until a check no longer
+rescans references it has already passed. `upstream.patch` does not contain
+the bound yet.
+
 ## Removing this patch
 
 The fix is upstreamable as is. Once an `oxc` release contains an equivalent

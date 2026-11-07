@@ -151,6 +151,8 @@ impl<'a> PeepholeOptimizations {
         {
             return;
         }
+        #[cfg(debug_assertions)]
+        let work_bound = OrphanRemovalWorkBound::start(stmts, ctx);
         let mut removals = OrphanRemovals::default();
         for stmt_index in (0..stmts.len()).rev() {
             match &mut stmts[stmt_index] {
@@ -172,11 +174,15 @@ impl<'a> PeepholeOptimizations {
             }
         }
         if removals.removed.is_empty() {
+            #[cfg(debug_assertions)]
+            work_bound.check(&removals, ctx);
             return;
         }
         if !removals.freed.is_empty() {
             Self::remove_declarations_orphaned_by_removals(stmts, &mut removals, ctx);
         }
+        #[cfg(debug_assertions)]
+        work_bound.check(&removals, ctx);
         Self::rebuild_statements_after_orphan_removals(stmts, removals, ctx);
     }
 
@@ -218,6 +224,7 @@ impl<'a> PeepholeOptimizations {
             }
         }
         while let Some(symbol_id) = removals.freed.pop() {
+            ctx.state.count_orphan_removal_step();
             let Some(&(stmt_index, decl_index)) = declared.get(&symbol_id) else { continue };
             let removed = match &mut stmts[stmt_index] {
                 Statement::FunctionDeclaration(_) => {
@@ -243,7 +250,11 @@ impl<'a> PeepholeOptimizations {
         ctx: &mut TraverseCtx<'a>,
     ) -> bool {
         let Statement::FunctionDeclaration(function) = &stmts[stmt_index] else { return false };
-        if !Self::function_declaration_is_unused(function, ctx) {
+        ctx.state.count_orphan_removal_step();
+        if !ctx
+            .state
+            .count_orphan_removal_scans(|| Self::function_declaration_is_unused(function, ctx))
+        {
             return false;
         }
         removals.collect_referenced_symbols(
@@ -268,7 +279,11 @@ impl<'a> PeepholeOptimizations {
     ) -> bool {
         let kind = var_decl.kind;
         let decl = &mut var_decl.declarations[decl_index];
-        if !Self::should_remove_unused_declarator(decl, kind, ctx) {
+        ctx.state.count_orphan_removal_step();
+        if !ctx
+            .state
+            .count_orphan_removal_scans(|| Self::should_remove_unused_declarator(decl, kind, ctx))
+        {
             return false;
         }
         if let Some(mut init) = decl.init.take() {
@@ -2175,6 +2190,9 @@ struct OrphanRemovals<'a> {
     /// Symbols referenced from removed code, whose declarations may now be
     /// unused. A superset: it also lists references kept in a residue.
     freed: Vec<SymbolId>,
+    /// Debug-only: how many symbols were ever pushed to `freed`.
+    #[cfg(debug_assertions)]
+    notified: usize,
 }
 
 impl OrphanRemovals<'_> {
@@ -2185,7 +2203,89 @@ impl OrphanRemovals<'_> {
         walk: impl FnOnce(&mut ReferencedSymbols<'_, '_>),
         ctx: &TraverseCtx<'_>,
     ) {
+        #[cfg(debug_assertions)]
+        let before = self.freed.len();
         walk(&mut ReferencedSymbols { scoping: ctx.scoping(), symbols: &mut self.freed });
+        #[cfg(debug_assertions)]
+        {
+            self.notified += self.freed.len() - before;
+        }
+    }
+}
+
+/// Debug-only check that `remove_declarations_orphaned_this_pass` stays
+/// within its work bound; "Work bound" in `vendor/oxc_minifier/PATCHED.md`
+/// explains what is counted and why the bound holds.
+///
+/// The steps counted are each removal-predicate call and worklist pop, and,
+/// inside those predicates, each reference visited in `live_reference_ids`
+/// and each scope-ancestor step of the self-recursive declarator check. The
+/// bound is
+///
+/// `2 × declarations + notifications × (2 + W) + 3 × Σ (2 + walk(r))`,
+///
+/// the sum over every resolved reference `r` to a symbol the block declares,
+/// `walk(r)` its scope-ancestor walk and `W` the longest one. A
+/// notification is one symbol pushed to `OrphanRemovals::freed`. A rescan of
+/// the same references on every notification goes over it.
+#[cfg(debug_assertions)]
+struct OrphanRemovalWorkBound {
+    declarations: usize,
+    symbols: Vec<SymbolId>,
+}
+
+#[cfg(debug_assertions)]
+impl OrphanRemovalWorkBound {
+    /// The passes over each declaration's references the bound allows.
+    const REFERENCE_PASSES: usize = 3;
+
+    fn start(stmts: &[Statement<'_>], ctx: &TraverseCtx<'_>) -> Self {
+        ctx.state.start_orphan_removal_work();
+        let mut declarations = 0;
+        let mut symbols = Vec::new();
+        for stmt in stmts {
+            match stmt {
+                Statement::FunctionDeclaration(function) => {
+                    declarations += 1;
+                    symbols.extend(function.id.as_ref().and_then(|id| id.symbol_id.get()));
+                }
+                Statement::VariableDeclaration(var_decl) => {
+                    for decl in &var_decl.declarations {
+                        declarations += 1;
+                        if let BindingPattern::BindingIdentifier(id) = &decl.id {
+                            symbols.extend(id.symbol_id.get());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self { declarations, symbols }
+    }
+
+    /// Reference lists only grow within a pass, so reading them at the end
+    /// counts every reference a predicate could have visited.
+    fn check(self, removals: &OrphanRemovals<'_>, ctx: &TraverseCtx<'_>) {
+        let scoping = ctx.scoping();
+        let mut reference_cost = 0;
+        let mut longest_walk = 0;
+        for &symbol_id in &self.symbols {
+            for &reference_id in scoping.get_resolved_reference_ids(symbol_id) {
+                let walk =
+                    scoping.scope_ancestors(scoping.get_reference(reference_id).scope_id()).count();
+                reference_cost += 2 + walk;
+                longest_walk = longest_walk.max(walk);
+            }
+        }
+        let bound = 2 * self.declarations
+            + removals.notified * (2 + longest_walk)
+            + Self::REFERENCE_PASSES * reference_cost;
+        let work = ctx.state.orphan_removal_work();
+        debug_assert!(
+            work <= bound,
+            "Removing orphaned declarations took {work} steps, over the bound of {bound} \
+             (vendor/oxc_minifier/PATCHED.md, \"Work bound\")"
+        );
     }
 }
 

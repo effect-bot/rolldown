@@ -108,6 +108,26 @@ pub struct MinifierState<'a> {
     /// Per-pass change accumulator populated by typed mutation helpers and
     /// consumed by `compression_pass` after Normalize and every peephole pass.
     pub(crate) pass_changes: PassChanges<'a>,
+
+    /// Debug-only work count of `remove_declarations_orphaned_this_pass`,
+    /// checked against the bound in "Work bound" in
+    /// `vendor/oxc_minifier/PATCHED.md`.
+    #[cfg(debug_assertions)]
+    pub(crate) orphan_removal_work: OrphanRemovalWork,
+}
+
+/// Steps counted for the debug-only work bound of
+/// `remove_declarations_orphaned_this_pass` (see "Work bound" in
+/// `vendor/oxc_minifier/PATCHED.md`).
+#[cfg(debug_assertions)]
+#[derive(Default)]
+pub struct OrphanRemovalWork {
+    /// Steps counted since the last [`MinifierState::start_orphan_removal_work`].
+    steps: std::cell::Cell<usize>,
+    /// Whether a removal predicate called by that function is running, so
+    /// that its reference visits and scope-ancestor steps count. The same
+    /// predicates called from elsewhere do not count.
+    scanning: std::cell::Cell<bool>,
 }
 
 impl<'a> MinifierState<'a> {
@@ -129,7 +149,71 @@ impl<'a> MinifierState<'a> {
                 this_initialized_at: None,
             }),
             pass_changes: PassChanges::new(scoping.references_len(), allocator),
+            #[cfg(debug_assertions)]
+            orphan_removal_work: OrphanRemovalWork::default(),
         }
+    }
+
+    /// Debug-only: restart the step count of
+    /// `remove_declarations_orphaned_this_pass`.
+    #[cfg(debug_assertions)]
+    pub(crate) fn start_orphan_removal_work(&self) {
+        self.orphan_removal_work.steps.set(0);
+    }
+
+    /// Debug-only: the steps counted since
+    /// [`Self::start_orphan_removal_work`].
+    #[cfg(debug_assertions)]
+    pub(crate) fn orphan_removal_work(&self) -> usize {
+        self.orphan_removal_work.steps.get()
+    }
+
+    /// Count one worklist or predicate step of
+    /// `remove_declarations_orphaned_this_pass`. A no-op without debug
+    /// assertions.
+    #[inline]
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(clippy::unused_self, reason = "the counter exists only in debug builds")
+    )]
+    pub(crate) fn count_orphan_removal_step(&self) {
+        #[cfg(debug_assertions)]
+        self.orphan_removal_work.steps.set(self.orphan_removal_work.steps.get() + 1);
+    }
+
+    /// Count one reference visit or scope-ancestor step, if it happens in a
+    /// predicate run through [`Self::count_orphan_removal_scans`]. A no-op
+    /// without debug assertions.
+    #[inline]
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(clippy::unused_self, reason = "the counter exists only in debug builds")
+    )]
+    pub(crate) fn count_orphan_removal_scan_step(&self) {
+        #[cfg(debug_assertions)]
+        if self.orphan_removal_work.scanning.get() {
+            self.count_orphan_removal_step();
+        }
+    }
+
+    /// Run a removal predicate of `remove_declarations_orphaned_this_pass`,
+    /// counting its reference visits and scope-ancestor steps in debug
+    /// builds. The predicate's result is unchanged.
+    #[inline]
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(clippy::unused_self, reason = "the counter exists only in debug builds")
+    )]
+    pub(crate) fn count_orphan_removal_scans<T>(&self, predicate: impl FnOnce() -> T) -> T {
+        #[cfg(debug_assertions)]
+        {
+            let outer = self.orphan_removal_work.scanning.replace(true);
+            let result = predicate();
+            self.orphan_removal_work.scanning.set(outer);
+            result
+        }
+        #[cfg(not(debug_assertions))]
+        predicate()
     }
 
     /// Whether `Normalize`'s member-write scan should seed persistent metadata,

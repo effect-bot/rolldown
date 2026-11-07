@@ -35,10 +35,12 @@ impl<'a> PeepholeOptimizations {
         ctx: &TraverseCtx<'a>,
     ) -> impl Iterator<Item = ReferenceId> {
         let removed = &ctx.state.pass_changes.removed_references;
+        let state = &ctx.state;
         ctx.scoping()
             .get_resolved_reference_ids(symbol_id)
             .iter()
             .copied()
+            .inspect(move |_| state.count_orphan_removal_scan_step())
             .filter(move |reference_id| !removed.contains(reference_id.index()))
     }
 
@@ -82,6 +84,7 @@ impl<'a> PeepholeOptimizations {
         Self::live_reference_ids(symbol_id, ctx).all(|reference_id| {
             ctx.scoping()
                 .scope_ancestors(ctx.scoping().get_reference(reference_id).scope_id())
+                .inspect(|_| ctx.state.count_orphan_removal_scan_step())
                 .any(|scope_id| scope_id == function_scope_id)
         })
     }

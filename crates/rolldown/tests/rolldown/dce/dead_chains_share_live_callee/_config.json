@@ -1,0 +1,14 @@
+{
+  "_comment": "Regression test for the cost of oxc_minifier's removal of orphaned declarations (vendor/oxc_minifier/PATCHED.md, \"Work bound\"), without the Effect pass. Dead code shares two live callees: 128 unused callers of 128 unused links, each calling common, and a chain of 256 unused links declared out of order (odds, link0, evens), each calling the next, common and shared. common's live call comes after every dead one; shared's live call is in an exported function 16 scopes deep. Each removal notifies common and shared again, and the removal predicate rescans common's references from the start, so the work grows with the square of the dead code; the debug-only work bound in remove_declarations_orphaned_this_pass then fires. The bound counts scope-ancestor steps, so the deep live call is within it. Runs in dead-code-elimination-only mode (minify: dceOnly) and full compression (minify: true); treeshake is off so the code reaches chunk minification. The program must run, both callees must stay, and no dead code may stay. Red until a removal no longer rescans references it has already passed.",
+  "config": {
+    "treeshake": false,
+    "minify": "dceOnly"
+  },
+  "configVariants": [
+    {
+      "minify": true,
+      "_snapshot": false
+    }
+  ],
+  "snapshot": false
+}
