@@ -1,0 +1,10 @@
+{
+  "_comment": "Accessors reached through property descriptors (getOwnPropertyDescriptors(...).x.get/.set, getOwnPropertyDescriptor(...).get): methods read on what they give back stay.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
