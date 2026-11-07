@@ -41,48 +41,48 @@ The patch has two parts:
   lie beyond the bitset and still count as live. With this change, chains
   whose links call later links go in one forward walk.
 - `peephole/minimize_statements.rs`: `remove_declarations_orphaned_this_pass`
-  walks the block's statements once more, last to first, after the forward
-  walk. It removes function declarations, and declarators whose initializer is
-  absent or has no side effects, when every reference to them was dropped this
-  pass. Each removal orphans the link declared before it, so a chain whose
-  links call earlier links goes in the same pass. Declarations whose
-  initializer still has side effects are left for the next pass's forward
-  walk, which keeps those side effects.
+  removes, after the forward walk, every declaration of the block whose
+  references were all dropped this pass, until no removal orphans another.
+  It first walks the block's declarations once, last to first, which clears
+  a chain whose links call earlier links. Each removal records the symbols
+  its initializer or body referenced. If the walk removed anything, those
+  symbols' declarations in the block are checked again through a worklist,
+  so a chain declared in any order goes in the same pass, and each
+  declaration is rechecked only when a removal may have orphaned it. A
+  removed declarator whose initializer has side effects leaves them where it
+  was, reduced by `remove_unused_expression` as in the forward walk; the
+  declaration is split around it, so `const a = 1, b = (f(), () => a), c = 2`
+  becomes `const a = 1; f(); const c = 2`, and side effects run in the same
+  order. The removed statements and declarators are taken out in one rebuild
+  of the block at the end. `remove_unused_function_declaration`'s check moved
+  into `function_declaration_is_unused`, so the closure can check before it
+  walks a function.
 
 The iteration limit, the debug assertion and the recursive-function graph's
 candidate rules are unchanged.
 
-The regression test is `crates/rolldown/tests/rolldown/dce/dead_arrow_chain`.
-
-## Known gaps
-
-Two chains still need more passes than the guard allows, so the debug assertion
-still fires in both `minify: true` and `minify: 'dceOnly'`. Release builds stop
-early and keep part of the chain. Both gaps are in the unpatched 0.157.0 too.
-
-- Links declared out of order (`dce/dead_chain_mixed_order`: 24 links,
-  declared 0, 2, …, 22, 23, 21, …, 1). The forward walk and the reverse sweep
-  each clear the links that are in order for them, about two per pass, and leave
-  orphans behind the walk that has passed them.
-- Links whose initializers have side effects (`dce/dead_chain_effectful_inits`:
-  `const linkN = (tick(N), () => linkN-1())`, 12 such links). The reverse sweep
-  skips them, so only the forward walk removes them, one link per pass. A fix
-  must still call every `tick`, in source order.
-
-Both tests are red. A fix needs an order-independent closure: when a declaration
-is removed, the symbols its dropped references pointed to are checked again,
-until none changes. A fixed number of extra sweeps only covers more orders.
-Removing an effectful declarator must keep its side effects as a statement in
-the same place. Raising the iteration limit only moves the threshold.
+The regression tests are in `crates/rolldown/tests/rolldown/dce/`, each in
+`minify: 'dceOnly'` and `minify: true`: `dead_arrow_chain` (links calling
+earlier links), `dead_chain_mixed_order` (24 links declared 0, 2, …, 22, 23,
+21, …, 1) and `dead_chain_effectful_inits` (12 links
+`(tick(n), () => link(n-1)())`, whose ticks must all run, in order). The
+last two used to go over the pass limit, with and without the first version
+of this patch.
 
 `upstream.patch` is the same change against oxc's `crates_v0.157.0` tag, with
-tests. Upstream's `cargo test -p oxc_minifier` passes with it: 748 tests,
-plus two new ones for chains in either direction, object methods, default
-parameters and mixed declarations, and for kept side effects.
+tests. Upstream's `cargo test -p oxc_minifier` passes with it (750 passed, 26
+ignored), and `cargo clippy -p oxc_minifier --all-targets -- -D warnings` is
+clean. The new tests cover chains in either direction, out of order, through
+object methods, default parameters and mixed function and `var`
+declarations, and chains with effectful initializers, whose effects stay in
+order, including a declaration split around one. A 12-link effectful chain
+takes two passes, as one effectful dead declarator already does; the second
+only settles the kept expression.
 `recursive_function_var_redeclaration_converges_on_count_pass` changes its
 expectations. `function f() { f() } var f;` now converges in one pass, not
-two, and a capped run removes `var f` as well. `tasks/minsize` output is
-byte-identical for all 12 libraries; antd.js needs 3 passes instead of 4.
+two, and a capped run removes `var f` as well. `tasks/minsize` sizes, minified
+and gzipped, are unchanged for all 12 libraries; antd.js needs 3 passes
+instead of 4.
 
 ## Removing this patch
 
@@ -92,7 +92,8 @@ fix:
 1. Delete the `[patch.crates-io]` entry, the `exclude` entry in the root
    `Cargo.toml`, and this directory.
 2. Bump `oxc`.
-3. Keep `dead_arrow_chain` green, and the `dead_chain_*` tests once they pass.
+3. Keep `dead_arrow_chain`, `dead_chain_mixed_order` and
+   `dead_chain_effectful_inits` green.
 
 When bumping `oxc` before then, rebase the patch onto the new
 `oxc_minifier`. The patched crate must keep the same version as the one

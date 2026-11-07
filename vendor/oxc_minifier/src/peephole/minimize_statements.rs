@@ -2,13 +2,15 @@ use std::iter;
 
 use oxc_allocator::{ArenaBox, ArenaVec, TakeIn};
 use oxc_ast::ast::*;
-use oxc_ast_visit::{VisitJs, walk_js};
+use oxc_ast_visit::{Visit, VisitJs, walk_js};
 use oxc_ecmascript::{
     constant_evaluation::{ConstantEvaluation, DetermineValueType, IsLiteralValue, ValueType},
     side_effects::MayHaveSideEffects,
 };
-use oxc_semantic::ScopeFlags;
+use oxc_semantic::{ScopeFlags, Scoping};
 use oxc_span::{ContentEq, GetSpan, GetSpanMut, SPAN};
+use oxc_syntax::symbol::SymbolId;
+use rustc_hash::FxHashMap;
 
 use crate::{
     TraverseCtx, generated::ancestor::Ancestor, is_terminated::IsTerminated, keep_var::KeepVar,
@@ -119,20 +121,27 @@ impl<'a> PeepholeOptimizations {
         *stmts = new_stmts;
     }
 
-    /// Revisit the block's declarations once, last to first, and remove the
-    /// ones whose every reference was dropped earlier in this pass.
+    /// Remove the block's declarations whose every reference was dropped
+    /// earlier in this pass, until removing one orphans no other.
     ///
     /// The forward walk above decides each declaration while every later
-    /// statement still holds its references. In a dead chain whose links call
-    /// earlier links (`const a = () => 0; const b = () => a();`) it can only
-    /// remove the last link, so a pass removed one link and a chain longer
-    /// than the fixed-point iteration guard tripped it. Walking backwards lets
-    /// each removal orphan the link declared before it, so the chain goes in
-    /// one pass.
+    /// statement still holds its references, so in a dead chain whose links
+    /// call earlier links (`const a = () => 0; const b = () => a();`) it only
+    /// removes the last link. A chain longer than the fixed-point iteration
+    /// guard used to trip it, one link per pass.
     ///
-    /// Only declarations that leave no code behind are handled here: function
-    /// declarations, and declarators whose initializer is absent or free of
-    /// side effects. Anything else waits for the next pass's forward walk.
+    /// This walks the declarations once, last to first, which clears such a
+    /// chain in one sweep. Each removal records the symbols its initializer or
+    /// body referenced. When the sweep removed anything, those symbols'
+    /// declarations in this block are checked again, through a worklist, so a
+    /// chain declared in any order goes in this pass, and each declaration is
+    /// rechecked only when a removal may have orphaned it.
+    ///
+    /// A removed declarator whose initializer has side effects leaves them in
+    /// its place, as `remove_unused_expression` reduced them, splitting the
+    /// declaration around it: `const a = 1, b = (f(), () => a), c = 2` becomes
+    /// `const a = 1; f(); const c = 2`. Side effects therefore run in the same
+    /// order as before.
     fn remove_declarations_orphaned_this_pass(
         stmts: &mut ArenaVec<'a, Statement<'a>>,
         ctx: &mut TraverseCtx<'a>,
@@ -142,42 +151,190 @@ impl<'a> PeepholeOptimizations {
         {
             return;
         }
-        let mut removed_statement = false;
-        for stmt in stmts.iter_mut().rev() {
-            match stmt {
+        let mut removals = OrphanRemovals::default();
+        for stmt_index in (0..stmts.len()).rev() {
+            match &mut stmts[stmt_index] {
                 Statement::FunctionDeclaration(_) => {
-                    Self::remove_unused_function_declaration(stmt, ctx);
-                    removed_statement |= matches!(stmt, Statement::EmptyStatement(_));
+                    Self::remove_orphaned_function(stmts, stmt_index, &mut removals, ctx);
                 }
                 Statement::VariableDeclaration(var_decl) => {
-                    let kind = var_decl.kind;
-                    let mut index = var_decl.declarations.len();
-                    while index > 0 {
-                        index -= 1;
-                        let decl = &var_decl.declarations[index];
-                        if Self::should_remove_unused_declarator(decl, kind, ctx)
-                            && !decl.init.as_ref().is_some_and(|init| {
-                                Self::has_side_effects_or_preserved_iife(init, ctx)
-                            })
-                        {
-                            let decl = var_decl.declarations.remove(index);
-                            // Walks the binding, type annotation and init, and
-                            // records the change for the fixed-point loop.
-                            ctx.drop_variable_declarator(&decl);
-                        }
+                    for decl_index in (0..var_decl.declarations.len()).rev() {
+                        Self::remove_orphaned_declarator(
+                            var_decl,
+                            stmt_index,
+                            decl_index,
+                            &mut removals,
+                            ctx,
+                        );
                     }
-                    removed_statement |= var_decl.declarations.is_empty();
                 }
                 _ => {}
             }
         }
-        if removed_statement {
-            stmts.retain(|stmt| match stmt {
-                Statement::EmptyStatement(_) => false,
-                Statement::VariableDeclaration(var_decl) => !var_decl.declarations.is_empty(),
-                _ => true,
-            });
+        if removals.removed.is_empty() {
+            return;
         }
+        if !removals.freed.is_empty() {
+            Self::remove_declarations_orphaned_by_removals(stmts, &mut removals, ctx);
+        }
+        Self::rebuild_statements_after_orphan_removals(stmts, removals, ctx);
+    }
+
+    /// The worklist half of `remove_declarations_orphaned_this_pass`.
+    fn remove_declarations_orphaned_by_removals(
+        stmts: &mut ArenaVec<'a, Statement<'a>>,
+        removals: &mut OrphanRemovals<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        let mut declared: FxHashMap<SymbolId, (usize, usize)> = FxHashMap::default();
+        for (stmt_index, stmt) in stmts.iter().enumerate() {
+            match stmt {
+                Statement::FunctionDeclaration(function) => {
+                    if let Some(symbol_id) = function.id.as_ref().and_then(|id| id.symbol_id.get())
+                    {
+                        declared.insert(symbol_id, (stmt_index, OrphanRemovals::FUNCTION));
+                    }
+                }
+                Statement::VariableDeclaration(var_decl) => {
+                    for (decl_index, decl) in var_decl.declarations.iter().enumerate() {
+                        if let BindingPattern::BindingIdentifier(id) = &decl.id
+                            && let Some(symbol_id) = id.symbol_id.get()
+                        {
+                            declared.insert(symbol_id, (stmt_index, decl_index));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A removed declarator keeps its binding until the rebuild, so it
+        // must not be found, and removed, again.
+        for &(stmt_index, decl_index) in &removals.removed {
+            if let Statement::VariableDeclaration(var_decl) = &stmts[stmt_index]
+                && let BindingPattern::BindingIdentifier(id) = &var_decl.declarations[decl_index].id
+                && let Some(symbol_id) = id.symbol_id.get()
+            {
+                declared.remove(&symbol_id);
+            }
+        }
+        while let Some(symbol_id) = removals.freed.pop() {
+            let Some(&(stmt_index, decl_index)) = declared.get(&symbol_id) else { continue };
+            let removed = match &mut stmts[stmt_index] {
+                Statement::FunctionDeclaration(_) => {
+                    Self::remove_orphaned_function(stmts, stmt_index, removals, ctx)
+                }
+                Statement::VariableDeclaration(var_decl) => Self::remove_orphaned_declarator(
+                    var_decl, stmt_index, decl_index, removals, ctx,
+                ),
+                _ => false,
+            };
+            if removed {
+                declared.remove(&symbol_id);
+            }
+        }
+    }
+
+    /// Remove the function declaration at `stmt_index` if nothing live
+    /// references it, leaving an empty statement until the rebuild.
+    fn remove_orphaned_function(
+        stmts: &mut ArenaVec<'a, Statement<'a>>,
+        stmt_index: usize,
+        removals: &mut OrphanRemovals<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) -> bool {
+        let Statement::FunctionDeclaration(function) = &stmts[stmt_index] else { return false };
+        if !Self::function_declaration_is_unused(function, ctx) {
+            return false;
+        }
+        removals.collect_referenced_symbols(
+            |collector| collector.visit_function(function, ScopeFlags::Function),
+            ctx,
+        );
+        Self::remove_unused_function_declaration(&mut stmts[stmt_index], ctx);
+        debug_assert!(matches!(stmts[stmt_index], Statement::EmptyStatement(_)));
+        removals.removed.push((stmt_index, OrphanRemovals::FUNCTION));
+        true
+    }
+
+    /// Remove declarator `decl_index` of the declaration at `stmt_index` if
+    /// it is unused. Its binding stays until the rebuild; its initializer is
+    /// dropped, or reduced to the side effects that must stay.
+    fn remove_orphaned_declarator(
+        var_decl: &mut VariableDeclaration<'a>,
+        stmt_index: usize,
+        decl_index: usize,
+        removals: &mut OrphanRemovals<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) -> bool {
+        let kind = var_decl.kind;
+        let decl = &mut var_decl.declarations[decl_index];
+        if !Self::should_remove_unused_declarator(decl, kind, ctx) {
+            return false;
+        }
+        if let Some(mut init) = decl.init.take() {
+            removals.collect_referenced_symbols(|collector| collector.visit_expression(&init), ctx);
+            if Self::remove_unused_expression(&mut init, ctx) {
+                ctx.drop_expression(&init);
+            } else {
+                removals.residues.push((stmt_index, decl_index, init));
+            }
+        }
+        // Walks the binding and type annotation, and records the change.
+        ctx.drop_variable_declarator(decl);
+        removals.removed.push((stmt_index, decl_index));
+        true
+    }
+
+    /// Drop the statements and declarators removed by
+    /// `remove_declarations_orphaned_this_pass`, putting each kept side effect
+    /// where its declarator was.
+    fn rebuild_statements_after_orphan_removals(
+        stmts: &mut ArenaVec<'a, Statement<'a>>,
+        mut removals: OrphanRemovals<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        removals.removed.sort_unstable();
+        removals
+            .residues
+            .sort_unstable_by_key(|&(stmt_index, decl_index, _)| (stmt_index, decl_index));
+        let mut removed = removals.removed.into_iter().peekable();
+        let mut residues = removals.residues.into_iter().peekable();
+        let mut result = ArenaVec::with_capacity_in(stmts.len() + residues.len(), ctx);
+        for (stmt_index, stmt) in stmts.take_in(ctx).into_iter().enumerate() {
+            if removed.peek().is_none_or(|&(index, _)| index != stmt_index) {
+                result.push(stmt);
+                continue;
+            }
+            let Statement::VariableDeclaration(var_decl) = stmt else {
+                // A removed function declaration, now an empty statement.
+                removed.next();
+                continue;
+            };
+            let VariableDeclaration { span, kind, declarations, declare, .. } = var_decl.unbox();
+            let mut kept = ArenaVec::new_in(ctx);
+            for (decl_index, decl) in declarations.into_iter().enumerate() {
+                if removed.next_if_eq(&(stmt_index, decl_index)).is_none() {
+                    kept.push(decl);
+                    continue;
+                }
+                if let Some((_, _, residue)) =
+                    residues.next_if(|&(index, decl, _)| (index, decl) == (stmt_index, decl_index))
+                {
+                    if !kept.is_empty() {
+                        let decls = kept.take_in(ctx);
+                        result.push(Statement::new_variable_declaration(
+                            span, kind, decls, declare, ctx,
+                        ));
+                    }
+                    Self::push_new_expression_stmt_to_result(residue, &mut result, ctx);
+                }
+            }
+            if !kept.is_empty() {
+                result.push(Statement::new_variable_declaration(span, kind, kept, declare, ctx));
+            }
+        }
+        debug_assert_eq!(removed.len() + residues.len(), 0, "every removal was applied");
+        *stmts = result;
     }
 
     /// Some parsers cannot parse long conditional expressions.
@@ -2003,6 +2160,47 @@ impl<'a> VisitJs<'a> for FindNestedBreak {
                 self.found_unlabelled_break = true;
             }
             _ => walk_js::walk_statement(self, it),
+        }
+    }
+}
+
+/// What `remove_declarations_orphaned_this_pass` removed from one block.
+#[derive(Default)]
+struct OrphanRemovals<'a> {
+    /// `(statement index, declarator index)` of each removal; a function
+    /// declaration's declarator index is [`Self::FUNCTION`].
+    removed: Vec<(usize, usize)>,
+    /// The side effects of removed declarators, to put where they were.
+    residues: Vec<(usize, usize, Expression<'a>)>,
+    /// Symbols referenced from removed code, whose declarations may now be
+    /// unused. A superset: it also lists references kept in a residue.
+    freed: Vec<SymbolId>,
+}
+
+impl OrphanRemovals<'_> {
+    const FUNCTION: usize = usize::MAX;
+
+    fn collect_referenced_symbols(
+        &mut self,
+        walk: impl FnOnce(&mut ReferencedSymbols<'_, '_>),
+        ctx: &TraverseCtx<'_>,
+    ) {
+        walk(&mut ReferencedSymbols { scoping: ctx.scoping(), symbols: &mut self.freed });
+    }
+}
+
+/// Collects the symbols that the references in a subtree resolve to.
+struct ReferencedSymbols<'s, 'v> {
+    scoping: &'s Scoping,
+    symbols: &'v mut Vec<SymbolId>,
+}
+
+impl<'a> Visit<'a> for ReferencedSymbols<'_, '_> {
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        if let Some(reference_id) = it.reference_id.get()
+            && let Some(symbol_id) = self.scoping.get_reference(reference_id).symbol_id()
+        {
+            self.symbols.push(symbol_id);
         }
     }
 }

@@ -201,19 +201,25 @@ impl<'a> PeepholeOptimizations {
 
     pub fn remove_unused_function_declaration(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
         let Statement::FunctionDeclaration(f) = stmt else { return };
-        if ctx.options().unused == CompressOptionsUnused::Keep {
-            return;
-        }
-        let Some(id) = &f.id else { return };
-        let Some(symbol_id) = id.symbol_id.get() else { return };
-        if Self::is_script_root_scope(ctx) || ctx.current_scope_flags().contains_direct_eval() {
-            return;
-        }
-        if !Self::function_has_no_live_references(symbol_id, ctx) {
+        if !Self::function_declaration_is_unused(f, ctx) {
             return;
         }
         let new_stmt = Statement::new_empty_statement(f.span, ctx);
         ctx.replace_statement(stmt, new_stmt);
+    }
+
+    /// Whether `remove_unused_function_declaration` removes this declaration.
+    pub(super) fn function_declaration_is_unused(f: &Function<'a>, ctx: &TraverseCtx<'a>) -> bool {
+        if ctx.options().unused == CompressOptionsUnused::Keep {
+            return false;
+        }
+        let Some(symbol_id) = f.id.as_ref().and_then(|id| id.symbol_id.get()) else {
+            return false;
+        };
+        if Self::is_script_root_scope(ctx) || ctx.current_scope_flags().contains_direct_eval() {
+            return false;
+        }
+        Self::function_has_no_live_references(symbol_id, ctx)
     }
 
     pub fn remove_unused_class_declaration(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
