@@ -286,6 +286,9 @@ pub enum Constraint {
   SuccessOf(VarId),
   FailureOf(VarId),
   KeyUse(KeyUse),
+  /// On a class's heritage variable: the class (`ObjId`) is a service key only when what it
+  /// extends is one, directly or through other classes (`Analysis::key_heritage`).
+  KeyHeritage(ObjId, KeyUse),
   /// Keys held by Contexts, Layers and runtimes flow into the variable as `Str` objects.
   ContextKeys(VarId),
   /// Elements of arrays and other iterables.
@@ -370,6 +373,16 @@ impl Key {
   }
 }
 
+impl KeyUse {
+  fn remap(&self, v: &impl Fn(VarId) -> VarId) -> KeyUse {
+    match self {
+      KeyUse::Lookup(x) => KeyUse::Lookup(v(*x)),
+      KeyUse::Provide(x) => KeyUse::Provide(v(*x)),
+      KeyUse::Strings(x) => KeyUse::Strings(v(*x)),
+    }
+  }
+}
+
 impl Constraint {
   /// The same constraint with variables renamed by `v` and call sites by `s` (for clones).
   fn remap(&self, v: &impl Fn(VarId) -> VarId, s: &mut impl FnMut(Site) -> Site) -> Constraint {
@@ -396,11 +409,8 @@ impl Constraint {
       })),
       C::SuccessOf(x) => C::SuccessOf(v(*x)),
       C::FailureOf(x) => C::FailureOf(v(*x)),
-      C::KeyUse(u) => C::KeyUse(match u {
-        KeyUse::Lookup(x) => KeyUse::Lookup(v(*x)),
-        KeyUse::Provide(x) => KeyUse::Provide(v(*x)),
-        KeyUse::Strings(x) => KeyUse::Strings(v(*x)),
-      }),
+      C::KeyUse(u) => C::KeyUse(u.remap(v)),
+      C::KeyHeritage(class, u) => C::KeyHeritage(*class, u.remap(v)),
       C::ContextKeys(x) => C::ContextKeys(v(*x)),
       C::ElemOf(x) => C::ElemOf(v(*x)),
       C::Contents(x) => C::Contents(v(*x)),
@@ -1411,6 +1421,7 @@ impl Analysis {
       Constraint::SuccessOf(dst) => self.success_of(obj, *dst),
       Constraint::FailureOf(dst) => self.failure_of(obj, *dst),
       Constraint::KeyUse(use_) => self.key_use(obj, use_),
+      Constraint::KeyHeritage(class, use_) => self.key_heritage(obj, *class, use_),
       Constraint::ContextKeys(dst) => match self.objs[obj].kind {
         ObjKind::Context { keys } | ObjKind::Layer { keys } | ObjKind::Runtime { keys } => {
           self.copy(keys, *dst);
@@ -2904,12 +2915,11 @@ impl Analysis {
     match self.objs[obj].kind.clone() {
       ObjKind::Key { strings, .. } => self.constrain(strings, Constraint::KeyUse(use_.clone())),
       ObjKind::Class { heritage, .. } => {
+        // A class is a key only through its heritage (`key_heritage`): a plain class with a
+        // `key` field names no service.
         if let Some(h) = heritage {
-          self.constrain(h, Constraint::KeyUse(use_.clone()));
+          self.constrain(h, Constraint::KeyHeritage(obj, use_.clone()));
         }
-        // `static key = "..."` overrides the inherited key string.
-        let own = self.field(obj, &ArcStr::from("key"));
-        self.constrain(own, Constraint::KeyUse(use_.clone()));
       }
       ObjKind::Str(name) => match use_ {
         KeyUse::Lookup(dst) => {
@@ -2943,6 +2953,44 @@ impl Analysis {
         self.key_use(all, use_);
       }
     }
+  }
+
+  /// `class` extends `base`, an object reaching its heritage variable. The class is a service key
+  /// when `base` is a key object (`Context.Service(...)`, `Context.Reference(...)`), or a class
+  /// that is one, at any depth. Heritage grows during the solve, so this runs as a constraint on
+  /// each heritage variable and fires for every object that arrives there later. A class whose
+  /// heritage is code the pass can't see may be a key too, and keeps the old reading.
+  ///
+  /// A key class's own `static key` field overrides the inherited string, as does that of any
+  /// key class between it and the key object, so every one of them is read.
+  fn key_heritage(&mut self, base: ObjId, class: ObjId, use_: &KeyUse) {
+    match self.objs[base].kind.clone() {
+      ObjKind::Key { strings, .. } => {
+        self.constrain(strings, Constraint::KeyUse(use_.clone()));
+        self.own_key_use(class, use_);
+      }
+      ObjKind::Class { heritage: Some(h), .. } => {
+        // `base` is a key class, and so is `class`, once `base`'s own heritage is one.
+        self.constrain(h, Constraint::KeyHeritage(base, use_.clone()));
+        self.constrain(h, Constraint::KeyHeritage(class, use_.clone()));
+      }
+      ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => {
+        self.key_use(base, use_);
+        self.own_key_use(class, use_);
+      }
+      ObjKind::Builtin { .. } if self.is_default(base) => {
+        self.key_use(base, use_);
+        self.own_key_use(class, use_);
+      }
+      // A class without heritage, or one extending anything else, is not a key.
+      _ => {}
+    }
+  }
+
+  /// A key class's own `key` field (`static key = "..."`) names its key.
+  fn own_key_use(&mut self, class: ObjId, use_: &KeyUse) {
+    let own = self.field(class, &ArcStr::from("key"));
+    self.constrain(own, Constraint::KeyUse(use_.clone()));
   }
 
   /// Iteration: array elements, or the unknown-key slot of a record used as an iterable.
