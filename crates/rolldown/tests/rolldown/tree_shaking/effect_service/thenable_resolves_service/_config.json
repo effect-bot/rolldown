@@ -1,0 +1,10 @@
+{
+  "_comment": "A thenable that is not itself a service resolves with a service; the caller awaits it and calls one of the service's methods. That method stays, the unread one is removed and the bundle runs. Guards that host adoption gives an await what a thenable resolves with, not only the thenable.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
