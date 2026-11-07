@@ -119,8 +119,6 @@ struct StandIn {
 /// Work the admission filter holds back until the object may hold a service
 /// (`Analysis::may_hold`); re-checked whenever the solve settles.
 enum Deferred {
-  /// The object flows into the variable.
-  Admit(ObjId, VarId),
   /// A walk of the object.
   Walk(ObjId, Walk, VarId, VarId, Site),
   /// Host adoption of the object (`adopt`).
@@ -428,11 +426,12 @@ pub enum Constraint {
   /// Values entering a type-modelled value's slot (`Analysis::slot_in`); the object is the
   /// stand-in for what the admission filter holds back.
   SlotIn(VarId, ObjId),
-  /// Direction 2's admission filter (`Analysis::admit`): what may hold a service flows into the
-  /// variable; anything else is stood for by the stand-in object until it may.
-  Admit(VarId, ObjId),
   /// A call reaching only the functions (closures, classes, builtins) of the variable.
   CallFn(Box<Call>),
+  /// A protocol method call (`protocol_call`) with the type model on: a summary found under a
+  /// protocol name is effect code run with the receiver as `this`, so the receiver goes to
+  /// unseen code instead of the summary being called; anything else is called.
+  ProtocolCall(Box<Call>),
   /// What a callback handed to type-modelled code returns (`typed_callback`): it goes to unseen
   /// code, and so does what an Effect or promise among it succeeds with.
   EscapeOut,
@@ -526,11 +525,14 @@ impl Constraint {
       C::ThenableAwait(dst) => C::ThenableAwait(v(*dst)),
       C::TypedArg(slot, back, site, mask) => C::TypedArg(v(*slot), v(*back), *site, *mask),
       C::SlotIn(dst, stand_in) => C::SlotIn(v(*dst), *stand_in),
-      C::Admit(dst, stand_in) => C::Admit(v(*dst), *stand_in),
       C::TypedConcrete(ty, site) => C::TypedConcrete(*ty, *site),
       C::AdmitTyped(dst) => C::AdmitTyped(v(*dst)),
       C::TypedNested(slot, back, site, mask) => C::TypedNested(v(*slot), v(*back), *site, *mask),
       C::EscapeOut => C::EscapeOut,
+      C::ProtocolCall(call) => match C::Call(call.clone()).remap(v, s) {
+        C::Call(c) => C::ProtocolCall(c),
+        _ => unreachable!(),
+      },
       C::CallFn(call) => {
         let mut c = (**call).clone();
         c.this = c.this.map(v);
@@ -840,7 +842,7 @@ pub struct Analysis {
   /// What concrete-position callbacks receive: an unknown, service-free host value.
   concrete_args: Option<VarId>,
   /// (object, position type, site) triples `typed_concrete` has handled.
-  concrete_seen: FxHashSet<(ObjId, u32, Site)>,
+  concrete_seen: FxHashSet<(ObjId, u32)>,
   /// The export call (export, argument count) each type-modelled call result comes from: a
   /// call of the result is a call of the function that export returns.
   typed_result_origin: FxHashMap<ObjId, (u32, usize)>,
@@ -861,6 +863,13 @@ pub struct Analysis {
   pub taint_log: FxHashMap<String, usize>,
   /// Debug: which calls write each pool.
   pool_writers: FxHashMap<ModuleIdx, FxHashSet<String>>,
+  /// Argument variables of type-modelled calls: spread elements by source, and filtered copies
+  /// by (variable, declared type).
+  typed_spreads: FxHashMap<VarId, VarId>,
+  typed_filtered: FxHashMap<(VarId, u32), VarId>,
+  /// `record_fields` by object, and the program-wide sink of unread callback results.
+  record_fields: FxHashMap<ObjId, VarId>,
+  discarded: Option<VarId>,
   /// The type-modelled modules whose code the program calls: an export, a method read off one,
   /// or a value one of its calls returned.
   pub typed_called_modules: FxHashSet<ModuleIdx>,
@@ -1056,6 +1065,10 @@ impl Analysis {
       methods_store: FxHashMap::default(),
       method_only: FxHashMap::default(),
       typed_called_modules: FxHashSet::default(),
+      typed_spreads: FxHashMap::default(),
+      typed_filtered: FxHashMap::default(),
+      record_fields: FxHashMap::default(),
+      discarded: None,
       stand_ins: FxHashMap::default(),
       site_stand_ins: FxHashMap::default(),
       unknown_store_filters: FxHashMap::default(),
@@ -1842,10 +1855,10 @@ impl Analysis {
         self.typed_arg(obj, *slot, *back, *site, *mask);
       }
       Constraint::SlotIn(dst, stand_in) => self.slot_in(obj, *dst, *stand_in),
-      Constraint::Admit(dst, stand_in) => self.admit(obj, *dst, *stand_in),
       Constraint::AdmitTyped(dst) => self.admit_typed(obj, *dst),
       Constraint::TypedConcrete(ty, site) => self.typed_concrete(obj, *ty, *site),
       Constraint::CallFn(call) => self.call_fn_only(obj, call),
+      Constraint::ProtocolCall(call) => self.protocol_method_call(obj, call),
       Constraint::EscapeOut => match self.objs[obj].kind {
         ObjKind::Effect { success, .. } => self.constrain(success, Constraint::EscapeOut),
         ObjKind::Promise { value } => self.constrain(value, Constraint::EscapeOut),
@@ -2879,6 +2892,28 @@ impl Analysis {
     Some(sig)
   }
 
+  /// The elements of a spread argument, one variable per spread source.
+  fn typed_spread_elems(&mut self, v: VarId) -> VarId {
+    if let Some(e) = self.typed_spreads.get(&v) {
+      return *e;
+    }
+    let e = self.var();
+    self.typed_spreads.insert(v, e);
+    self.constrain(v, Constraint::ElemOf(e));
+    e
+  }
+
+  /// `v` filtered by the declared type `ty` (`bounded_copy`), one variable per pair.
+  fn typed_filtered_arg(&mut self, v: VarId, ty: u32) -> VarId {
+    if let Some(a) = self.typed_filtered.get(&(v, ty)) {
+      return *a;
+    }
+    let a = self.var();
+    self.typed_filtered.insert((v, ty), a);
+    self.bounded_copy(v, a, Some(ty));
+    a
+  }
+
   /// The module a type-modelled value comes from: an export's, or the producing call's.
   fn typed_module(&self, obj: ObjId) -> Option<ModuleIdx> {
     match self.objs[obj].kind {
@@ -3102,17 +3137,18 @@ impl Analysis {
     for (i, a) in call.args.iter().enumerate() {
       let v = match a {
         Arg::Var(v) => *v,
-        Arg::Spread(v) => {
-          let e = self.var();
-          self.constrain(*v, Constraint::ElemOf(e));
-          e
-        }
+        Arg::Spread(v) => self.typed_spread_elems(*v),
       };
       let ty = sig.as_ref().and_then(|s| s.params.get(i).copied().flatten().or(s.rest));
       let generic =
         sig.as_ref().is_none_or(|s| s.generic.get(i).copied().unwrap_or(s.rest_generic));
-      let arg = self.var();
-      self.bounded_copy(v, arg, ty);
+      // The argument as the declared type admits it: the variable itself when the position is
+      // open, one filtered copy per (variable, type) otherwise. A copy per application would
+      // copy the same values once for every callee the call reaches.
+      let arg = match ty {
+        None => v,
+        Some(t) => self.typed_filtered_arg(v, t),
+      };
       if generic {
         self.constrain(arg, Constraint::AdmitTyped(handed));
         // Without a signature, the call hands what it holds to unseen code (below), so its
@@ -3389,58 +3425,8 @@ impl Analysis {
         .any(|(k, v)| !self.never_prune.contains(k) && self.vars[*v].pts.contains(&o))
   }
 
-  /// A fresh stand-in (`StandIn`).
-  fn new_stand_in(&mut self) -> ObjId {
-    let slot = self.var();
-    let held_var = self.var();
-    let returns = self.var();
-    let o = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, None);
-    self
-      .stand_ins
-      .insert(o, StandIn { held: vec![], held_var, tainted: false, called: false, returns });
-    o
-  }
-
   fn is_stand_in(&self, obj: ObjId) -> bool {
     self.stand_ins.contains_key(&obj)
-  }
-
-  /// The admission filter: `obj` flows into `dst` if it may hold a service; otherwise the
-  /// stand-in flows there for it until it may, or until the stand-in is tainted.
-  fn admit(&mut self, obj: ObjId, dst: VarId, stand_in: ObjId) {
-    if self.is_stand_in(obj) || self.stand_ins.get(&stand_in).is_none_or(|s| s.tainted) {
-      self.seed(dst, obj);
-      return;
-    }
-    if self.may_hold(obj) {
-      self.admission_stats.0 += 1;
-      self.seed(dst, obj);
-      return;
-    }
-    self.admission_stats.1 += 1;
-    self.seed(dst, stand_in);
-    let held_var = match self.stand_ins.get_mut(&stand_in) {
-      Some(s) => {
-        s.held.push((obj, dst));
-        Some(s.held_var)
-      }
-      None => None,
-    };
-    if let Some(v) = held_var {
-      self.seed(v, obj);
-    }
-    if self.stand_ins.get(&stand_in).is_some_and(|s| s.called) && self.held_call_needs_release(obj)
-    {
-      let why = if self.debug {
-        format!("call; later holds {:?}", self.objs[obj].site.map(|s| (s.module.raw(), s.start)))
-      } else {
-        String::new()
-      };
-      self.taint_by(stand_in, &why);
-    }
-    if !matches!(self.objs[obj].kind, ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim) {
-      self.deferred.push(Deferred::Admit(obj, dst));
-    }
   }
 
   /// A call through a stand-in: the call reaches the callables it holds (`held_var`). A member
@@ -3569,15 +3555,18 @@ impl Analysis {
   }
 
   /// `src` filtered by the admission test, as the variable an unknown-key store copies into the
-  /// target's fields (one per source variable, with its own stand-in).
+  /// target's fields (one per source variable). A value stored under a dynamic key reaches
+  /// every field, so only what may hold a prunable service flows as itself; anything else goes
+  /// to unseen code (`admit_typed`), and the fields hold `top_ext` for it: reading one back is
+  /// reading a value from unseen code, and a service written into it later bails.
   fn admitted_store(&mut self, src: VarId) -> VarId {
     if let Some(v) = self.unknown_store_filters.get(&src) {
       return *v;
     }
     let v = self.var();
-    let stand_in = self.new_stand_in();
     self.unknown_store_filters.insert(src, v);
-    self.constrain(src, Constraint::Admit(v, stand_in));
+    self.seed(v, self.top_ext);
+    self.constrain(src, Constraint::AdmitTyped(v));
     v
   }
 
@@ -3598,25 +3587,14 @@ impl Analysis {
     let mut keep = vec![];
     for d in pending {
       let obj = match &d {
-        Deferred::Admit(o, _)
-        | Deferred::Walk(o, ..)
-        | Deferred::Adopt(o, _)
-        | Deferred::Concrete(o, ..) => *o,
+        Deferred::Walk(o, ..) | Deferred::Adopt(o, _) | Deferred::Concrete(o, ..) => *o,
       };
-      let ready = match &d {
-        Deferred::Admit(..) => self.may_hold(obj),
-        _ => self.reaches_code(obj),
-      };
-      if !ready {
+      if !self.reaches_code(obj) {
         keep.push(d);
         continue;
       }
       ran = true;
       match d {
-        Deferred::Admit(o, dst) => {
-          self.admission_stats.0 += 1;
-          self.seed(dst, o);
-        }
         Deferred::Walk(o, walk, pool, arg, site) => self.walk(o, walk, pool, arg, site),
         Deferred::Adopt(o, dst) => self.adopt(o, dst),
         Deferred::Concrete(o, ty, site) => self.typed_concrete(o, ty, site),
@@ -3628,7 +3606,8 @@ impl Analysis {
   }
 
   /// Debug census of the type model: pool sizes by module, the largest slots and what fills
-  /// them.
+  /// them, and where the points-to entries are.
+  #[expect(clippy::too_many_lines, reason = "one debug report")]
   pub fn typed_census(&self, names: &dyn Fn(ModuleIdx) -> String) -> String {
     let mut pools: Vec<(usize, String)> =
       self.typed_pools.iter().map(|(m, v)| (self.vars[*v].pts.len(), names(*m))).collect();
@@ -3707,6 +3686,108 @@ impl Analysis {
       t
     };
     let typed_vars: usize = self.vars.iter().filter(|v| v.pts.len() > 100).count();
+    // Points-to entries by the origin of the object held: what fills the budget.
+    let mut by_origin: FxHashMap<(String, Option<(u32, u32)>), usize> = FxHashMap::default();
+    for v in &self.vars {
+      for o in &v.pts {
+        let ob = &self.objs[*o];
+        let kind = if self.is_stand_in(*o) {
+          "StandIn".to_string()
+        } else {
+          format!("{:?}", ob.kind).split([' ', '(', '{']).next().unwrap_or("").to_string()
+        };
+        *by_origin.entry((kind, ob.site.map(|s| (s.module.raw(), s.start)))).or_default() += 1;
+      }
+    }
+    let mut by_origin: Vec<_> = by_origin.into_iter().collect();
+    by_origin.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let by_origin: Vec<String> =
+      by_origin.iter().take(30).map(|((k, s), n)| format!("{n} {k} {s:?}")).collect();
+    // Points-to entries by the function owning the variable (template and clones together).
+    let mut owner: FxHashMap<VarId, (u32, u32)> = FxHashMap::default();
+    for f in &self.fns {
+      let key = (f.module.raw(), f.span_start);
+      for v in f.locals.iter().chain(f.params.iter()).chain([&f.ret, &f.this]) {
+        owner.entry(*v).or_insert(key);
+      }
+    }
+    let mut by_fn: FxHashMap<(u32, u32), (usize, usize)> = FxHashMap::default();
+    let mut unowned = 0usize;
+    for (v, var) in self.vars.iter_enumerated() {
+      match owner.get(&v) {
+        Some(k) => {
+          let e = by_fn.entry(*k).or_default();
+          e.0 += var.pts.len();
+          e.1 += 1;
+        }
+        None => unowned += var.pts.len(),
+      }
+    }
+    // The unowned ones: fields, elements and prototypes of objects, by the object's origin.
+    let mut field_owner: FxHashMap<VarId, String> = FxHashMap::default();
+    for (o, ob) in self.objs.iter_enumerated() {
+      let kind = if self.is_stand_in(o) {
+        "StandIn".to_string()
+      } else {
+        format!("{:?}", ob.kind).split([' ', '(', '{']).next().unwrap_or("").to_string()
+      };
+      let d = format!("{kind} {:?}", ob.site.map(|s| (s.module.raw(), s.start)));
+      for (name, v) in &ob.fields {
+        field_owner.entry(*v).or_insert(format!("{d} .{name}"));
+      }
+      if let Some(v) = ob.elem {
+        field_owner.entry(v).or_insert(format!("{d} []"));
+      }
+      if let ObjKind::Typed { slot, .. } = ob.kind {
+        field_owner.entry(slot).or_insert(format!("{d} slot"));
+      }
+    }
+    let mut by_field: FxHashMap<String, (usize, usize)> = FxHashMap::default();
+    let mut rest = 0usize;
+    for (v, var) in self.vars.iter_enumerated() {
+      if owner.contains_key(&v) {
+        continue;
+      }
+      match field_owner.get(&v) {
+        Some(k) => {
+          let e = by_field.entry(k.clone()).or_default();
+          e.0 += var.pts.len();
+          e.1 += 1;
+        }
+        None => rest += var.pts.len(),
+      }
+    }
+    // The fattest other model variables, by what they are attached to.
+    let mut sig_of: FxHashMap<String, (usize, usize)> = FxHashMap::default();
+    for (v, var) in self.vars.iter_enumerated() {
+      if owner.contains_key(&v) || field_owner.contains_key(&v) || var.pts.len() < 50 {
+        continue;
+      }
+      let cs: Vec<String> = var
+        .constraints
+        .iter()
+        .take(3)
+        .map(|c| format!("{c:?}").split([' ', '(', '{']).next().unwrap_or("").to_string())
+        .collect();
+      let k = format!("constraints {cs:?}, {} copies", var.copies.len().min(5));
+      let e = sig_of.entry(k).or_default();
+      e.0 += var.pts.len();
+      e.1 += 1;
+    }
+    let mut sig_of: Vec<_> = sig_of.into_iter().collect();
+    sig_of.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+    let sig_of: Vec<String> =
+      sig_of.iter().take(15).map(|(k, (n, vs))| format!("{n} in {vs} vars: {k}")).collect();
+    let mut by_field: Vec<_> = by_field.into_iter().collect();
+    by_field.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+    let by_field: Vec<String> = std::iter::once(format!("{rest} in other model variables"))
+      .chain(by_field.iter().take(25).map(|(k, (n, vs))| format!("{n} in {vs} x {k}")))
+      .collect();
+    let mut by_fn: Vec<_> = by_fn.into_iter().collect();
+    by_fn.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+    let by_fn: Vec<String> = std::iter::once(format!("{unowned} in variables no function owns"))
+      .chain(by_fn.iter().take(25).map(|(k, (n, vs))| format!("{n} in {vs} vars of fn {k:?}")))
+      .collect();
     let mut cb: FxHashMap<(u32, u32, u8), (usize, usize)> = FxHashMap::default();
     for (m, st, mask, slot, _) in &self.callback_log {
       let e = cb.entry((*m, *st, *mask)).or_default();
@@ -3770,7 +3851,7 @@ impl Analysis {
     taints.sort_by_key(|x| std::cmp::Reverse(*x.1));
     let taints: Vec<String> = taints.iter().take(25).map(|(k, n)| format!("{n} x {k}")).collect();
     format!(
-      "callbacks {cbs:?}; hot typed calls {hot:?}; fattest {fat_desc:?}; taints {taints:#?}; pools {:?}; writers {writers:#?}; {} Typed, slot entries {total}; vars over 100 entries {typed_vars}; largest slots {top:#?}",
+      "other variables {sig_of:#?}; entries by field {by_field:#?}; entries by function {by_fn:#?}; entries by origin {by_origin:#?}; callbacks {cbs:?}; hot typed calls {hot:?}; fattest {fat_desc:?}; taints {taints:#?}; pools {:?}; writers {writers:#?}; {} Typed, slot entries {total}; vars over 100 entries {typed_vars}; largest slots {top:#?}",
       &pools[..pools.len().min(10)],
       slots.len()
     )
@@ -3880,13 +3961,13 @@ impl Analysis {
       return;
     }
     if matches!(self.objs[obj].kind, ObjKind::Object | ObjKind::Array)
-      && !self.concrete_seen.contains(&(obj, ty, site))
+      && !self.concrete_seen.contains(&(obj, ty))
       && !self.reaches_code(obj)
     {
       self.deferred.push(Deferred::Concrete(obj, ty, site));
       return;
     }
-    if !self.concrete_seen.insert((obj, ty, site)) {
+    if !self.concrete_seen.insert((obj, ty)) {
       return;
     }
     let args = match self.concrete_args {
@@ -3903,7 +3984,7 @@ impl Analysis {
     // Only functions run: effect code calls the handlers a value declares, and a summary among
     // them is effect code already (its own calls are modelled where it was made).
     let call_with_unknowns = |a: &mut Self, callee: VarId| {
-      let ret = a.var();
+      let ret = a.discarded();
       let call = Call {
         site: call_site,
         this: None,
@@ -3931,15 +4012,16 @@ impl Analysis {
           .as_ref()
           .map(|t| t.members.iter().flatten().map(|m| ArcStr::from(m.as_str())).collect())
           .unwrap_or_default();
-        let fields = self.var();
-        if members.is_empty() {
+        let fields = if members.is_empty() {
           // No declared members to go by: every member may be read.
-          self.constrain(holder, Constraint::Load { key: Key::Unknown, dst: fields });
+          self.record_fields(obj)
         } else {
+          let fields = self.var();
           for m in members {
             self.constrain(holder, Constraint::Load { key: Key::Name(m), dst: fields });
           }
-        }
+          fields
+        };
         if matches!(self.objs[obj].kind, ObjKind::Array) {
           let elem = self.elem(obj);
           self.constrain(elem, Constraint::TypedConcrete(u32::MAX, site));
@@ -4032,10 +4114,31 @@ impl Analysis {
   fn typed_nested_callbacks(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site, mask: u8) {
     // Effect's code reads the handlers off the object by name, so every member counts as read
     // (an ordinary unknown-key load): an object whose methods are services' keeps them.
-    let holder = self.holder(obj);
-    let fields = self.var();
-    self.constrain(holder, Constraint::Load { key: Key::Unknown, dst: fields });
+    let fields = self.record_fields(obj);
     self.constrain(fields, Constraint::TypedNested(slot, back, site, mask));
+  }
+
+  /// Everything a record or array holds, read by an unknown name: one variable per object,
+  /// shared by every type-modelled call it is handed to.
+  fn record_fields(&mut self, obj: ObjId) -> VarId {
+    if let Some(v) = self.record_fields.get(&obj) {
+      return *v;
+    }
+    let fields = self.var();
+    self.record_fields.insert(obj, fields);
+    let holder = self.holder(obj);
+    self.constrain(holder, Constraint::Load { key: Key::Unknown, dst: fields });
+    fields
+  }
+
+  /// Where the results of callbacks nothing reads go: one variable for the whole program.
+  fn discarded(&mut self) -> VarId {
+    if let Some(v) = self.discarded {
+      return v;
+    }
+    let v = self.var();
+    self.discarded = Some(v);
+    v
   }
 
   /// `Constraint::BailKeys`: the key the string names keeps every method.
@@ -4049,6 +4152,18 @@ impl Analysis {
         self.bail_everything("a key of unknown name is handed to type-modelled effect code");
       }
       _ => {}
+    }
+  }
+
+  /// `Constraint::ProtocolCall`: a summary under a protocol name hands the receiver to unseen
+  /// code; anything else is called.
+  fn protocol_method_call(&mut self, obj: ObjId, call: &Call) {
+    if matches!(self.objs[obj].kind, ObjKind::Typed { .. }) {
+      if let Some(this) = call.this {
+        self.constrain(this, Constraint::Escape(Flavour::Ext, None));
+      }
+    } else {
+      self.call(obj, call);
     }
   }
 
@@ -4879,7 +4994,11 @@ impl Analysis {
       is_new: false,
       builtin: None,
     };
-    self.constrain(method, Constraint::Call(Box::new(call)));
+    if self.admission {
+      self.constrain(method, Constraint::ProtocolCall(Box::new(call)));
+    } else {
+      self.constrain(method, Constraint::Call(Box::new(call)));
+    }
     self.copy(result, ret);
     method
   }
