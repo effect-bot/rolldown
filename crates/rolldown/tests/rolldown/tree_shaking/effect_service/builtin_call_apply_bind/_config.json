@@ -1,0 +1,10 @@
+{
+  "_comment": "Effect's own functions called through `.call` (`pipe.call(undefined, svc, f)`), `.apply` (`Effect.map.apply(null, [eff, f])`) and `.bind` (`Effect.map.bind(null, eff)(f)`) each pass the service to a function reading one of its methods, which stays; the method nothing reads is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

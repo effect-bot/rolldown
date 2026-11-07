@@ -1,0 +1,10 @@
+{
+  "_comment": "A bundled pipe forwarder called with another receiver through `.apply`, `.bind(other)(f)` and `.bind(other, f)()` reads one service method in each case, which stays; the method nothing reads is removed. Guards `.apply` and `.bind` on a builtin, as pipe_forwarder_guards does `.call`.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
