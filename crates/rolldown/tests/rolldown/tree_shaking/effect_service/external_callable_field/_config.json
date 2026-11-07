@@ -1,0 +1,13 @@
+{
+  "_comment": "A function holding the service in its own property is handed to an external module, which reads the service off it: the service reaches unseen code through the function's field, so Store keeps every method. Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": [
+      "./late.js"
+    ]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
