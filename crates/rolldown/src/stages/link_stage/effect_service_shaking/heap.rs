@@ -287,8 +287,11 @@ pub enum Constraint {
   FailureOf(VarId),
   KeyUse(KeyUse),
   /// On a class's heritage variable: the class (`ObjId`) is a service key only when what it
-  /// extends is one, directly or through other classes (`Analysis::key_heritage`).
+  /// directly extends is a key object (`Analysis::key_heritage`).
   KeyHeritage(ObjId, KeyUse),
+  /// On the heritage variable of a class another class extends: once it reaches a key, at any
+  /// depth, the subclass is read as an unknown key (`Analysis::subclass_heritage`).
+  SubclassHeritage(KeyUse),
   /// Keys held by Contexts, Layers and runtimes flow into the variable as `Str` objects.
   ContextKeys(VarId),
   /// Elements of arrays and other iterables.
@@ -411,6 +414,7 @@ impl Constraint {
       C::FailureOf(x) => C::FailureOf(v(*x)),
       C::KeyUse(u) => C::KeyUse(u.remap(v)),
       C::KeyHeritage(class, u) => C::KeyHeritage(*class, u.remap(v)),
+      C::SubclassHeritage(u) => C::SubclassHeritage(u.remap(v)),
       C::ContextKeys(x) => C::ContextKeys(v(*x)),
       C::ElemOf(x) => C::ElemOf(v(*x)),
       C::Contents(x) => C::Contents(v(*x)),
@@ -1444,6 +1448,7 @@ impl Analysis {
       Constraint::FailureOf(dst) => self.failure_of(obj, *dst),
       Constraint::KeyUse(use_) => self.key_use(obj, use_),
       Constraint::KeyHeritage(class, use_) => self.key_heritage(obj, *class, use_),
+      Constraint::SubclassHeritage(use_) => self.subclass_heritage(obj, use_),
       Constraint::ContextKeys(dst) => match self.objs[obj].kind {
         ObjKind::Context { keys } | ObjKind::Layer { keys } | ObjKind::Runtime { keys } => {
           self.copy(keys, *dst);
@@ -3040,13 +3045,18 @@ impl Analysis {
   }
 
   /// `class` extends `base`, an object reaching its heritage variable. The class is a service key
-  /// when `base` is a key object (`Context.Service(...)`, `Context.Reference(...)`), or a class
-  /// that is one, at any depth. Heritage grows during the solve, so this runs as a constraint on
+  /// only when `base` is a key object: it directly extends what `Context.Service` or
+  /// `Context.Reference` returns. Heritage grows during the solve, so this runs as a constraint on
   /// each heritage variable and fires for every object that arrives there later. A class whose
   /// heritage is code the pass can't see may be a key too, and keeps the old reading.
   ///
-  /// A key class's own `static key` field overrides the inherited string, as does that of any
-  /// key class between it and the key object, so every one of them is read.
+  /// A subclass of another class is not a key, even when that class is one: the rule covers only
+  /// the direct form (issue, "Analysis model"). Constructors such as `HttpApiMiddleware.Service`
+  /// return such a subclass, and their services must not be pruned, so a class that reaches a key
+  /// through another class is read as an unknown key instead (`subclass_heritage`). See
+  /// internal-docs/effect-service-shaking/implementation.md.
+  ///
+  /// A key class's own `static key` field overrides the inherited string, so it is read too.
   fn key_heritage(&mut self, base: ObjId, class: ObjId, use_: &KeyUse) {
     match self.objs[base].kind.clone() {
       ObjKind::Key { strings, .. } => {
@@ -3054,9 +3064,7 @@ impl Analysis {
         self.own_key_use(class, use_);
       }
       ObjKind::Class { heritage: Some(h), .. } => {
-        // `base` is a key class, and so is `class`, once `base`'s own heritage is one.
-        self.constrain(h, Constraint::KeyHeritage(base, use_.clone()));
-        self.constrain(h, Constraint::KeyHeritage(class, use_.clone()));
+        self.constrain(h, Constraint::SubclassHeritage(use_.clone()));
       }
       ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => {
         self.key_use(base, use_);
@@ -3068,6 +3076,29 @@ impl Analysis {
       }
       // A class without heritage, or one extending anything else, is not a key.
       _ => {}
+    }
+  }
+
+  /// A class extends another class whose heritage `base` reaches. If that chain reaches a key,
+  /// or heritage the pass can't see, the subclass may share a key at run time, and neither the
+  /// key nor the service is modelled: the subclass is read as an unknown key. Its providers are
+  /// then kept whole (`unknown_key_values`), and a lookup through it sees every service, so the
+  /// methods it calls run in the analysis and record their reads. Issue, "Analysis model":
+  /// services from constructors other than `Context.Service` and `Context.Reference` are not
+  /// pruned.
+  fn subclass_heritage(&mut self, base: ObjId, use_: &KeyUse) {
+    let possible_key = match self.objs[base].kind.clone() {
+      ObjKind::Class { heritage: Some(h), .. } => {
+        self.constrain(h, Constraint::SubclassHeritage(use_.clone()));
+        false
+      }
+      ObjKind::Key { .. } | ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => true,
+      ObjKind::Builtin { .. } => self.is_default(base),
+      _ => false,
+    };
+    if possible_key {
+      let all = self.all_keys;
+      self.key_use(all, use_);
     }
   }
 
