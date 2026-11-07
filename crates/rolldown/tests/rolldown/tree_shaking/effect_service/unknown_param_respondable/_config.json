@@ -1,0 +1,10 @@
+{
+  "_comment": "A service implementing HttpServerRespondable is passed to HttpServerRespondable.toResponseOrElse, whose parameter is typed unknown; the API calls its [HttpServerRespondable.symbol] method. The program calls one other method itself. That method and the protocol method stay, the unread method is removed and the bundle runs. Guards the Respondable case of the unknown/any rule's protocol exception.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
