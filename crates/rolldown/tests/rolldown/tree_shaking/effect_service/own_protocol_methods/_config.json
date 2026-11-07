@@ -1,0 +1,10 @@
+{
+  "_comment": "Protocol methods an array or plain object defines itself (toJSON, toString) are called by host serialization, string conversion and Effect's log formatting: the service methods they read stay, the unread one goes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
