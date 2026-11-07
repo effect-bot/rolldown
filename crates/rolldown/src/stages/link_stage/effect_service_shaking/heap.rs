@@ -3793,6 +3793,54 @@ impl Analysis {
     sig_of.sort_by_key(|x| std::cmp::Reverse(x.1.0));
     let sig_of: Vec<String> =
       sig_of.iter().take(15).map(|(k, (n, vs))| format!("{n} in {vs} vars: {k}")).collect();
+    // The constraint-free variables with one copy: where their values come from and go.
+    let describe_var = |v: VarId| -> String {
+      if let Some((m, st)) = owner.get(&v) {
+        return format!("fn ({m}, {st})");
+      }
+      if let Some(f) = field_owner.get(&v) {
+        return format!("field {f}");
+      }
+      let cs: Vec<String> = self.vars[v]
+        .constraints
+        .iter()
+        .take(2)
+        .map(|c| format!("{c:?}").split([' ', '(', '{']).next().unwrap_or("").to_string())
+        .collect();
+      format!("model var {cs:?}")
+    };
+    let mut incoming: FxHashMap<VarId, Vec<VarId>> = FxHashMap::default();
+    for (src, var) in self.vars.iter_enumerated() {
+      for dst in &var.copies {
+        if self.vars[*dst].constraints.is_empty() && self.vars[*dst].copies.len() == 1 {
+          incoming.entry(*dst).or_default().push(src);
+        }
+      }
+    }
+    let mut relays: FxHashMap<String, (usize, usize)> = FxHashMap::default();
+    for (v, var) in self.vars.iter_enumerated() {
+      if !var.constraints.is_empty() || var.copies.len() != 1 || var.pts.len() < 50 {
+        continue;
+      }
+      if owner.contains_key(&v) || field_owner.contains_key(&v) {
+        continue;
+      }
+      let dst = *var.copies.iter().next().unwrap();
+      let mut froms: Vec<String> = incoming
+        .get(&v)
+        .map(|srcs| srcs.iter().take(3).map(|s| describe_var(*s)).collect())
+        .unwrap_or_default();
+      froms.sort();
+      froms.dedup();
+      let k = format!("from {froms:?} to {}", describe_var(dst));
+      let e = relays.entry(k).or_default();
+      e.0 += var.pts.len();
+      e.1 += 1;
+    }
+    let mut relays: Vec<_> = relays.into_iter().collect();
+    relays.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+    let relays: Vec<String> =
+      relays.iter().take(15).map(|(k, (n, vs))| format!("{n} in {vs} vars {k}")).collect();
     let mut by_field: Vec<_> = by_field.into_iter().collect();
     by_field.sort_by_key(|x| std::cmp::Reverse(x.1.0));
     let by_field: Vec<String> = std::iter::once(format!("{rest} in other model variables"))
@@ -3866,7 +3914,7 @@ impl Analysis {
     taints.sort_by_key(|x| std::cmp::Reverse(*x.1));
     let taints: Vec<String> = taints.iter().take(25).map(|(k, n)| format!("{n} x {k}")).collect();
     format!(
-      "other variables {sig_of:#?}; entries by field {by_field:#?}; entries by function {by_fn:#?}; entries by origin {by_origin:#?}; callbacks {cbs:?}; hot typed calls {hot:?}; fattest {fat_desc:?}; taints {taints:#?}; pools {:?}; writers {writers:#?}; {} Typed, slot entries {total}; vars over 100 entries {typed_vars}; largest slots {top:#?}",
+      "relays {relays:#?}; other variables {sig_of:#?}; entries by field {by_field:#?}; entries by function {by_fn:#?}; entries by origin {by_origin:#?}; callbacks {cbs:?}; hot typed calls {hot:?}; fattest {fat_desc:?}; taints {taints:#?}; pools {:?}; writers {writers:#?}; {} Typed, slot entries {total}; vars over 100 entries {typed_vars}; largest slots {top:#?}",
       &pools[..pools.len().min(10)],
       slots.len()
     )
@@ -4183,6 +4231,13 @@ impl Analysis {
         self.constrain(this, Constraint::Escape(Flavour::Ext, None));
       }
       self.seed(call.ret, self.top_ext);
+    } else if let ObjKind::Builtin { rule, .. } = self.objs[obj].kind
+      && self.rules[rule as usize].0.contains(".prototype.")
+    {
+      // A host prototype's own method (`Array.prototype.toString`, `Date.prototype.toISOString`)
+      // runs no program code the walk doesn't already reach: it walks the elements and fields
+      // itself. Its result is a primitive.
+      self.seed(call.ret, self.prim);
     } else {
       self.call(obj, call);
     }
