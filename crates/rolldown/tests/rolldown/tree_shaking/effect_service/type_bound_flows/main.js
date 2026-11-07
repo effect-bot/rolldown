@@ -9,7 +9,9 @@ import * as Option from 'effect/Option';
 // a handlers object whose `onSome` comes from its prototype, a handlers object
 // whose `onSome` is replaced by a store in a function that runs later, and an
 // Effect passed where Deferred.complete expects an Effect. Each read method
-// stays; each service's unread method is removed.
+// stays; each service's unread method is removed, except Inherited's: the class
+// whose prototype supplies `onSome` closes over that service, so it reaches class
+// code and its key keeps every method.
 const Handlers = Context.Service('test/BoundHandlers');
 const Inherited = Context.Service('test/BoundInherited');
 const Late = Context.Service('test/BoundLate');

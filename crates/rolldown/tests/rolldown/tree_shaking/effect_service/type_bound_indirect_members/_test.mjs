@@ -10,10 +10,12 @@ const kept = [
   ['viaAccessor', /(?<![.\w$])viaAccessor\s*[:(]/],
   ['viaAssigned', /(?<![.\w$])viaAssigned\s*[:(]/],
   ['viaStored', /(?<![.\w$])viaStored\s*[:(]/],
+  // The class accessor's body closes over the Accessor service, so the service reaches
+  // class code and its key keeps every method (Tim's class rule).
+  ['accessorUnused', /(?<![.\w$])accessorUnused\s*[:(]/],
 ];
 const removed = [
   ['getterUnused', /\bgetterUnused\b/],
-  ['accessorUnused', /\baccessorUnused\b/],
   ['assignedUnused', /\bassignedUnused\b/],
   ['storedUnused', /\bstoredUnused\b/],
 ];

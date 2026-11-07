@@ -11,10 +11,12 @@ const kept = [
   ['viaInherited', /(?<![.\w$])viaInherited\s*[:(]/],
   ['viaLate', /(?<![.\w$])viaLate\s*[:(]/],
   ['viaDeferred', /(?<![.\w$])viaDeferred\s*[:(]/],
+  // ProtoHandlers' method closes over the Inherited service, so the service reaches class
+  // code and its key keeps every method (Tim's class rule).
+  ['inheritedUnused', /(?<![.\w$])inheritedUnused\s*[:(]/],
 ];
 const removed = [
   ['handlersUnused', /\bhandlersUnused\b/],
-  ['inheritedUnused', /\binheritedUnused\b/],
   ['lateUnused', /\blateUnused\b/],
   ['deferredUnused', /\bdeferredUnused\b/],
 ];

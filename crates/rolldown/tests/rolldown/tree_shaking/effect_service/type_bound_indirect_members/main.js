@@ -7,7 +7,9 @@ import * as Option from 'effect/Option';
 // analysis sees indirectly: a getter installed with Object.defineProperty, a class
 // accessor, a prototype filled by Object.assign, and a store under a computed key
 // after the call is built. Each object must still reach Option.match, so the
-// method its onSome reads stays; each service's unread method is removed.
+// method its onSome reads stays; each service's unread method is removed, except
+// Accessor's: the class accessor closes over that service, so it reaches class
+// code and its key keeps every method.
 const Getter = Context.Service('test/MemberGetter');
 const Accessor = Context.Service('test/MemberAccessor');
 const Assigned = Context.Service('test/MemberAssigned');
