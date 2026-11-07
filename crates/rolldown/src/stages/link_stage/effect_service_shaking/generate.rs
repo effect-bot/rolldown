@@ -794,7 +794,59 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   // == functions and classes
 
+  /// `function () { return pipeArguments(this, arguments) }`, with `pipeArguments` bound to
+  /// `Pipeable.pipeArguments`, is the `pipe` method of `Pipeable.Prototype`: the
+  /// `effect:Pipeable.pipe` builtin, which applies its arguments in order to the receiver at each
+  /// call site. As a closure it would collect every receiver and every piped function once its
+  /// clones run out, and `pipeArguments` would apply each function to all of them.
+  fn pipe_forwarder(&mut self, f: &Function<'_>) -> Option<VarId> {
+    if f.r#async || f.generator || !f.params.items.is_empty() || f.params.rest.is_some() {
+      return None;
+    }
+    let body = f.body.as_ref()?;
+    if !body.directives.is_empty() {
+      return None;
+    }
+    let [Statement::ReturnStatement(r)] = body.statements.as_slice() else { return None };
+    let Some(Expression::CallExpression(c)) = &r.argument else { return None };
+    if c.optional {
+      return None;
+    }
+    let Expression::Identifier(callee) = &c.callee else { return None };
+    let [Argument::ThisExpression(_), Argument::Identifier(args)] = c.arguments.as_slice() else {
+      return None;
+    };
+    // `arguments` is the function's own arguments object, not a binding of that name.
+    let args_symbol =
+      args.reference_id.get().and_then(|id| self.m.scoping.get_reference(id).symbol_id());
+    if args.name.as_str() != "arguments" || args_symbol.is_some() {
+      return None;
+    }
+    let symbol =
+      callee.reference_id.get().and_then(|id| self.m.scoping.get_reference(id).symbol_id())?;
+    let canonical = self.sh.symbols.canonical_ref_for((self.m.module, symbol).into());
+    let bound = *self.sh.rule_symbols.get(&canonical)?;
+    let ObjKind::Builtin { rule, .. } = self.a.objs[bound].kind else { return None };
+    if self.a.rule_id("effect:Pipeable.pipeArguments") != Some(rule) {
+      return None;
+    }
+    let pipe = self.a.rule_id("effect:Pipeable.pipe")?;
+    let method = self.a.builtin(pipe, None, None);
+    let v = self.fresh();
+    self.seed(v, method);
+    // A named function expression's own name binding.
+    if let Some(name) = &f.id {
+      if let Some(bv) = self.binding_var(name) {
+        self.copy(v, bv);
+      }
+    }
+    Some(v)
+  }
+
   fn function(&mut self, f: &Function<'_>, kind_hint: FnKind) -> VarId {
+    if let Some(v) = self.pipe_forwarder(f) {
+      return v;
+    }
     let kind = match (f.r#async, f.generator) {
       (true, true) => FnKind::AsyncGenerator,
       (true, false) => FnKind::Async,

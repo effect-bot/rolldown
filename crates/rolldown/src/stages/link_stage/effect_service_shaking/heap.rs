@@ -1461,12 +1461,7 @@ impl Analysis {
           }
         }
         if matches!(self.objs[obj].kind, ObjKind::Closure(_)) {
-          if let Some(id) = self.rule_id(match name.as_str() {
-            "call" => "Function.prototype.call",
-            "apply" => "Function.prototype.apply",
-            "bind" => "Function.prototype.bind",
-            _ => "",
-          }) {
+          if let Some(id) = function_prototype_rule(self, name) {
             let b = self.method(id, obj);
             self.seed(dst, b);
             return;
@@ -1532,6 +1527,13 @@ impl Analysis {
         }
       }
       ObjKind::Builtin { .. } => {
+        // A builtin is a function too: `.call`, `.apply` and `.bind` call it with the receiver
+        // and arguments they are given, as they do a closure (`builtin.call(other, f)`).
+        if let Some(id) = function_prototype_rule(self, name) {
+          let b = self.method(id, obj);
+          self.seed(dst, b);
+          return;
+        }
         self.read_field(obj, name, dst);
       }
       ObjKind::Key { .. }
@@ -2692,4 +2694,14 @@ pub fn model_kind_name(kind: &ObjKind) -> &'static str {
     ObjKind::Prim | ObjKind::Num(_) => "Prim",
     _ => "",
   }
+}
+
+/// The rule of `Function.prototype.call`, `apply` or `bind`, for a read of `name` on a callable.
+fn function_prototype_rule(a: &Analysis, name: &str) -> Option<u16> {
+  a.rule_id(match name {
+    "call" => "Function.prototype.call",
+    "apply" => "Function.prototype.apply",
+    "bind" => "Function.prototype.bind",
+    _ => return None,
+  })
 }
