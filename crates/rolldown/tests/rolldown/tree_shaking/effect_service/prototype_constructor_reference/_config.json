@@ -1,5 +1,5 @@
 {
-  "_comment": "A prototype's `constructor` property refers back to its function or class: a constructor recovered through `F.prototype.constructor` or `instance.constructor` builds instances whose service methods are read, so those stay and the unread one is removed.",
+  "_comment": "A prototype's `constructor` property refers back to its function or class: a constructor recovered through `F.prototype.constructor` or `instance.constructor` builds instances whose service methods are read. Under the class rule (a service that reaches class code bails its key; class code is every class body that is not a key class, and every function nested in one) the class constructor's parameter holds the service, so its key bails: every method stays, including the unread one, and the bundle runs. Function constructors are not class code; this key bails through the class.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

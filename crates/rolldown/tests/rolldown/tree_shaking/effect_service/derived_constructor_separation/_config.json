@@ -1,5 +1,5 @@
 {
-  "_comment": "A derived class without its own constructor runs the base constructor, which writes `this.value` at two `new` sites; the instance holding plain data is compared structurally, the one holding the service reads one method: that method stays, the unread one is removed.",
+  "_comment": "A derived class without its own constructor runs the base constructor, which writes `this.value` at two `new` sites; the instance holding plain data is compared structurally, the one holding the service reads one method. Under the class rule (a service that reaches class code bails its key; class code is every class body that is not a key class, and every function nested in one) the base constructor's parameter holds the service, so every method stays, including the unread one, and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

@@ -1,0 +1,10 @@
+{
+  "_comment": "Guard: a service held in a plain object is read through a getter installed with Object.defineProperty, which reads it through `this`. The getter is an ordinary function and the object inherits from no class, so the service reaches no class code and the class rule does not fire: the method the program calls stays, the unread one is removed and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

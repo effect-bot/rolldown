@@ -1,5 +1,5 @@
 {
-  "_comment": "A class instance (`new FsImpl()`) provided as the service, one method called. Class methods are a later increment: behaviour must be unchanged and the called method kept; no removal is asserted.",
+  "_comment": "A class instance (`new FsImpl()`) provided as the service, one method called. Under the class rule (a service that reaches class code bails its key; class code is every class body that is not a key class, and every function nested in one) the service's methods run with it as `this`, so its key bails: both methods stay and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

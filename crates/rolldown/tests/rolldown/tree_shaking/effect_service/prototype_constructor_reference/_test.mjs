@@ -2,19 +2,22 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 
-// The program asserts its own output when imported.
-await import('./dist/main.js');
-
-// The methods read through the recovered constructors are kept; the unread method is removed.
+// Names are checked before the program runs, so each case is reported on its
+// own rather than only as the bundle's first failure. The service reaches class
+// code, so its key bails: every method stays.
 const code = fs.readFileSync(path.join(import.meta.dirname, 'dist/main.js'), 'utf8');
+const failures = [];
 for (const name of [
   'functionPrototypeUsed',
   'functionInstanceUsed',
   'classPrototypeUsed',
   'classInstanceUsed',
+  'unusedConstructorReference',
 ]) {
-  assert.match(code, new RegExp(`\\b${name}\\b`), `${name} should be kept`);
+  if (!new RegExp(`(?<![.\\w$])${name}\\s*[:(]`).test(code))
+    failures.push(`${name} should be kept`);
 }
-for (const name of ['unusedConstructorReference']) {
-  assert.doesNotMatch(code, new RegExp(`\\b${name}\\b`), `${name} should be removed`);
-}
+assert.deepStrictEqual(failures, []);
+
+// The program asserts its own output when imported.
+await import('./dist/main.js');

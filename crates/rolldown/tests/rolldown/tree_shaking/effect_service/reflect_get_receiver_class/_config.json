@@ -1,0 +1,10 @@
+{
+  "_comment": "Boundary guard: `Reflect.get(C.prototype, 'x', { value: store })` runs the class getter `x` with the plain object as `this`, so the service reaches class code through the receiver argument. Under the class rule (a service that reaches class code bails its key) every method stays, including the unread one, and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

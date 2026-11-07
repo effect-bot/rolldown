@@ -1,5 +1,5 @@
 {
-  "_comment": "`super(...)` hands the parent constructor its own arguments, not the `new` call's: the service passed only through `super(store)` is written to `this` by the base constructor, so the method read on it stays and the unread one is removed.",
+  "_comment": "`super(...)` hands the parent constructor its own arguments, not the `new` call's: the service passed only through `super(store)` is written to `this` by the base constructor. Under the class rule (a service that reaches class code bails its key; class code is every class body that is not a key class, and every function nested in one) the constructors' parameters reach the service, so every method stays, including the unread one, and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

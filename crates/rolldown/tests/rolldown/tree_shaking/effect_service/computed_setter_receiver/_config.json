@@ -1,5 +1,5 @@
 {
-  "_comment": "A class setter with a computed name receives what is written under that name on an inheriting instance, for a name computed at run time and for a symbol; the methods read on what it stores stay, the unread one is removed.",
+  "_comment": "A class setter with a computed name receives what is written under that name on an inheriting instance, for a name computed at run time and for a symbol. Under the class rule (a service that reaches class code bails its key; class code is every class body that is not a key class, and every function nested in one) the service reaches the setters, so every method stays, including the unread one, and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

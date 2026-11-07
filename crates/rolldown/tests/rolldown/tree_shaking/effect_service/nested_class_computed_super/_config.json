@@ -1,5 +1,5 @@
 {
-  "_comment": "A nested class's computed member names are evaluated in the enclosing method, so `super` there refers to the enclosing class's parent, not the nested class's: the service read while computing the name stays, the unread one is removed.",
+  "_comment": "A nested class's computed member names are evaluated in the enclosing method, so `super` there refers to the enclosing class's parent, not the nested class's. Under the class rule (a service that reaches class code bails its key; class code is every class body that is not a key class, and every function nested in one) the service reaches the static methods, so every method stays, including the unread one, and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true
