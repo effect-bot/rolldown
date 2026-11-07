@@ -722,7 +722,9 @@ pub fn register(a: &mut Analysis) {
     a.copy(v, c.ret);
   });
   a.rule("promise.resolve", |a, c| {
-    let value = c_data(c);
+    // The value it settles: the builtin's own data variable (the promise's value, or an adopted
+    // thenable's settlement), not the memoised call's copy of it.
+    let value = a.builtin_data(c).unwrap_or_else(|| c_data(c));
     let v = arg(a, c, 0);
     // Resolving with a thenable adopts it (`AwaitOf` calls its `then`).
     let settled = await_of(a, v);

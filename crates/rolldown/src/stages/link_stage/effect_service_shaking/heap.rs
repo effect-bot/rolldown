@@ -684,6 +684,9 @@ pub struct Analysis {
   ignored_pool: Option<VarId>,
   prim_arg: Option<VarId>,
   inspect_args: Option<VarId>,
+  /// Each adopted object's settle variable: what its `then` resolves with (`adopt`); for a
+  /// summary, what awaiting the values it wraps gives.
+  settled_by: FxHashMap<ObjId, VarId>,
   /// Objects the generator proves are allocated at most once at run time (`Gen::alloc`).
   pub once_allocated: FxHashSet<ObjId>,
   /// `ServiceFree` objects waiting for the solve to settle (`service_free`).
@@ -827,6 +830,7 @@ impl Analysis {
       inspect_args: None,
       pending_service_free: vec![],
       once_allocated: FxHashSet::default(),
+      settled_by: FxHashMap::default(),
       then_args: None,
       prim_ty: None,
       hash_pool: None,
@@ -921,6 +925,15 @@ impl Analysis {
     target: Option<u16>,
   ) -> ObjId {
     self.alloc(ObjKind::Builtin { rule, data, arity, this: None, target }, None)
+  }
+
+  /// The data variable of the builtin being called. A memoised rule call sees a fresh copy of
+  /// it as `this`, so a rule that writes into its data uses this instead.
+  pub fn builtin_data(&self, call: &Call) -> Option<VarId> {
+    match call.builtin.map(|b| &self.objs[b].kind) {
+      Some(ObjKind::Builtin { data, .. }) => *data,
+      _ => None,
+    }
   }
 
   pub fn builtin_arity(&self, call: &Call) -> Option<u32> {
@@ -1459,8 +1472,26 @@ impl Analysis {
       Constraint::AwaitOf(dst) => match self.objs[obj].kind {
         ObjKind::Promise { value } => self.copy(value, *dst),
         ObjKind::Object | ObjKind::Closure(_) | ObjKind::Class { .. } => {
+          // The object itself (awaiting a non-thenable yields it), and what its `then`
+          // resolves with.
           self.seed(*dst, obj);
-          self.adopt(obj);
+          let settled = self.adopt(obj);
+          self.copy(settled, *dst);
+        }
+        // A summary may stand for a thenable: what it wraps is awaited too, once per summary
+        // (`settled_by`), and every await of the summary receives that.
+        ObjKind::Wrap(inner) => {
+          self.seed(*dst, obj);
+          let settled = match self.settled_by.get(&obj) {
+            Some(s) => *s,
+            None => {
+              let s = self.var();
+              self.settled_by.insert(obj, s);
+              self.constrain(inner, Constraint::AwaitOf(s));
+              s
+            }
+          };
+          self.copy(settled, *dst);
         }
         _ => self.seed(*dst, obj),
       },
@@ -2365,15 +2396,23 @@ impl Analysis {
   }
 
   /// Host adoption of an object that may be a thenable (an `await`, an async function's return,
-  /// a promise resolved with it): the host calls its `then` with a resolve function, which adopts
-  /// a thenable it receives in turn, and a reject function, whose argument nothing reads. Every
-  /// adoption shares one call site and one resolve function (`then_args`): what `then` reaches
-  /// runs, while the awaited value stays the object itself, as before.
-  fn adopt(&mut self, obj: ObjId) {
+  /// a promise resolved with it): the host calls its `then` with a resolve function and a reject
+  /// function, whose argument nothing reads. Returns the object's settle variable: what its
+  /// `then` resolves with, which every adoption of the object receives. The resolve function is
+  /// a `promise.resolve` builtin carrying that variable, so resolving with a thenable adopts it in
+  /// turn and its settlement flows on. Once per object (`settled_by`); every adoption shares one
+  /// call site, so a `then` function's body is shared by the objects that have it, and a value
+  /// one of them resolves with may reach the others' settlements (imprecise, sound).
+  fn adopt(&mut self, obj: ObjId) -> VarId {
+    if let Some(s) = self.settled_by.get(&obj) {
+      return *s;
+    }
+    let settled = self.var();
+    self.settled_by.insert(obj, settled);
     let this = self.holder(obj);
     let then = self.var();
     self.constrain(this, Constraint::Load { key: Key::Name(ArcStr::from("then")), dst: then });
-    let resolve = self.then_args();
+    let resolve = self.resolve_function(settled);
     let reject = self.prim_arg();
     let ret = self.var();
     let call = Call {
@@ -2385,6 +2424,7 @@ impl Analysis {
       builtin: None,
     };
     self.constrain(then, Constraint::Call(Box::new(call)));
+    settled
   }
 
   /// `ServiceFree`: a primitive flows on; a summary (which may stand for a service) becomes an
