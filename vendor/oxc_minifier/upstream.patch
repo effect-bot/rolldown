@@ -1,0 +1,227 @@
+diff --git a/crates/oxc_minifier/src/peephole/minimize_statements.rs b/crates/oxc_minifier/src/peephole/minimize_statements.rs
+index 86cdeac0..01cefa39 100644
+--- a/crates/oxc_minifier/src/peephole/minimize_statements.rs
++++ b/crates/oxc_minifier/src/peephole/minimize_statements.rs
+@@ -107,6 +107,8 @@ impl<'a> PeepholeOptimizations {
+             }
+         }
+ 
++        Self::remove_declarations_orphaned_this_pass(&mut new_stmts, ctx);
++
+         // Drop a trailing unconditional jump statement if applicable
+         if let Some(last_stmt) = new_stmts.last()
+             && Self::can_remove_termination_statement(last_stmt, ctx)
+@@ -117,6 +119,67 @@ impl<'a> PeepholeOptimizations {
+         *stmts = new_stmts;
+     }
+ 
++    /// Revisit the block's declarations once, last to first, and remove the
++    /// ones whose every reference was dropped earlier in this pass.
++    ///
++    /// The forward walk above decides each declaration while every later
++    /// statement still holds its references. In a dead chain whose links call
++    /// earlier links (`const a = () => 0; const b = () => a();`) it can only
++    /// remove the last link, so a pass removed one link and a chain longer
++    /// than the fixed-point iteration guard tripped it. Walking backwards lets
++    /// each removal orphan the link declared before it, so the chain goes in
++    /// one pass.
++    ///
++    /// Only declarations that leave no code behind are handled here: function
++    /// declarations, and declarators whose initializer is absent or free of
++    /// side effects. Anything else waits for the next pass's forward walk.
++    fn remove_declarations_orphaned_this_pass(
++        stmts: &mut ArenaVec<'a, Statement<'a>>,
++        ctx: &mut TraverseCtx<'a>,
++    ) {
++        if ctx.state.pass_changes.removed_references.is_empty()
++            || !Self::can_remove_unused_declarators(ctx)
++        {
++            return;
++        }
++        let mut removed_statement = false;
++        for stmt in stmts.iter_mut().rev() {
++            match stmt {
++                Statement::FunctionDeclaration(_) => {
++                    Self::remove_unused_function_declaration(stmt, ctx);
++                    removed_statement |= matches!(stmt, Statement::EmptyStatement(_));
++                }
++                Statement::VariableDeclaration(var_decl) => {
++                    let kind = var_decl.kind;
++                    let mut index = var_decl.declarations.len();
++                    while index > 0 {
++                        index -= 1;
++                        let decl = &var_decl.declarations[index];
++                        if Self::should_remove_unused_declarator(decl, kind, ctx)
++                            && !decl.init.as_ref().is_some_and(|init| {
++                                Self::has_side_effects_or_preserved_iife(init, ctx)
++                            })
++                        {
++                            let decl = var_decl.declarations.remove(index);
++                            // Walks the binding, type annotation and init, and
++                            // records the change for the fixed-point loop.
++                            ctx.drop_variable_declarator(&decl);
++                        }
++                    }
++                    removed_statement |= var_decl.declarations.is_empty();
++                }
++                _ => {}
++            }
++        }
++        if removed_statement {
++            stmts.retain(|stmt| match stmt {
++                Statement::EmptyStatement(_) => false,
++                Statement::VariableDeclaration(var_decl) => !var_decl.declarations.is_empty(),
++                _ => true,
++            });
++        }
++    }
++
+     /// Some parsers cannot parse long conditional expressions.
+     /// See <https://bugzilla.mozilla.org/show_bug.cgi?id=2033215>
+     fn conditional_expression_count_exceeded(expr: &Expression<'a>) -> bool {
+diff --git a/crates/oxc_minifier/src/peephole/remove_unused_declaration.rs b/crates/oxc_minifier/src/peephole/remove_unused_declaration.rs
+index c43075fb..8d047b17 100644
+--- a/crates/oxc_minifier/src/peephole/remove_unused_declaration.rs
++++ b/crates/oxc_minifier/src/peephole/remove_unused_declaration.rs
+@@ -2,7 +2,7 @@ use super::{PeepholeOptimizations, remove_unused_expression::ClassRemovability};
+ use crate::{CompressOptionsUnused, TraverseCtx};
+ use oxc_ast::ast::*;
+ use oxc_ecmascript::constant_evaluation::{DetermineValueType, ValueType};
+-use oxc_syntax::symbol::SymbolId;
++use oxc_syntax::{reference::ReferenceId, symbol::SymbolId};
+ 
+ impl<'a> PeepholeOptimizations {
+     pub(super) fn can_remove_unused_declarators(ctx: &TraverseCtx<'a>) -> bool {
+@@ -16,9 +16,30 @@ impl<'a> PeepholeOptimizations {
+     /// pair `is_implicitly_observable` with their own count thresholds,
+     /// because some runtime semantics can observe a binding independently of
+     /// resolved references.
++    ///
++    /// A reference dropped earlier in the current pass is still listed until
++    /// the pass is flushed, but its node is already gone for good (the
++    /// over-prune guard in `compression_pass` checks this). Counting it as
++    /// removed lets one pass remove a whole dead chain such as
++    /// `const a = () => 0; const b = () => a();` instead of one link per pass.
+     pub(super) fn symbol_is_unused_by_count(symbol_id: SymbolId, ctx: &TraverseCtx<'a>) -> bool {
+         !ctx.state.symbols.is_implicitly_observable(symbol_id)
+-            && ctx.scoping().symbol_is_unused(symbol_id)
++            && Self::live_reference_ids(symbol_id, ctx).next().is_none()
++    }
++
++    /// Resolved references to `symbol_id` that were not dropped earlier in
++    /// the current pass. References minted this pass lie beyond the bitset's
++    /// capacity and always count as live.
++    fn live_reference_ids(
++        symbol_id: SymbolId,
++        ctx: &TraverseCtx<'a>,
++    ) -> impl Iterator<Item = ReferenceId> {
++        let removed = &ctx.state.pass_changes.removed_references;
++        ctx.scoping()
++            .get_resolved_reference_ids(symbol_id)
++            .iter()
++            .copied()
++            .filter(move |reference_id| !removed.contains(reference_id.index()))
+     }
+ 
+     /// Function declarations additionally consume graph deadness, allowing
+@@ -58,9 +79,9 @@ impl<'a> PeepholeOptimizations {
+             return false;
+         }
+ 
+-        ctx.scoping().get_resolved_references(symbol_id).all(|reference| {
++        Self::live_reference_ids(symbol_id, ctx).all(|reference_id| {
+             ctx.scoping()
+-                .scope_ancestors(reference.scope_id())
++                .scope_ancestors(ctx.scoping().get_reference(reference_id).scope_id())
+                 .any(|scope_id| scope_id == function_scope_id)
+         })
+     }
+diff --git a/crates/oxc_minifier/tests/peephole/remove_unused_declaration.rs b/crates/oxc_minifier/tests/peephole/remove_unused_declaration.rs
+index cb6fe741..eb5499b3 100644
+--- a/crates/oxc_minifier/tests/peephole/remove_unused_declaration.rs
++++ b/crates/oxc_minifier/tests/peephole/remove_unused_declaration.rs
+@@ -661,13 +661,13 @@ fn recursive_function_with_var_redeclaration() {
+ #[test]
+ fn recursive_function_var_redeclaration_converges_on_count_pass() {
+     let options = CompressOptions::smallest();
+-    test_options_with_iterations("function f() { f() } var f;", "", 2, &options);
++    test_options_with_iterations("function f() { f() } var f;", "", 1, &options);
+ 
+     // The first pass removes the function using published graph deadness.
+-    // Its body reference is pruned only at the following flush, so a capped
+-    // run conservatively retains the sibling `var` declaration.
++    // Its body reference was dropped earlier in that pass, so the sibling
++    // `var` declaration goes in the same pass even when the run is capped.
+     let options = CompressOptions { max_iterations: Some(0), ..CompressOptions::smallest() };
+-    test_options_once_with_iterations("function f() { f() } var f;", "var f;", 0, &options);
++    test_options_once_with_iterations("function f() { f() } var f;", "", 0, &options);
+ }
+ 
+ // ---- Export observability ----
+@@ -1117,3 +1117,66 @@ fn remove_unused_import_defer_statements() {
+         },
+     );
+ }
++
++fn dead_chain(links: usize, link: impl Fn(usize) -> String) -> String {
++    (0..links).map(link).collect::<Vec<_>>().join("\n")
++}
++
++// A dead chain of declarators goes in one pass whichever way its links
++// point. A chain longer than the fixed-point guard used to trip it.
++#[test]
++fn remove_dead_declarator_chain_in_one_pass() {
++    let options = CompressOptions::smallest();
++    let backward = |i: usize| {
++        if i == 0 {
++            "const f0 = () => g();".to_string()
++        } else {
++            format!("const f{i} = () => f{}();", i - 1)
++        }
++    };
++    test_options_with_iterations(&dead_chain(12, backward), "", 1, &options);
++    test_options_with_iterations(&dead_chain(60, backward), "", 1, &options);
++    let forward = |i: usize| {
++        if i == 59 {
++            "let f59 = () => g();".to_string()
++        } else {
++            format!("let f{i} = () => f{}();", i + 1)
++        }
++    };
++    test_options_with_iterations(&dead_chain(60, forward), "", 1, &options);
++    let methods = |i: usize| {
++        if i == 0 {
++            "const o0 = { m() { g() } };".to_string()
++        } else {
++            format!("const o{i} = {{ m() {{ o{}.m() }} }};", i - 1)
++        }
++    };
++    test_options_with_iterations(&dead_chain(13, methods), "", 1, &options);
++    let defaults = |i: usize| {
++        if i == 0 {
++            "const f0 = () => g();".to_string()
++        } else {
++            format!("const f{i} = (a = f{}()) => a;", i - 1)
++        }
++    };
++    test_options_with_iterations(&dead_chain(13, defaults), "", 1, &options);
++    let mixed = |i: usize| match i {
++        0 => "function f0() { g() }".to_string(),
++        _ if i % 2 == 1 => format!("var f{i} = function () {{ f{}() }};", i - 1),
++        _ => format!("function f{i}() {{ f{}() }}", i - 1),
++    };
++    test_options_with_iterations(&dead_chain(13, mixed), "", 1, &options);
++}
++
++// The backward sweep leaves declarations with side-effecting initializers to
++// the next pass's forward walk, which keeps the side effects.
++#[test]
++fn dead_declarator_chain_keeps_side_effects() {
++    let source = "const a = () => g(); const b = (a(), () => a()); const c = () => b();";
++    test_options(source, "const a = () => g(); a();", &CompressOptions::dce());
++    test_smallest(source, "g();");
++    test_same_options(
++        "const a = () => g(); const b = () => a(); export const c = () => b();",
++        &CompressOptions::dce(),
++    );
++}

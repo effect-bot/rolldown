@@ -1821,8 +1821,6 @@ dependencies = [
 [[package]]
 name = "oxc_minifier"
 version = "0.157.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c06137db8eb391b3388094a7e47072764ed2be0b08acd3ecaef2ac68c825b3a"
 dependencies = [
  "cow-utils",
  "itoa",
