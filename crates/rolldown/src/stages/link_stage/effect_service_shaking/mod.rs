@@ -278,7 +278,7 @@ impl LinkStage<'_> {
             let file = self.module_table[module].id().as_str();
             let file = file.rsplit_once("/dist/").map_or(file, |(_, f)| f).to_string();
             // Diagnostic only: leave matching constructor modules type-modelled.
-            if std::env::var("ROLLDOWN_ESS_SKIP_CTOR")
+            if std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_SKIP_CONSTRUCTOR")
               .is_ok_and(|v| !v.is_empty() && file.contains(v.as_str()))
             {
               continue;

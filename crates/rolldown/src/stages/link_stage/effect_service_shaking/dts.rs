@@ -103,6 +103,9 @@ pub struct RetShape {
   pub unknown: bool,
 }
 
+/// What `Dts::returned_call` reads: bounds, return shape, generic positions and callback masks.
+pub type ReturnedCall = (Bounds, RetShape, (Vec<bool>, bool), Vec<u8>);
+
 /// The bounds of one exported function: a type per parameter, the elements of its rest
 /// parameter, and the return type (`None` is open).
 #[derive(Clone, Debug, Default)]
@@ -157,6 +160,8 @@ struct Sig<'a> {
   params: Vec<(Option<&'a TSType<'a>>, bool)>,
   ret: Option<&'a TSType<'a>>,
   tparams: Vec<String>,
+  /// The constraint of each type parameter declared on this signature, by name.
+  constraints: Vec<(String, &'a TSType<'a>)>,
   file: usize,
 }
 
@@ -346,6 +351,120 @@ impl Dts {
     Some(out)
   }
 
+  /// For a call with `nparams` arguments: per parameter, which parameters of the callbacks its
+  /// declared type holds (directly, in a union, or as members of an options type) take a value
+  /// of a type parameter, as a bit mask over the first 8. A callback parameter of a concrete
+  /// type (`(response: HttpClientResponse) => …`) receives no value the call was handed.
+  /// All bits are set where the type is open or a type parameter.
+  pub fn callback_masks(&self, path: &Path, name: &str, nparams: usize) -> Option<Vec<u8>> {
+    let start = std::time::Instant::now();
+    let sigs = self.signatures(path, name)?;
+    let out = self.callback_masks_of(&sigs, nparams);
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    Some(out)
+  }
+
+  fn callback_masks_of(&self, sigs: &[Sig<'_>], nparams: usize) -> Vec<u8> {
+    let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
+    let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
+    let mut masks = vec![0u8; nparams];
+    for sig in matching {
+      for (i, mask) in masks.iter_mut().enumerate() {
+        let t = match sig.params.get(i).or_else(|| sig.params.last().filter(|(_, r)| *r)) {
+          Some((t, _)) => *t,
+          None => {
+            *mask = 0xFF;
+            continue;
+          }
+        };
+        *mask |= match t {
+          None => 0xFF,
+          Some(t) => self.mask_of(sig.file, t, &sig.tparams, &sig.constraints, 0),
+        };
+      }
+    }
+    masks
+  }
+
+  fn mask_of(
+    &self,
+    f: usize,
+    t: &TSType<'_>,
+    tp: &[String],
+    cs: &[(String, &TSType<'_>)],
+    depth: u32,
+  ) -> u8 {
+    if depth > 6 {
+      return 0xFF;
+    }
+    match t {
+      TSType::TSFunctionType(ft) => {
+        let mut m = 0u8;
+        for (j, p) in ft.params.items.iter().take(8).enumerate() {
+          let generic = p.type_annotation.as_ref().is_none_or(|a| {
+            self.mentions_tparam(f, &a.type_annotation, tp)
+              || self.classify(f, &a.type_annotation, tp, 0).open
+          });
+          if generic {
+            m |= 1 << j;
+          }
+        }
+        if ft.params.rest.is_some() {
+          m |= !((1u8 << ft.params.items.len().min(7)) - 1);
+        }
+        m
+      }
+      TSType::TSParenthesizedType(p) => self.mask_of(f, &p.type_annotation, tp, cs, depth + 1),
+      TSType::TSUnionType(u) => {
+        u.types.iter().fold(0, |m, x| m | self.mask_of(f, x, tp, cs, depth + 1))
+      }
+      TSType::TSIntersectionType(u) => {
+        u.types.iter().fold(0, |m, x| m | self.mask_of(f, x, tp, cs, depth + 1))
+      }
+      TSType::TSTypeLiteral(lit) => lit.members.iter().fold(0, |m, member| {
+        m | match member {
+          TSSignature::TSPropertySignature(p) => p
+            .type_annotation
+            .as_ref()
+            .map_or(0, |a| self.mask_of(f, &a.type_annotation, tp, cs, depth + 1)),
+          TSSignature::TSIndexSignature(ix) => {
+            self.mask_of(f, &ix.type_annotation.type_annotation, tp, cs, depth + 1)
+          }
+          TSSignature::TSMethodSignature(_) => 0xFF,
+          _ => 0,
+        }
+      }),
+      TSType::TSTypeReference(r) => {
+        // A type parameter, or a named type the callbacks of which aren't read here: open,
+        // unless the type mentions no type parameter and no function at all.
+        if let TSTypeName::IdentifierReference(id) = &r.type_name {
+          if tp.iter().any(|p| p == id.name.as_str()) {
+            // A value of a type parameter is called the way its constraint declares (effect's
+            // code sees only the constraint); without one, any way.
+            return match cs.iter().find(|(n, _)| n == id.name.as_str()) {
+              Some((_, c)) => self.mask_of(f, c, tp, cs, depth + 1),
+              None => 0xFF,
+            };
+          }
+        }
+        let c = self.classify(f, t, tp, depth + 1);
+        if c.prim_only() || (!c.func && !c.open && !self.mentions_tparam(f, t, tp)) {
+          0
+        } else if self.mentions_tparam(f, t, tp) || c.open {
+          0xFF
+        } else {
+          // A concrete named type that holds functions (an interface of handlers): their
+          // parameters are concrete too.
+          0
+        }
+      }
+      _ => {
+        let c = self.classify(f, t, tp, depth + 1);
+        if c.open || self.mentions_tparam(f, t, tp) { 0xFF } else { 0 }
+      }
+    }
+  }
+
   fn generic_of_sigs(&self, sigs: &[Sig<'_>], nparams: usize) -> (Vec<bool>, bool) {
     let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
     let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
@@ -411,7 +530,7 @@ impl Dts {
     name: &str,
     nparams: usize,
     nargs: usize,
-  ) -> Option<(Bounds, RetShape, (Vec<bool>, bool))> {
+  ) -> Option<ReturnedCall> {
     let start = std::time::Instant::now();
     let inner = self.returned_sigs(path, name, nparams);
     let out = inner.map(|inner| {
@@ -426,7 +545,7 @@ impl Dts {
           None => shape.unknown = true,
         }
       }
-      (bounds, shape, self.generic_of_sigs(&inner, nargs))
+      (bounds, shape, self.generic_of_sigs(&inner, nargs), self.callback_masks_of(&inner, nargs))
     });
     self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
     out
@@ -1381,7 +1500,15 @@ fn sig_of<'a>(
   let tparams = tps
     .map(|d| d.params.iter().map(|p| p.name.name.as_str().to_string()).collect())
     .unwrap_or_default();
-  Sig { params: ps, ret, tparams, file }
+  let constraints = tps
+    .map(|d| {
+      d.params
+        .iter()
+        .filter_map(|p| p.constraint.as_ref().map(|c| (p.name.name.as_str().to_string(), c)))
+        .collect()
+    })
+    .unwrap_or_default();
+  Sig { params: ps, ret, tparams, constraints, file }
 }
 
 fn index<'a>(program: &'a Program<'a>, dir: PathBuf, file: Option<String>) -> Index<'a> {

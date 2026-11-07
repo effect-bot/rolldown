@@ -826,6 +826,22 @@ pub fn register(a: &mut Analysis) {
   a.rule("effect:Context.Reference", |a, c| {
     let strings = arg(a, c, 0);
     let key = a.site_obj(c.site, 2, |_| ObjKind::Key { strings, reference: true });
+    // A Reference is never pruned (`prune::plan`); knowing it during the solve keeps its values
+    // out of the admission test (`Analysis::may_hold`).
+    if let ObjKind::Key { strings, .. } = a.objs[key].kind {
+      let names: Vec<ArcStr> = a
+        .pts(strings)
+        .iter()
+        .filter_map(|o| match &a.objs[*o].kind {
+          ObjKind::Str(n) => Some(n.clone()),
+          _ => None,
+        })
+        .collect();
+      for n in names {
+        a.never_prune.insert(n);
+      }
+      a.constrain(strings, Constraint::BailKeys);
+    }
     let kv = a.var();
     a.seed(kv, key);
     if c.args.len() > 1 {
