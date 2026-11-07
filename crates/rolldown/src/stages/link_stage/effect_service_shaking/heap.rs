@@ -5438,7 +5438,9 @@ impl Analysis {
     // the services reached only through them (issue, "Code the pass can't see").
     let external = flavour == Flavour::Ext;
     match self.objs[obj].kind.clone() {
-      ObjKind::Object | ObjKind::Array | ObjKind::Class { .. } => {
+      // A function is a holder too: its own properties go with it, then its body runs with
+      // unknown arguments (`escape_fn`).
+      ObjKind::Object | ObjKind::Array | ObjKind::Class { .. } | ObjKind::Closure(_) => {
         if external {
           self.objs[obj].demand.all();
         }
@@ -5469,8 +5471,10 @@ impl Analysis {
             self.constrain(h, Constraint::Escape(flavour, site));
           }
         }
+        if let ObjKind::Closure(f) = self.objs[obj].kind {
+          self.escape_fn(f, flavour, site);
+        }
       }
-      ObjKind::Closure(f) => self.escape_fn(f, flavour, site),
       // A stand-in's values escape themselves (`apply` hands the escape to `held_var`).
       ObjKind::Typed { .. } if self.is_stand_in(obj) => {}
       ObjKind::Promise { value } | ObjKind::Wrap(value) | ObjKind::Typed { slot: value, .. } => {
