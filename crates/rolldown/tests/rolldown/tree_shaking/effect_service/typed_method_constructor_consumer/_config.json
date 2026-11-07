@@ -1,0 +1,10 @@
+{
+  "_comment": "A constructor key read only by type-modelled code the program reaches through a method of an export (`HttpBody.file.call`): that code still counts as a reader, so the FileSystem service keeps `stat`.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
