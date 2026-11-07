@@ -1,5 +1,5 @@
 {
-  "_comment": "An async function returns a service that is a thenable, so the host adopts it and calls its then with resolve functions. then resolves with a nested thenable, adopted in turn, whose then calls another method of the service: that method stays, the unread one is removed and the bundle runs. Guards that host adoption runs then, not only reads it.",
+  "_comment": "An async function returns a service that is a thenable, so the host adopts it and calls its then, which resolves with a nested thenable whose then calls another method of the service. Under the hand-written-thenable rule (adopting a non-native-Promise object with a callable then bails every service it can reach) the key bails, so every method stays, including the one nothing reads, and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

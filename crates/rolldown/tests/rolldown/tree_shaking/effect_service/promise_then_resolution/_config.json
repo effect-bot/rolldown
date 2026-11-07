@@ -1,5 +1,5 @@
 {
-  "_comment": "Promise resolution of a service (returned from an async function and from Effect.runPromise) reads `then`, which the program observes being called: `then` stays, the uncalled method is removed.",
+  "_comment": "A service with its own then is resolved by a Promise twice (returned from an async function, and as the success of Effect.runPromise), and the program observes then being called. A service that defines its own then bails its key, so every method stays, including then and the one nothing reads, and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

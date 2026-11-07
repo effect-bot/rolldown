@@ -2,12 +2,18 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 
-// Every name is checked before the program runs, so a failure to run does not
-// hide which method went.
+// Names are checked before the program runs, so each case is reported on its
+// own rather than only as the bundle's first failure. The service reaches a
+// hand-written thenable that is adopted, so its key bails: every method stays.
 const code = fs.readFileSync(path.join(import.meta.dirname, 'dist/main.js'), 'utf8');
+const kept = [
+  ['resolvedUsed', /(?<![.\w$])resolvedUsed\s*[:(]/],
+  ['resolvedUnused', /(?<![.\w$])resolvedUnused\s*[:(]/],
+];
 const failures = [];
-if (!/(?<![.\w$])resolvedUsed\s*:/.test(code)) failures.push('resolvedUsed should be kept');
-if (/\bresolvedUnused\b/.test(code)) failures.push('resolvedUnused should be removed');
+for (const [name, pattern] of kept) {
+  if (!pattern.test(code)) failures.push(`${name} should be kept`);
+}
 assert.deepStrictEqual(failures, []);
 
 // The program asserts its own output when imported.

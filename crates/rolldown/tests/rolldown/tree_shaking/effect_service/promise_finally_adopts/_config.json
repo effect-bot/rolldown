@@ -1,5 +1,5 @@
 {
-  "_comment": "Promise.prototype.finally awaits what its callback returns, here a thenable service, before settling with the original value. The service's then resolves with a nested thenable whose then calls another method of the service: that method stays, the unread one is removed, the original value survives and the bundle runs. Guards that finally adopts its callback's result.",
+  "_comment": "Promise.prototype.finally awaits what its callback returns, here a thenable service, before settling with the original value. The service's then resolves with a nested thenable whose then calls another method of the service. Under the hand-written-thenable rule (adopting a non-native-Promise object with a callable then bails every service it can reach) the key bails, so every method stays, including the one nothing reads, the original value survives and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

@@ -1,0 +1,10 @@
+{
+  "_comment": "Guard: a service with no then, returned from a plain async function and awaited, still prunes precisely. The hand-written-thenable bail must not fire on a native Promise resolving with an ordinary service: the method the caller calls stays, the unread one is removed and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

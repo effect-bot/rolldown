@@ -1,5 +1,5 @@
 {
-  "_comment": "A thenable service reaches Inspectable.toJson's unknown parameter, which returns it; an async function returns the result, so the host calls then (the protocol exception). then hands its resolve function a nested thenable whose then calls another method of the service: that method stays, the unread one is removed and the bundle runs. Guards that protocol calls to then get resolve functions.",
+  "_comment": "A thenable service reaches Inspectable.toJson's unknown parameter, which returns it; an async function returns the result, so the host adopts it. then hands its resolve function a nested thenable whose then calls another method of the service. Under the hand-written-thenable rule (adopting a non-native-Promise object with a callable then bails every service it can reach) the key bails, so every method stays, including the one nothing reads, and the bundle runs.",
   "config": {
     "experimental": {
       "effectServiceShaking": true
