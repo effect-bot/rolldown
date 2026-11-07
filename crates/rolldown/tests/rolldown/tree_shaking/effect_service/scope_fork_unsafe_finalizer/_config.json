@@ -1,0 +1,10 @@
+{
+  "_comment": "A finalizer added to a child scope made with Scope.forkUnsafe calls a service method; one child is closed explicitly, the other is finalized by closing its parent. Each finalizer's method stays; each service's unread method is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
