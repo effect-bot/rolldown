@@ -684,6 +684,8 @@ pub struct Analysis {
   ignored_pool: Option<VarId>,
   prim_arg: Option<VarId>,
   inspect_args: Option<VarId>,
+  /// Objects the generator proves are allocated at most once at run time (`Gen::alloc`).
+  pub once_allocated: FxHashSet<ObjId>,
   /// `ServiceFree` objects waiting for the solve to settle (`service_free`).
   pending_service_free: Vec<(ObjId, VarId)>,
   then_args: Option<VarId>,
@@ -824,6 +826,7 @@ impl Analysis {
       prim_arg: None,
       inspect_args: None,
       pending_service_free: vec![],
+      once_allocated: FxHashSet::default(),
       then_args: None,
       prim_ty: None,
       hash_pool: None,
@@ -2385,11 +2388,12 @@ impl Analysis {
   }
 
   /// `ServiceFree`: a primitive flows on; a summary (which may stand for a service) becomes an
-  /// unknown scalar; a program service value (any key's value, `all_values`) is dropped, for
-  /// good, since being one only grows; any other object waits for the solve to settle, and
-  /// flows on then unless it has become a service value meanwhile. Admitting an object is
-  /// always sound; waiting only keeps a service whose provision is found late out of the
-  /// Schedule.
+  /// unknown scalar; an object waits for the solve to settle, then flows on unless it is
+  /// definitely a service. An abstract object is definitely a service only if it is provided
+  /// (`all_values`, which only grows) and stands for one runtime object (`once_allocated`):
+  /// an allocation site that runs more than once may provide one of its objects and hand
+  /// another, service-free, to the Schedule. Admitting an object is always sound; waiting only
+  /// keeps a service whose provision is found late out of the Schedule.
   fn service_free(&mut self, obj: ObjId, dst: VarId) {
     match self.objs[obj].kind {
       ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim => self.seed(dst, obj),
@@ -2397,7 +2401,7 @@ impl Analysis {
         self.seed(dst, self.top_host);
       }
       _ => {
-        if !self.vars[self.all_values].pts.contains(&obj) {
+        if !self.definitely_service(obj) {
           self.pending_service_free.push((obj, dst));
         }
       }
@@ -2410,12 +2414,18 @@ impl Analysis {
     let pending = std::mem::take(&mut self.pending_service_free);
     let mut admitted = false;
     for (obj, dst) in pending {
-      if !self.vars[self.all_values].pts.contains(&obj) && !self.vars[dst].pts.contains(&obj) {
+      if !self.definitely_service(obj) && !self.vars[dst].pts.contains(&obj) {
         self.seed(dst, obj);
         admitted = true;
       }
     }
     admitted
+  }
+
+  /// A provided service value allocated at most once: every runtime object it stands for is a
+  /// service.
+  fn definitely_service(&self, obj: ObjId) -> bool {
+    self.once_allocated.contains(&obj) && self.vars[self.all_values].pts.contains(&obj)
   }
 
   /// What may enter a Schedule from `src` flows into `dst` (`Constraint::ServiceFree`).
