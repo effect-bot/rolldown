@@ -164,7 +164,6 @@ impl Walk {
         ("valueOf", 0),
         ("@@toPrimitive", 1),
         (super::host::INSPECT_CUSTOM, 3),
-        ("then", 2),
         (EQUAL_KEY, 1),
         (HASH_KEY, 0),
         (REDACTABLE_KEY, 1),
@@ -386,6 +385,10 @@ pub enum Constraint {
   /// Every key named by these strings keeps all its methods (a key handed to type-modelled
   /// code, which may provide or read it).
   BailKeys,
+  /// A callable reaching an adopted object's `then` (`Analysis::adopt`): the object bails.
+  ThenableBail(ObjId),
+  /// A callable reaching an adopted object's `then`: the await yields an unknown value.
+  ThenableAwait(VarId),
   /// What may enter a Schedule (issue, "Assumptions" 4): primitives and ordinary values flow
   /// into the variable with their structure, a program service value never does, and a summary
   /// becomes an unknown scalar (`Analysis::service_free`).
@@ -455,6 +458,8 @@ impl Constraint {
       }
       C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
       C::ServiceFree(dst) => C::ServiceFree(v(*dst)),
+      C::ThenableBail(obj) => C::ThenableBail(*obj),
+      C::ThenableAwait(dst) => C::ThenableAwait(v(*dst)),
       C::TypedArg(slot, back, site) => C::TypedArg(v(*slot), v(*back), *site),
       C::SlotIn(dst) => C::SlotIn(v(*dst)),
       C::BailKeys => C::BailKeys,
@@ -723,7 +728,6 @@ pub struct Analysis {
   ignored_pool: Option<VarId>,
   prim_arg: Option<VarId>,
   inspect_args: Option<VarId>,
-  reject_function: Option<VarId>,
   /// The exports of type-modelled `effect` modules (`ObjKind::Typed`).
   pub typed_exports: Vec<TypedExport>,
   /// Signatures read for a type-modelled export, by (export, argument count).
@@ -744,9 +748,13 @@ pub struct Analysis {
   typed_args_seen: FxHashSet<(ObjId, VarId)>,
   /// The method summary read off a type-modelled value.
   typed_methods: FxHashMap<ObjId, ObjId>,
-  /// Each adopted object's settle variable: what its `then` resolves with (`adopt`); for a
-  /// summary, what awaiting the values it wraps gives.
-  settled_by: FxHashMap<ObjId, VarId>,
+  /// What awaiting each summary gives (`AwaitOf` on a `Wrap`).
+  awaited_wraps: FxHashMap<ObjId, VarId>,
+  /// Each adopted object's `then` (`adopt`).
+  thenable_then: FxHashMap<ObjId, VarId>,
+  /// Hand-written thenables that have bailed (`adopt`).
+  thenables_bailed: FxHashSet<ObjId>,
+
   /// The value variables of providers (a `KeyUse::Provide` that reached a key), for
   /// `definitely_service`.
   provide_sources: FxHashSet<VarId>,
@@ -754,7 +762,6 @@ pub struct Analysis {
   pub once_allocated: FxHashSet<ObjId>,
   /// `ServiceFree` objects waiting for the solve to settle (`service_free`).
   pending_service_free: Vec<(ObjId, VarId)>,
-  then_args: Option<VarId>,
   prim_ty: Option<u32>,
   pub hash_pool: Option<VarId>,
   /// The program-wide pools of host serialization and inspection (`host_protocol`).
@@ -891,11 +898,12 @@ impl Analysis {
       ignored_pool: None,
       prim_arg: None,
       inspect_args: None,
-      reject_function: None,
       pending_service_free: vec![],
       once_allocated: FxHashSet::default(),
       provide_sources: FxHashSet::default(),
-      settled_by: FxHashMap::default(),
+      awaited_wraps: FxHashMap::default(),
+      thenable_then: FxHashMap::default(),
+      thenables_bailed: FxHashSet::default(),
       typed_exports: vec![],
       typed_sigs: FxHashMap::default(),
       typed_results: FxHashMap::default(),
@@ -905,7 +913,6 @@ impl Analysis {
       typed_backs: FxHashMap::default(),
       typed_receivers: FxHashSet::default(),
       typed_slot_fns: FxHashSet::default(),
-      then_args: None,
       prim_ty: None,
       hash_pool: None,
       json_pool: None,
@@ -1551,12 +1558,11 @@ impl Analysis {
       }
       Constraint::AwaitOf(dst) => match self.objs[obj].kind {
         ObjKind::Promise { value } => self.copy(value, *dst),
-        ObjKind::Object | ObjKind::Closure(_) | ObjKind::Class { .. } => {
-          // The object itself (awaiting a non-thenable yields it), and what its `then`
-          // resolves with.
+        ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
+          // The object itself (awaiting a non-thenable yields it); a hand-written thenable
+          // bails (`adopt`).
           self.seed(*dst, obj);
-          let settled = self.adopt(obj);
-          self.copy(settled, *dst);
+          self.adopt(obj, *dst);
         }
         // Awaiting a type-modelled value yields what it holds.
         ObjKind::Typed { slot, .. } => {
@@ -1564,19 +1570,19 @@ impl Analysis {
           self.copy(slot, *dst);
         }
         // A summary may stand for a thenable: what it wraps is awaited too, once per summary
-        // (`settled_by`), and every await of the summary receives that.
+        // (`awaited_wraps`), and every await of the summary receives that.
         ObjKind::Wrap(inner) => {
           self.seed(*dst, obj);
-          let settled = match self.settled_by.get(&obj) {
+          let awaited = match self.awaited_wraps.get(&obj) {
             Some(s) => *s,
             None => {
               let s = self.var();
-              self.settled_by.insert(obj, s);
+              self.awaited_wraps.insert(obj, s);
               self.constrain(inner, Constraint::AwaitOf(s));
               s
             }
           };
-          self.copy(settled, *dst);
+          self.copy(awaited, *dst);
         }
         _ => self.seed(*dst, obj),
       },
@@ -1658,6 +1664,16 @@ impl Analysis {
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
       Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
       Constraint::ServiceFree(dst) => self.service_free(obj, *dst),
+      Constraint::ThenableBail(thenable) => {
+        if Self::callable_kind(&self.objs[obj].kind) && self.thenables_bailed.insert(*thenable) {
+          self.escape(*thenable, Flavour::Ext, None);
+        }
+      }
+      Constraint::ThenableAwait(dst) => {
+        if Self::callable_kind(&self.objs[obj].kind) {
+          self.seed(*dst, self.top_ext);
+        }
+      }
       Constraint::TypedArg(slot, back, site) => self.typed_arg(obj, *slot, *back, *site),
       Constraint::SlotIn(dst) => self.slot_in(obj, *dst),
       Constraint::BailKeys => match &self.objs[obj].kind {
@@ -2472,74 +2488,25 @@ impl Analysis {
     v
   }
 
-  /// `then(resolve, reject)`'s arguments as the host passes them: functions that resolve a
-  /// thenable they receive by adopting it (`resolve_function`).
-  fn then_args(&mut self) -> VarId {
-    if let Some(v) = self.then_args {
-      return v;
-    }
-    let settled = self.var();
-    let v = self.resolve_function(settled);
-    self.then_args = Some(v);
-    v
-  }
-
-  /// A host resolve function (`promise.resolve`) that settles into `value`: resolving with a
-  /// thenable adopts it in turn (`AwaitOf`).
-  fn resolve_function(&mut self, value: VarId) -> VarId {
-    let v = self.var();
-    if let Some(id) = self.rule_id("promise.resolve") {
-      let resolve = self.builtin(id, Some(value), None);
-      self.seed(v, resolve);
-    }
-    v
-  }
-
-  /// The reject function host adoption passes (`promise.reject`): one function object for the
-  /// program, which can hold fields; what it is called with is not read.
-  fn reject_function(&mut self) -> VarId {
-    if let Some(v) = self.reject_function {
-      return v;
-    }
-    let v = self.var();
-    if let Some(id) = self.rule_id("promise.reject") {
-      let reject = self.builtin(id, None, None);
-      self.seed(v, reject);
-    }
-    self.reject_function = Some(v);
-    v
-  }
-
-  /// Host adoption of an object that may be a thenable (an `await`, an async function's return,
-  /// a promise resolved with it): the host calls its `then` with a resolve function and a reject
-  /// function (`reject_function`), whose argument nothing reads. Returns the object's settle variable: what its
-  /// `then` resolves with, which every adoption of the object receives. The resolve function is
-  /// a `promise.resolve` builtin carrying that variable, so resolving with a thenable adopts it in
-  /// turn and its settlement flows on. Once per object (`settled_by`); every adoption shares one
-  /// call site, so a `then` function's body is shared by the objects that have it, and a value
-  /// one of them resolves with may reach the others' settlements (imprecise, sound).
-  fn adopt(&mut self, obj: ObjId) -> VarId {
-    if let Some(s) = self.settled_by.get(&obj) {
-      return *s;
-    }
-    let settled = self.var();
-    self.settled_by.insert(obj, settled);
-    let this = self.holder(obj);
-    let then = self.var();
-    self.constrain(this, Constraint::Load { key: Key::Name(ArcStr::from("then")), dst: then });
-    let resolve = self.resolve_function(settled);
-    let reject = self.reject_function();
-    let ret = self.var();
-    let call = Call {
-      site: protocol_site(5),
-      this: Some(this),
-      args: vec![Arg::Var(resolve), Arg::Var(reject)],
-      ret,
-      is_new: false,
-      builtin: None,
+  /// Host adoption of an object an `await`, an async function's return or a promise resolution
+  /// receives. A native Promise is followed exactly (`AwaitOf`); an object with a callable `then`
+  /// is a hand-written thenable, which bails (Tim's decision): every service it can reach (its
+  /// fields, what its `then` captures and what that passes to `resolve`/`reject`, nested
+  /// thenables included) keeps every method, by escaping the object to code the pass can't see,
+  /// and the await yields an unknown value. An object with no callable `then` yields itself.
+  fn adopt(&mut self, obj: ObjId, dst: VarId) {
+    let then = match self.thenable_then.get(&obj) {
+      Some(t) => *t,
+      None => {
+        let this = self.holder(obj);
+        let then = self.var();
+        self.constrain(this, Constraint::Load { key: Key::Name(ArcStr::from("then")), dst: then });
+        self.constrain(then, Constraint::ThenableBail(obj));
+        self.thenable_then.insert(obj, then);
+        then
+      }
     };
-    self.constrain(then, Constraint::Call(Box::new(call)));
-    settled
+    self.constrain(then, Constraint::ThenableAwait(dst));
   }
 
   /// `ServiceFree`: a primitive flows on; a summary (which may stand for a service) becomes an
@@ -2873,6 +2840,20 @@ impl Analysis {
       Call { site, this: None, args: vec![Arg::Var(slot); 4], ret, is_new: false, builtin: None };
     self.constrain(callables, Constraint::Call(Box::new(call)));
     self.constrain(ret, Constraint::TypedArg(slot, back, site));
+  }
+
+  /// A value that may be called: a function, class or builtin, or a value that may stand for one.
+  fn callable_kind(kind: &ObjKind) -> bool {
+    matches!(
+      kind,
+      ObjKind::Closure(_)
+        | ObjKind::Class { .. }
+        | ObjKind::Builtin { .. }
+        | ObjKind::Typed { .. }
+        | ObjKind::Wrap(_)
+        | ObjKind::Top(_)
+        | ObjKind::External { .. }
+    )
   }
 
   /// A variable holding a primitive, for arguments that carry nothing.
@@ -3560,19 +3541,22 @@ impl Analysis {
         }
         let this = self.holder(obj);
         // The protocol walk passes each method what the host or Effect passes it: the current
-        // Context to Redactable, Node's inspector arguments to `[util.inspect.custom]`, resolve
-        // functions to `then`, and a primitive to the rest.
-        let protocol_args = if walk == Walk::Protocol {
-          Some((self.prim_arg(), self.inspect_args(), self.then_args()))
-        } else {
-          None
-        };
+        // Context to Redactable, Node's inspector arguments to `[util.inspect.custom]`, and a
+        // primitive to the rest.
+        let protocol_args =
+          if walk == Walk::Protocol { Some((self.prim_arg(), self.inspect_args())) } else { None };
+        // A value at an `unknown`/`any` position may be adopted as a thenable (an async function
+        // returning what `Inspectable.toJson` hands back): one with a callable `then` bails, as
+        // in `adopt`.
+        if walk == Walk::Protocol {
+          let sink = self.var();
+          self.adopt(obj, sink);
+        }
         for (name, arity) in walk.protocols() {
           let arg = match protocol_args {
             Some(_) if *name == REDACTABLE_KEY => arg,
-            Some((_, inspect, _)) if *name == super::host::INSPECT_CUSTOM => inspect,
-            Some((_, _, then)) if *name == "then" => then,
-            Some((prim, _, _)) => prim,
+            Some((_, inspect)) if *name == super::host::INSPECT_CUSTOM => inspect,
+            Some((prim, _)) => prim,
             None => arg,
           };
           let method = self.protocol_call(this, name, *arity, arg, site, pool);

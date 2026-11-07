@@ -807,9 +807,7 @@ pub fn register(a: &mut Analysis) {
     }
     a.copy(this, c.ret);
   });
-  // The reject function the host hands a thenable's `then` when it adopts it: a function object
-  // (it can hold fields), whose argument nothing reads.
-  a.rule("promise.reject", |_, _| {});
+
   // JSON, String, Number, Symbol, console
   a.rule("JSON.stringify", |a, c| {
     let v = arg(a, c, 0);
