@@ -688,6 +688,9 @@ pub struct Analysis {
   /// Each adopted object's settle variable: what its `then` resolves with (`adopt`); for a
   /// summary, what awaiting the values it wraps gives.
   settled_by: FxHashMap<ObjId, VarId>,
+  /// The value variables of providers (a `KeyUse::Provide` that reached a key), for
+  /// `definitely_service`.
+  provide_sources: FxHashSet<VarId>,
   /// Objects the generator proves are allocated at most once at run time (`Gen::alloc`).
   pub once_allocated: FxHashSet<ObjId>,
   /// `ServiceFree` objects waiting for the solve to settle (`service_free`).
@@ -832,6 +835,7 @@ impl Analysis {
       reject_function: None,
       pending_service_free: vec![],
       once_allocated: FxHashSet::default(),
+      provide_sources: FxHashSet::default(),
       settled_by: FxHashMap::default(),
       then_args: None,
       prim_ty: None,
@@ -2446,43 +2450,52 @@ impl Analysis {
 
   /// `ServiceFree`: a primitive flows on; a summary (which may stand for a service) becomes an
   /// unknown scalar; an object waits for the solve to settle, then flows on unless it is
-  /// definitely a service. An abstract object is definitely a service only if it is provided
-  /// (`all_values`, which only grows) and stands for one runtime object (`once_allocated`):
-  /// an allocation site that runs more than once may provide one of its objects and hand
-  /// another, service-free, to the Schedule. Admitting an object is always sound; waiting only
-  /// keeps a service whose provision is found late out of the Schedule.
+  /// definitely a service (`definitely_service`). Admitting an object is always sound; holding
+  /// one back is sound only while it is definitely a service, so a held object is re-checked
+  /// every time the solve settles (points-to sets keep growing after admissions) and flows as
+  /// soon as it no longer is.
   fn service_free(&mut self, obj: ObjId, dst: VarId) {
     match self.objs[obj].kind {
       ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim => self.seed(dst, obj),
       ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. } => {
         self.seed(dst, self.top_host);
       }
-      _ => {
-        if !self.definitely_service(obj) {
-          self.pending_service_free.push((obj, dst));
-        }
-      }
+      _ => self.pending_service_free.push((obj, dst)),
     }
   }
 
-  /// Admits the waiting `ServiceFree` objects that are not service values; returns whether any
-  /// flowed.
+  /// Admits the waiting `ServiceFree` objects that are not definitely services, keeping the rest
+  /// waiting for the next check; returns whether any flowed.
   fn admit_service_free(&mut self) -> bool {
     let pending = std::mem::take(&mut self.pending_service_free);
     let mut admitted = false;
+    let mut held = vec![];
     for (obj, dst) in pending {
-      if !self.definitely_service(obj) && !self.vars[dst].pts.contains(&obj) {
+      if self.vars[dst].pts.contains(&obj) {
+        continue;
+      }
+      if self.definitely_service(obj) {
+        held.push((obj, dst));
+      } else {
         self.seed(dst, obj);
         admitted = true;
       }
     }
+    self.pending_service_free = held;
     admitted
   }
 
-  /// A provided service value allocated at most once: every runtime object it stands for is a
-  /// service.
+  /// Must-provision: the object stands for one runtime object (`once_allocated`), and some
+  /// provider's value holds exactly that object (`provide_sources`), so that runtime object is
+  /// what was provided. Being among a key's possible values (`all_values`) is not enough: a
+  /// provider's value may hold several objects (array elements merge, say), and then none of
+  /// them is known to be the provided one.
   fn definitely_service(&self, obj: ObjId) -> bool {
-    self.once_allocated.contains(&obj) && self.vars[self.all_values].pts.contains(&obj)
+    self.once_allocated.contains(&obj)
+      && self.provide_sources.iter().any(|src| {
+        let pts = &self.vars[*src].pts;
+        pts.len() == 1 && pts.contains(&obj)
+      })
   }
 
   /// What may enter a Schedule from `src` flows into `dst` (`Constraint::ServiceFree`).
@@ -2994,6 +3007,7 @@ impl Analysis {
           self.copy(v, *dst);
         }
         KeyUse::Provide(src) => {
+          self.provide_sources.insert(*src);
           let v = self.key_value_var(&name);
           self.copy(*src, v);
         }
@@ -3001,7 +3015,10 @@ impl Analysis {
       },
       ObjKind::AllKeys => match use_ {
         KeyUse::Lookup(dst) => self.copy(self.all_values, *dst),
-        KeyUse::Provide(src) => self.copy(*src, self.unknown_key_values),
+        KeyUse::Provide(src) => {
+          self.provide_sources.insert(*src);
+          self.copy(*src, self.unknown_key_values);
+        }
         KeyUse::Strings(dst) => self.seed(*dst, obj),
       },
       ObjKind::Object => {
