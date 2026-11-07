@@ -14,6 +14,10 @@
 //! - the enabled bundle is at least `minReductionPercent` smaller, when set;
 //! - an `EFFECT_SERVICE_SHAKING` warning is emitted, when `expectDiagnostic` is set.
 //!
+//! Both builds set `experimental.attachDebugInfo: "none"`: the module-path
+//! comments otherwise depend on where the packages are installed (pnpm's
+//! store paths), so sizes would not compare across checkouts.
+//!
 //! The two bundles are written to `dist/off/main.js` and `dist/on/main.js` in
 //! the program directory. Node resolves `effect` and the other fixture
 //! packages from the repository's root `node_modules`.
@@ -86,6 +90,9 @@ async fn build(dir: &Path, expect: &Expect, enabled: bool, out: &str) -> Build {
     external: (!expect.external.is_empty()).then(|| IsExternal::from(expect.external.clone())),
     experimental: Some(ExperimentalOptions {
       effect_service_shaking: Some(enabled),
+      // Module-path comments depend on the installation layout (pnpm's store paths), not
+      // on the code: without them, sizes compare across checkouts.
+      attach_debug_info: Some(rolldown::AttachDebugInfo::None),
       ..Default::default()
     }),
     ..Default::default()
@@ -144,7 +151,9 @@ fn property_counts(code: &str) -> std::collections::BTreeMap<String, usize> {
 
   impl<'a> Visit<'a> for Properties {
     fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
-      if let Some(name) = property.key.static_name().and_then(|name| name.into_cow_str()) {
+      if let Some(name) =
+        property.key.static_name().and_then(oxc::ast::StaticPropertyName::into_cow_str)
+      {
         *self.0.entry(name.into_owned()).or_default() += 1;
       }
       walk::walk_object_property(self, property);

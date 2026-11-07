@@ -22,6 +22,9 @@ async fn build(entry: &std::path::Path, out_dir: &std::path::Path, enabled: bool
     platform: Some(Platform::Node),
     experimental: Some(ExperimentalOptions {
       effect_service_shaking: Some(enabled),
+      // Module-path comments depend on the installation layout (pnpm's store paths), not
+      // on the code: without them, sizes compare across checkouts.
+      attach_debug_info: Some(rolldown::AttachDebugInfo::None),
       ..Default::default()
     }),
     ..Default::default()
