@@ -1,0 +1,10 @@
+{
+  "_comment": "A Tracer written in bundled code, provided by a Layer: Effect calls the attribute and end methods of the spans it returns, and those call a captured service's methods. Both methods stay; the unread one is removed and the bundle runs. Guards that Effect's calls on a bundled Tracer's spans count as reads.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

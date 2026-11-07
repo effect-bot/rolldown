@@ -8,8 +8,9 @@ import * as References from 'effect/References';
 // A service set as a log annotation and read back as an unknown value,
 // narrowed before the call: with the key/value form through
 // References.CurrentLogAnnotations, and with the record form by a custom
-// logger through its fiber. Each path calls its own method, which stays; the
-// unread method goes.
+// logger through its fiber. Annotation values are `unknown` in Effect's public
+// types, so a value read back holds no service even after narrowing (Tim's
+// decision): the reads keep nothing and every method may go.
 const Store = Context.Service('test/LogAnnotationReadBack');
 const annotationUnusedHelper = () => 'unused';
 const StoreLayer = Layer.succeed(Store, {

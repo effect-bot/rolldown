@@ -1,0 +1,10 @@
+{
+  "_comment": "Services passed to Effect APIs whose parameter is typed unknown: Inspectable.toJson calls toJSON, and Redactable.redact and Formatter.format call [Redactable.symbolRedactable]. The program calls one method of each service itself. Those methods and the protocol methods stay; each service's unread method is removed and the bundle runs. Guards the protocol exception of the unknown/any rule.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

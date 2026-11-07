@@ -1,0 +1,10 @@
+{
+  "_comment": "Services passed to Schema.decodeUnknownSync's unknown input and read back from the decoded value: a record holding the service under a Schema.Any field, and the service decoded by a struct whose field is declared as a function. The decoded result holds nothing from an ignored input, so the method called on each decoded value is removed and the bundle is not run. Red until the unknown/any rule and the returned-function bound land.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
