@@ -169,6 +169,19 @@ pub fn host_var(a: &mut Analysis) -> VarId {
   v
 }
 
+/// A descriptor's `get` and `set`. The generator keeps a getter only as the value it returns,
+/// so `get` is a function whose call gives back the property's values (a wrap of them: reads
+/// on its result demand on those values). Calling `set` runs a setter with what it is given,
+/// which the pass doesn't follow: `set` is a value from code the pass can't see, so what it is
+/// handed bails.
+fn descriptor_accessors(a: &mut Analysis, desc: ObjId, values: VarId, site: Site) {
+  let get = a.field(desc, &ArcStr::from("get"));
+  let wrapped = a.wrap_of(values, site);
+  a.copy(wrapped, get);
+  let set = a.field(desc, &ArcStr::from("set"));
+  a.seed(set, a.top_ext);
+}
+
 /// The values an enumeration of the objects in `o` hands out: every field, through the
 /// admission filter with the type model on (`Analysis::admitted_values`).
 fn enumerated(a: &mut Analysis, o: VarId) -> VarId {
@@ -271,6 +284,7 @@ pub fn register(a: &mut Analysis) {
     let (desc, dv) = new_object(a, c.site, 9);
     let value = a.field(desc, &ArcStr::from("value"));
     a.copy(values, value);
+    descriptor_accessors(a, desc, values, c.site);
     a.constrain(v, Constraint::Store { key: Key::Unknown, src: dv });
     a.copy(v, c.ret);
   });
@@ -380,8 +394,7 @@ pub fn register(a: &mut Analysis) {
       let (obj, v) = new_object(a, c.site, 4);
       let value = a.field(obj, &ArcStr::from("value"));
       a.constrain(o, Constraint::Load { key: Key::Var(k), dst: value });
-      let get = a.field(obj, &ArcStr::from("get"));
-      a.copy(value, get);
+      descriptor_accessors(a, obj, value, c.site);
       a.copy(v, c.ret);
     });
   }
