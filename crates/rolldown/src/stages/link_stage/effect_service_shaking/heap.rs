@@ -67,6 +67,23 @@ impl Site {
 
 pub type Rule = fn(&mut Analysis, &Call);
 
+/// `ObjKind::Typed::export` of a value that is not an export.
+pub const NO_EXPORT: u32 = u32::MAX;
+
+/// An export of a type-modelled `effect` module: its `.d.ts` (if any) and export name.
+pub struct TypedExport {
+  pub dts: Option<std::path::PathBuf>,
+  pub name: ArcStr,
+}
+
+/// What a call to a type-modelled export with a given argument count reads from its `.d.ts`.
+#[derive(Clone)]
+struct TypedSig {
+  params: Vec<Option<u32>>,
+  rest: Option<u32>,
+  ret: super::dts::RetShape,
+}
+
 /// The `.d.ts` bounds of a default-modelled export: which arguments are at `unknown`/`any`
 /// positions, by argument count, and its callbacks' parameter types.
 #[derive(Clone, Default)]
@@ -361,6 +378,14 @@ pub enum Constraint {
   /// `obj` flows into `dst` once anything reaches the variable (a walked object that has the
   /// protocol method loaded into the variable).
   Witness(ObjId, VarId),
+  /// An argument of a call into type-modelled `effect` code (`Analysis::typed_arg`): what it
+  /// contributes to the call's slot.
+  TypedArg(VarId, VarId, Site),
+  /// Values entering a type-modelled value's slot (`Analysis::slot_in`).
+  SlotIn(VarId),
+  /// Every key named by these strings keeps all its methods (a key handed to type-modelled
+  /// code, which may provide or read it).
+  BailKeys,
   /// What may enter a Schedule (issue, "Assumptions" 4): primitives and ordinary values flow
   /// into the variable with their structure, a program service value never does, and a summary
   /// becomes an unknown scalar (`Analysis::service_free`).
@@ -430,6 +455,9 @@ impl Constraint {
       }
       C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
       C::ServiceFree(dst) => C::ServiceFree(v(*dst)),
+      C::TypedArg(slot, back, site) => C::TypedArg(v(*slot), v(*back), *site),
+      C::SlotIn(dst) => C::SlotIn(v(*dst)),
+      C::BailKeys => C::BailKeys,
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
       C::Accessor(acc) => C::Accessor(Accessor {
         this: v(acc.this),
@@ -582,6 +610,13 @@ pub enum ObjKind {
   Iterator(FnId),
   /// Every access path yields the wrapped values.
   Wrap(VarId),
+  /// A value made by `effect`'s type-modelled library code (`Analysis::typed_call`), or one of
+  /// its exports. `slot` holds what the caller handed it at type-parameter positions; `export`
+  /// indexes `Analysis::typed_exports` for an export (`NO_EXPORT` otherwise).
+  Typed {
+    slot: VarId,
+    export: u32,
+  },
   Top(Flavour),
   /// A callable with built-in behaviour; `data` is rule-specific.
   Builtin {
@@ -689,6 +724,26 @@ pub struct Analysis {
   prim_arg: Option<VarId>,
   inspect_args: Option<VarId>,
   reject_function: Option<VarId>,
+  /// The exports of type-modelled `effect` modules (`ObjKind::Typed`).
+  pub typed_exports: Vec<TypedExport>,
+  /// Signatures read for a type-modelled export, by (export, argument count).
+  typed_sigs: FxHashMap<(u32, usize), TypedSig>,
+  /// The value a call into type-modelled code returns, and the variable of what the call is
+  /// handed, by (site, callee).
+  typed_results: FxHashMap<(Site, Option<ObjId>), (ObjId, VarId)>,
+  /// (function, slot) pairs `slot_in` has run.
+  typed_slot_fns: FxHashSet<(ObjId, VarId)>,
+  /// (result, receiver) pairs of method calls already joined (`typed_call`).
+  typed_receivers: FxHashSet<(ObjId, ObjId)>,
+  /// The one type-modelled value that stands, inside slots, for every type-modelled value held
+  /// there (`slot_in`).
+  typed_any: Option<ObjId>,
+  /// Each call's handed-values variable, translated for slots (`slot_in`).
+  typed_backs: FxHashMap<VarId, VarId>,
+  /// (object, slot) pairs `typed_arg` has handled.
+  typed_args_seen: FxHashSet<(ObjId, VarId)>,
+  /// The method summary read off a type-modelled value.
+  typed_methods: FxHashMap<ObjId, ObjId>,
   /// Each adopted object's settle variable: what its `then` resolves with (`adopt`); for a
   /// summary, what awaiting the values it wraps gives.
   settled_by: FxHashMap<ObjId, VarId>,
@@ -841,6 +896,15 @@ impl Analysis {
       once_allocated: FxHashSet::default(),
       provide_sources: FxHashSet::default(),
       settled_by: FxHashMap::default(),
+      typed_exports: vec![],
+      typed_sigs: FxHashMap::default(),
+      typed_results: FxHashMap::default(),
+      typed_methods: FxHashMap::default(),
+      typed_args_seen: FxHashSet::default(),
+      typed_any: None,
+      typed_backs: FxHashMap::default(),
+      typed_receivers: FxHashSet::default(),
+      typed_slot_fns: FxHashSet::default(),
       then_args: None,
       prim_ty: None,
       hash_pool: None,
@@ -1453,7 +1517,9 @@ impl Analysis {
         ObjKind::Context { keys } | ObjKind::Layer { keys } | ObjKind::Runtime { keys } => {
           self.copy(keys, *dst);
         }
-        ObjKind::Top(_) | ObjKind::Wrap(_) => self.seed(*dst, self.all_keys),
+        ObjKind::Top(_) | ObjKind::Wrap(_) | ObjKind::Typed { .. } => {
+          self.seed(*dst, self.all_keys);
+        }
         ObjKind::Builtin { .. } if self.is_default(obj) => self.copy(self.effect_key_strings, *dst),
         _ => {}
       },
@@ -1475,7 +1541,10 @@ impl Analysis {
       Constraint::Callables(dst) => {
         if matches!(
           self.objs[obj].kind,
-          ObjKind::Closure(_) | ObjKind::Class { .. } | ObjKind::Builtin { .. }
+          ObjKind::Closure(_)
+            | ObjKind::Class { .. }
+            | ObjKind::Builtin { .. }
+            | ObjKind::Typed { .. }
         ) {
           self.seed(*dst, obj);
         }
@@ -1488,6 +1557,11 @@ impl Analysis {
           self.seed(*dst, obj);
           let settled = self.adopt(obj);
           self.copy(settled, *dst);
+        }
+        // Awaiting a type-modelled value yields what it holds.
+        ObjKind::Typed { slot, .. } => {
+          self.seed(*dst, obj);
+          self.copy(slot, *dst);
         }
         // A summary may stand for a thenable: what it wraps is awaited too, once per summary
         // (`settled_by`), and every await of the summary receives that.
@@ -1538,7 +1612,7 @@ impl Analysis {
             self.seed(v, self.top_host);
           }
         }
-        ObjKind::Top(_) | ObjKind::Wrap(_) | ObjKind::External { .. } => {
+        ObjKind::Top(_) | ObjKind::Wrap(_) | ObjKind::Typed { .. } | ObjKind::External { .. } => {
           let t = self.top_of(obj);
           self.seed(self.unknown_key_values, t);
         }
@@ -1560,7 +1634,7 @@ impl Analysis {
       },
       Constraint::MapKeys(dst) => match self.objs[obj].kind {
         ObjKind::Str(_) => self.seed(*dst, obj),
-        ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => {
+        ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) | ObjKind::Typed { .. } => {
           self.seed(*dst, self.all_keys);
         }
         _ => {}
@@ -1569,7 +1643,7 @@ impl Analysis {
       Constraint::FilterCopy { dst, ty } => {
         if matches!(
           self.objs[obj].kind,
-          ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. }
+          ObjKind::Wrap(_) | ObjKind::Typed { .. } | ObjKind::Top(_) | ObjKind::External { .. }
         ) && !self.admits(*ty, obj)
         {
           // A summary may stand for a value the type admits, such as a scalar or a key: it
@@ -1584,6 +1658,18 @@ impl Analysis {
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
       Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
       Constraint::ServiceFree(dst) => self.service_free(obj, *dst),
+      Constraint::TypedArg(slot, back, site) => self.typed_arg(obj, *slot, *back, *site),
+      Constraint::SlotIn(dst) => self.slot_in(obj, *dst),
+      Constraint::BailKeys => match &self.objs[obj].kind {
+        ObjKind::Str(name) => {
+          let name = name.clone();
+          self.never_prune.insert(name);
+        }
+        ObjKind::AllKeys | ObjKind::Top(_) | ObjKind::External { .. } => {
+          self.bail_everything("a key of unknown name is handed to type-modelled effect code");
+        }
+        _ => {}
+      },
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
       Constraint::EscapeReceiver(flavour, site, name) => {
         self.escape_receiver(obj, *flavour, *site, name);
@@ -1706,6 +1792,7 @@ impl Analysis {
         self.constrain(inner, Constraint::Demand(name.clone()));
         self.seed(dst, obj);
       }
+      ObjKind::Typed { slot, .. } => self.typed_member(obj, slot, dst),
       ObjKind::Top(flavour) => {
         let t = if flavour == Flavour::Ext { self.top_ext } else { self.top_host };
         self.seed(dst, t);
@@ -1831,6 +1918,7 @@ impl Analysis {
         self.constrain(inner, Constraint::DemandAll);
         self.seed(dst, obj);
       }
+      ObjKind::Typed { slot, .. } => self.typed_member(obj, slot, dst),
       ObjKind::Str(_) => self.seed(dst, self.top_host),
       ObjKind::Top(_) | ObjKind::External { .. } => {
         let t = self.top_of(obj);
@@ -1904,7 +1992,7 @@ impl Analysis {
       ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
         self.constrain(src, Constraint::Escape(flavour, None));
       }
-      ObjKind::Wrap(inner) => self.copy(src, inner),
+      ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => self.copy(src, inner),
       // The only writable public member of a container is `ManagedRuntime.cachedContext`: the
       // Context written there provides its services. Other writes don't type check, so they
       // store nothing.
@@ -1953,7 +2041,7 @@ impl Analysis {
       ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
         self.constrain(src, Constraint::Escape(flavour, None));
       }
-      ObjKind::Wrap(inner) => self.copy(src, inner),
+      ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => self.copy(src, inner),
       ObjKind::Context { .. }
       | ObjKind::Layer { .. }
       | ObjKind::Runtime { .. }
@@ -2091,6 +2179,7 @@ impl Analysis {
         // `K(...)` is not a call form Effect supports; treat as opaque host behaviour.
         self.escape_args(call, Flavour::Host);
       }
+      ObjKind::Typed { slot, export } => self.typed_call(callee, slot, export, call),
       _ => {}
     }
   }
@@ -2462,7 +2551,7 @@ impl Analysis {
   fn service_free(&mut self, obj: ObjId, dst: VarId) {
     match self.objs[obj].kind {
       ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim => self.seed(dst, obj),
-      ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. } => {
+      ObjKind::Wrap(_) | ObjKind::Typed { .. } | ObjKind::Top(_) | ObjKind::External { .. } => {
         self.seed(dst, self.top_host);
       }
       _ => self.pending_service_free.push((obj, dst)),
@@ -2520,6 +2609,270 @@ impl Analysis {
       }
     };
     self.constrain(src, Constraint::FilterCopy { dst, ty });
+  }
+
+  /// An export of a type-modelled `effect` module (design section 11): its body is not
+  /// analysed; calls take their flow from its `.d.ts` signature (`typed_call`).
+  pub fn typed_export(&mut self, dts: Option<std::path::PathBuf>, name: ArcStr) -> ObjId {
+    let export = u32::try_from(self.typed_exports.len()).expect("too many exports");
+    self.typed_exports.push(TypedExport { dts, name });
+    let slot = self.var();
+    self.alloc(ObjKind::Typed { slot, export }, None)
+  }
+
+  fn typed_sig(&mut self, export: u32, nargs: usize) -> Option<TypedSig> {
+    if export == NO_EXPORT {
+      return None;
+    }
+    if let Some(sig) = self.typed_sigs.get(&(export, nargs)) {
+      return Some(sig.clone());
+    }
+    let e = &self.typed_exports[export as usize];
+    let sig = match &e.dts {
+      Some(dts) => {
+        let (dts, name) = (dts.clone(), e.name.clone());
+        let b = self.dts.bounds(&dts, &name, nargs);
+        let ret = self.dts.ret_shape(&dts, &name, nargs);
+        let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
+        let rest = b.rest.map(|t| self.intern_ty(t));
+        TypedSig { params, rest, ret }
+      }
+      None => TypedSig {
+        params: vec![],
+        rest: None,
+        ret: super::dts::RetShape { unknown: true, ..Default::default() },
+      },
+    };
+    self.typed_sigs.insert((export, nargs), sig.clone());
+    Some(sig)
+  }
+
+  /// A member read off a type-modelled value: what it holds, and a method summary that shares
+  /// its slot (a method or a getter may hand out any of it; what a method's caller passes joins
+  /// it, the way a container's setter does).
+  fn typed_member(&mut self, obj: ObjId, slot: VarId, dst: VarId) {
+    self.copy(slot, dst);
+    // A value's method is the value itself (calling it is a call on it); an export's is a
+    // separate summary, so that its own signature is not applied to a method call.
+    if matches!(self.objs[obj].kind, ObjKind::Typed { export: NO_EXPORT, .. }) {
+      self.seed(dst, obj);
+      return;
+    }
+    let method = match self.typed_methods.get(&obj) {
+      Some(m) => *m,
+      None => {
+        let m = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, None);
+        self.typed_methods.insert(obj, m);
+        m
+      }
+    };
+    self.seed(dst, method);
+  }
+
+  /// A call into type-modelled `effect` code (an export, or a value it made). The body is not
+  /// analysed. Flow follows the declared signature, with one slot per call site standing for
+  /// every type parameter:
+  /// - each argument, filtered by its declared parameter type (`unknown`/`any` is ignored and
+  ///   walked for protocols; a primitive-only type passes primitives), contributes to the slot
+  ///   (`typed_arg`): a plain value joins it, a type-modelled value's slot is unified with it, an
+  ///   Effect contributes its success, an array its elements, and callbacks (direct, or in an
+  ///   options object) run with the slot and their results join it;
+  /// - a key handed over keeps all its methods (the code may provide or read it);
+  /// - calling a value it made (a curried result, a method) unifies with that value's slot;
+  /// - the result follows the declared return: an `Effect` (succeeding with a summary, and with
+  ///   the slot when its success is a type parameter), the slot for a bare type parameter, a
+  ///   primitive, or a summary holding the slot. Without a signature it is both.
+  fn typed_call(&mut self, callee: ObjId, callee_slot: VarId, export: u32, call: &Call) {
+    // One result per source call site and export: the clones of a function share it, and so do
+    // the values a method call is made on (a result per receiver would chain without bound when
+    // a value's own result is called again, `loop(x.pipe(…))`).
+    let key = (Site { sub: 0, ..call.site }, if export == NO_EXPORT { None } else { Some(callee) });
+    let (result, back) = match self.typed_results.get(&key) {
+      Some(r) => *r,
+      None => {
+        let slot = self.var();
+        // What the call is handed, as it may be stored into the values it is handed.
+        let handed = self.var();
+        let back = self.var();
+        self.constrain(handed, Constraint::SlotIn(back));
+        let r = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, Some(call.site));
+        self.typed_results.insert(key, (r, handed));
+        self.typed_backs.insert(handed, back);
+        (r, handed)
+      }
+    };
+    if export == NO_EXPORT && self.typed_receivers.insert((result, callee)) {
+      // A call on a value it made: what that value holds flows into the result, and what the
+      // call is handed may be stored in it.
+      let ObjKind::Typed { slot, .. } = self.objs[result].kind else { unreachable!() };
+      let back = self.typed_backs[&back];
+      self.copy(callee_slot, slot);
+      self.copy(back, callee_slot);
+    }
+    let ObjKind::Typed { slot, .. } = self.objs[result].kind else { unreachable!() };
+    let handed = back;
+    let back = self.typed_backs[&handed];
+    if export == NO_EXPORT {
+      if let Some(this) = call.this {
+        self.constrain(this, Constraint::TypedArg(slot, back, call.site));
+      }
+    }
+    let nargs = call.args.len();
+    let sig = self.typed_sig(export, nargs);
+    let pool = self.ignored_pool();
+    for (i, a) in call.args.iter().enumerate() {
+      let v = match a {
+        Arg::Var(v) => *v,
+        Arg::Spread(v) => {
+          let e = self.var();
+          self.constrain(*v, Constraint::ElemOf(e));
+          e
+        }
+      };
+      let ty = sig.as_ref().and_then(|s| s.params.get(i).copied().flatten().or(s.rest));
+      let arg = self.var();
+      self.bounded_copy(v, arg, ty);
+      self.copy(arg, handed);
+      self.constrain(arg, Constraint::TypedArg(slot, back, call.site));
+      // Effect's code may call a value's implicit protocol methods.
+      self.copy(arg, pool);
+    }
+    let ret = sig.map_or(super::dts::RetShape { unknown: true, ..Default::default() }, |s| s.ret);
+    if ret.effect {
+      let (eff, success, _) = self.new_effect(call.site, 41);
+      if ret.effect_other || ret.effect_param {
+        self.seed(success, result);
+      }
+      if ret.effect_param {
+        self.copy(slot, success);
+      }
+      self.seed(call.ret, eff);
+    }
+    if ret.param || ret.unknown {
+      self.copy(slot, call.ret);
+    }
+    if ret.prim {
+      self.seed(call.ret, self.prim);
+    }
+    if ret.other || ret.unknown {
+      self.seed(call.ret, result);
+    }
+  }
+
+  /// The value standing for every type-modelled value held in a slot (`slot_in`), and its slot.
+  fn typed_any(&mut self) -> (ObjId, VarId) {
+    if let Some(o) = self.typed_any {
+      let ObjKind::Typed { slot, .. } = self.objs[o].kind else { unreachable!() };
+      return (o, slot);
+    }
+    let slot = self.var();
+    let o = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, None);
+    self.typed_any = Some(o);
+    (o, slot)
+  }
+
+  /// A value entering a slot. Slots hold no type-modelled value of their own: one held there
+  /// (a Stream in an `Option`, an Effect's success) contributes what it holds, and is stood for
+  /// by one shared value (`typed_any`) whose slot holds what every such value holds. Each value
+  /// in its own slot made slots grow with every one upstream of them.
+  fn slot_in(&mut self, obj: ObjId, dst: VarId) {
+    match self.objs[obj].kind {
+      ObjKind::Typed { slot, .. } => {
+        let (any, any_slot) = self.typed_any();
+        if obj != any {
+          self.copy(slot, dst);
+          self.copy(slot, any_slot);
+        }
+        self.seed(dst, any);
+      }
+      ObjKind::Effect { success, .. } => self.constrain(success, Constraint::SlotIn(dst)),
+      ObjKind::Promise { value } => self.constrain(value, Constraint::SlotIn(dst)),
+      // A function a type-modelled value holds may be called by its code (a Schedule's step, a
+      // stored callback): it runs with what the value holds.
+      ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
+        self.seed(dst, obj);
+        if self.typed_slot_fns.insert((obj, dst)) {
+          let back = self.var();
+          self.typed_callback(obj, dst, back, protocol_site(6));
+        }
+      }
+      _ => self.seed(dst, obj),
+    }
+  }
+
+  /// What one argument of a type-modelled call contributes to its slot (`typed_call`).
+  fn typed_arg(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site) {
+    // Once per (object, slot): a callback's result feeds the same slot back.
+    if !self.typed_args_seen.insert((obj, slot)) {
+      return;
+    }
+    match self.objs[obj].kind.clone() {
+      // A type-modelled value handed over: what it holds flows on, and what the call is handed
+      // may be stored in it (`Ref.set`, `Queue.offer`, …).
+      ObjKind::Typed { slot: other, .. } => {
+        self.copy(other, slot);
+        self.copy(back, other);
+      }
+      ObjKind::Effect { success, .. } => self.constrain(success, Constraint::SlotIn(slot)),
+      ObjKind::Promise { value } => self.constrain(value, Constraint::SlotIn(slot)),
+      ObjKind::Wrap(inner) => {
+        self.seed(slot, obj);
+        self.constrain(inner, Constraint::SlotIn(slot));
+      }
+      ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
+        self.seed(slot, obj);
+        self.typed_callback(obj, slot, back, site);
+      }
+      ObjKind::Key { strings, .. } => {
+        self.seed(slot, obj);
+        self.constrain(strings, Constraint::BailKeys);
+      }
+      ObjKind::Class { .. } => {
+        self.seed(slot, obj);
+        let strings = self.var();
+        self.key_use(obj, &KeyUse::Strings(strings));
+        self.constrain(strings, Constraint::BailKeys);
+      }
+      ObjKind::Array => {
+        self.seed(slot, obj);
+        let elem = self.elem(obj);
+        self.copy(elem, slot);
+        self.typed_nested_callbacks(obj, slot, back, site);
+      }
+      ObjKind::Object => {
+        self.seed(slot, obj);
+        self.typed_nested_callbacks(obj, slot, back, site);
+      }
+      _ => self.seed(slot, obj),
+    }
+  }
+
+  /// A callback handed to type-modelled code runs with the slot at each parameter, and what it
+  /// returns joins the slot. It is called on the type-modelled call's own site, so a callback
+  /// gets one clone per such call, not one per slot (which would nest without bound).
+  fn typed_callback(&mut self, f: ObjId, slot: VarId, back: VarId, site: Site) {
+    let callee = self.holder(f);
+    let ret = self.var();
+    let call =
+      Call { site, this: None, args: vec![Arg::Var(slot); 4], ret, is_new: false, builtin: None };
+    self.constrain(callee, Constraint::Call(Box::new(call)));
+    self.constrain(ret, Constraint::TypedArg(slot, back, site));
+  }
+
+  /// The callbacks inside an options object or array handed to type-modelled code.
+  fn typed_nested_callbacks(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site) {
+    // Effect's code reads the handlers off the object by name, so every member counts as read
+    // (an ordinary unknown-key load): an object whose methods are services' keeps them.
+    let holder = self.holder(obj);
+    let fields = self.var();
+    self.constrain(holder, Constraint::Load { key: Key::Unknown, dst: fields });
+    let callables = self.var();
+    self.constrain(fields, Constraint::Callables(callables));
+    let ret = self.var();
+    let call =
+      Call { site, this: None, args: vec![Arg::Var(slot); 4], ret, is_new: false, builtin: None };
+    self.constrain(callables, Constraint::Call(Box::new(call)));
+    self.constrain(ret, Constraint::TypedArg(slot, back, site));
   }
 
   /// A variable holding a primitive, for arguments that carry nothing.
@@ -2582,7 +2935,7 @@ impl Analysis {
         t.members.iter().any(|alt| alt.iter().all(|m| self.has_member(obj, m, 0)))
       }
       // A summary may be a value of any type that admits more than primitives.
-      ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. } => {
+      ObjKind::Wrap(_) | ObjKind::Typed { .. } | ObjKind::Top(_) | ObjKind::External { .. } => {
         t.func || t.arrays || objects
       }
       // Effect's objects are objects: only an object-admitting type can hold one.
@@ -2838,7 +3191,11 @@ impl Analysis {
   fn lookup_in(&mut self, obj: ObjId, key: VarId, dst: VarId) {
     if matches!(
       self.objs[obj].kind,
-      ObjKind::Context { .. } | ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_)
+      ObjKind::Context { .. }
+        | ObjKind::Top(_)
+        | ObjKind::External { .. }
+        | ObjKind::Wrap(_)
+        | ObjKind::Typed { .. }
     ) {
       self.constrain(key, Constraint::KeyUse(KeyUse::Lookup(dst)));
     }
@@ -2905,6 +3262,8 @@ impl Analysis {
       }
       ObjKind::Promise { value } => self.copy(value, dst),
       ObjKind::Wrap(_) => self.seed(dst, obj),
+      // Run as an effect, a type-modelled value yields what it holds.
+      ObjKind::Typed { slot, .. } => self.copy(slot, dst),
       ObjKind::Top(Flavour::Ext) | ObjKind::External { flavour: Flavour::Ext, .. } => {
         // An effect built by code the pass can't see runs in this runtime. It reaches services
         // only through the Context it runs with, which is not a path (issue, "Code the pass
@@ -2957,7 +3316,7 @@ impl Analysis {
     }
     if matches!(
       self.objs[obj].kind,
-      ObjKind::Effect { .. } | ObjKind::Iterator(_) | ObjKind::Wrap(_)
+      ObjKind::Effect { .. } | ObjKind::Iterator(_) | ObjKind::Wrap(_) | ObjKind::Typed { .. }
     ) {
       let (cause, done) = self.done_failure();
       self.seed(dst, cause);
@@ -3036,6 +3395,8 @@ impl Analysis {
         }
       }
       ObjKind::Wrap(inner) => self.constrain(inner, Constraint::KeyUse(use_.clone())),
+      // A type-modelled value used as a key: which key is unknown.
+      ObjKind::Typed { .. } => self.key_use(self.all_keys, use_),
       _ => {
         // Anything else in a key position: an unknown key.
         let all = self.all_keys;
@@ -3066,7 +3427,7 @@ impl Analysis {
       ObjKind::Class { heritage: Some(h), .. } => {
         self.constrain(h, Constraint::SubclassHeritage(use_.clone()));
       }
-      ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => {
+      ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) | ObjKind::Typed { .. } => {
         self.key_use(base, use_);
         self.own_key_use(class, use_);
       }
@@ -3121,6 +3482,7 @@ impl Analysis {
       }
       ObjKind::Str(_) => self.seed(dst, self.top_host),
       ObjKind::Wrap(_) => self.seed(dst, obj),
+      ObjKind::Typed { slot, .. } => self.copy(slot, dst),
       ObjKind::Top(_) | ObjKind::External { .. } => {
         let t = self.top_of(obj);
         self.seed(dst, t);
@@ -3148,6 +3510,7 @@ impl Analysis {
         self.load_unknown(obj, dst);
       }
       ObjKind::Wrap(_) => self.seed(dst, obj),
+      ObjKind::Typed { slot, .. } => self.copy(slot, dst),
       ObjKind::Top(_) | ObjKind::External { .. } => {
         let t = self.top_of(obj);
         self.seed(dst, t);
@@ -3222,7 +3585,7 @@ impl Analysis {
       // Its failures hold no service (issue, "Assumptions" 3).
       ObjKind::Effect { success, .. } => self.constrain(success, again),
       // A wrapped value may be any of the values it wraps. A Promise has no keys of its own.
-      ObjKind::Wrap(inner) => self.constrain(inner, again),
+      ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => self.constrain(inner, again),
       // A printed Context or runtime prints its services. Context equality is ignored.
       ObjKind::Context { keys } | ObjKind::Runtime { keys } if walk == Walk::Protocol => {
         let services = self.var();
@@ -3370,7 +3733,7 @@ impl Analysis {
           self.load_name(obj, &name, dst);
         }
       }
-      ObjKind::Wrap(inner) => {
+      ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => {
         let elem = self.elem(target);
         self.copy(inner, elem);
       }
@@ -3441,7 +3804,7 @@ impl Analysis {
         }
       }
       ObjKind::Closure(f) => self.escape_fn(f, flavour, site),
-      ObjKind::Promise { value } | ObjKind::Wrap(value) => {
+      ObjKind::Promise { value } | ObjKind::Wrap(value) | ObjKind::Typed { slot: value, .. } => {
         self.constrain(value, Constraint::Escape(flavour, site));
       }
       ObjKind::Iterator(f) => {

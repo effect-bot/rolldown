@@ -84,6 +84,20 @@ impl Ty {
   }
 }
 
+/// The declared shape of what a function returns (`Dts::ret_shape`). `unknown` covers a
+/// signature that could not be found or a type the resolver could not follow.
+#[derive(Clone, Copy, Debug, Default)]
+#[expect(clippy::struct_excessive_bools, reason = "one flag per shape a return may take")]
+pub struct RetShape {
+  pub param: bool,
+  pub effect: bool,
+  pub effect_param: bool,
+  pub effect_other: bool,
+  pub prim: bool,
+  pub other: bool,
+  pub unknown: bool,
+}
+
 /// The bounds of one exported function: a type per parameter, the elements of its rest
 /// parameter, and the return type (`None` is open).
 #[derive(Clone, Debug, Default)]
@@ -193,6 +207,85 @@ impl Dts {
     internal_open(path, &mut out);
     self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
     out
+  }
+
+  /// What a call to the function exported as `name` with `nparams` arguments returns, by
+  /// declared shape (joined over the overloads that fit): a type parameter the caller picks, an
+  /// `Effect` (and whether its success is a type parameter), a primitive, or anything else.
+  pub fn ret_shape(&self, path: &Path, name: &str, nparams: usize) -> RetShape {
+    let start = std::time::Instant::now();
+    let mut out = RetShape::default();
+    match self.signatures(path, name) {
+      None => out.unknown = true,
+      Some(sigs) => {
+        let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
+        let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
+        for sig in matching {
+          match sig.ret {
+            Some(t) => self.ret_shape_of(sig.file, t, &sig.tparams, &mut out, 0),
+            None => out.unknown = true,
+          }
+        }
+      }
+    }
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    out
+  }
+
+  fn ret_shape_of(&self, f: usize, t: &TSType<'_>, tp: &[String], out: &mut RetShape, depth: u32) {
+    if depth > 8 {
+      out.unknown = true;
+      return;
+    }
+    match t {
+      TSType::TSParenthesizedType(p) => {
+        self.ret_shape_of(f, &p.type_annotation, tp, out, depth + 1);
+      }
+      TSType::TSUnionType(u) => {
+        for m in &u.types {
+          self.ret_shape_of(f, m, tp, out, depth + 1);
+        }
+      }
+      TSType::TSTypeReference(r) => {
+        if let TSTypeName::IdentifierReference(id) = &r.type_name {
+          if tp.iter().any(|p| p == id.name.as_str()) {
+            out.param = true;
+            return;
+          }
+        }
+        if let Some((rf, local)) = self.name_in(f, &r.type_name, 0) {
+          let idx = self.index(rf);
+          if idx.file == "Effect.d.ts" && local == "Effect" {
+            out.effect = true;
+            let success = r.type_arguments.as_ref().and_then(|a| a.params.first());
+            match success {
+              Some(TSType::TSTypeReference(sr)) if matches!(&sr.type_name, TSTypeName::IdentifierReference(id) if tp.iter().any(|p| p == id.name.as_str())) =>
+              {
+                out.effect_param = true;
+              }
+              Some(st) if self.classify(f, st, tp, depth + 1).prim_only() => {}
+              _ => out.effect_other = true,
+            }
+            return;
+          }
+        }
+        if self.classify(f, t, tp, depth + 1).prim_only() {
+          out.prim = true;
+        } else {
+          out.other = true;
+        }
+      }
+      _ => {
+        let c = self.classify(f, t, tp, depth + 1);
+        if c.prim_only() {
+          out.prim = true;
+        } else if c.open {
+          out.unknown = true;
+        } else {
+          out.other = true;
+        }
+      }
+    }
   }
 
   /// The parameter bounds shared by the callbacks the function exported as `name` takes: for

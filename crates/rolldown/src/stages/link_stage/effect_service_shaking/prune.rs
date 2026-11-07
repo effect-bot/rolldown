@@ -83,7 +83,7 @@ fn apply_protocols(a: &mut Analysis) {
             stack.extend(a.pts(all).iter().copied());
           }
         }
-        ObjKind::Promise { value } | ObjKind::Wrap(value) => {
+        ObjKind::Promise { value } | ObjKind::Wrap(value) | ObjKind::Typed { slot: value, .. } => {
           stack.extend(a.pts(value).iter().copied());
         }
         ObjKind::Effect { success, .. } if bits & (PROTO_JSON | PROTO_INSPECT) != 0 => {
@@ -149,7 +149,9 @@ pub fn plan(
           }
           candidate_keys.entry(obj).or_default().push(key.clone());
         }
-        ObjKind::Wrap(_) => d.all(),
+        // A summary, or a value made by type-modelled `effect` code, may be any service: its
+        // key keeps every method.
+        ObjKind::Wrap(_) | ObjKind::Typed { .. } => d.all(),
         // Anything else adds no demand. In particular a value from code the pass can't see (an
         // external Layer may provide any key) is another implementation, not a reader of the
         // bundled providers: those are read only through the program's own variables, where

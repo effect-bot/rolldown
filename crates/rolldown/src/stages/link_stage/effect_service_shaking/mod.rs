@@ -217,6 +217,24 @@ impl LinkStage<'_> {
         }
       }
     }
+    // == type-modelled library modules (design section 11): every other module of the `effect`
+    // package, the listed modules' unlisted exports included, is modelled from its `.d.ts`
+    // instead of its body. Its exports are `ObjKind::Typed` values; its body is not generated.
+    // Opt-in while the engine is incomplete: `ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL=1`.
+    let mut typed_modules: FxHashSet<ModuleIdx> = FxHashSet::default();
+    let type_model = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL").is_some();
+    for module in order.iter().map(|idx| &self.module_table.modules[*idx]).filter(|_| type_model) {
+      let Module::Normal(normal) = module else { continue };
+      let is_effect = normal
+        .originative_resolved_id
+        .package_json
+        .as_ref()
+        .is_some_and(|pkg| pkg.name() == Some("effect"));
+      if is_effect && !modelled.contains(&normal.idx) {
+        typed_modules.insert(normal.idx);
+        modelled.insert(normal.idx);
+      }
+    }
     // Model-bound declarations that alias ordinary code, linked once every rule is bound.
     let mut links: Vec<(SymbolRef, SymbolRef)> = vec![];
     // Symbols the model or the build reads outside generated code: their lazy statements run.
@@ -236,19 +254,49 @@ impl LinkStage<'_> {
           chain.into_iter().take_while(|sym| modelled.contains(&sym.owner)).collect();
         let (obj, rank) = match spec {
           Some(spec) => (effect::spec_object(&mut a, spec), BindRank::Rule),
-          None => match chain.iter().find_map(|sym| self.key_declaration_of(*sym)) {
-            Some((key_name, reference)) => {
-              (effect::declared_key(&mut a, key_name.as_deref(), reference), BindRank::Key)
-            }
-            None => {
-              if let Some(target) = generic_target {
-                links.extend(chain.iter().map(|sym| (target, *sym)));
-                continue;
+          None => {
+            match chain.iter().find_map(|sym| self.key_declaration_of(*sym).map(|k| (k, sym.owner)))
+            {
+              Some(((key_name, reference), owner)) => {
+                // A key declared inside type-modelled `effect` code: that code uses its service
+                // in ways the pass can't see, so the key keeps every method.
+                if typed_modules.contains(&owner) {
+                  if let Some(n) = &key_name {
+                    a.never_prune.insert(ArcStr::from(n.as_str()));
+                  }
+                }
+                (effect::declared_key(&mut a, key_name.as_deref(), reference), BindRank::Key)
               }
-              // A public export whose `.d.ts` ignores some arguments (`unknown`/`any`) or bounds
-              // its callbacks' parameters (`useSpan`'s `span: Span`) carries them (design
-              // section 8).
-              let bounds = specs.and_then(|_| {
+              None => {
+                if let Some(target) = generic_target {
+                  links.extend(chain.iter().map(|sym| (target, *sym)));
+                  continue;
+                }
+                if typed_modules.contains(&module) {
+                  let dts = self.module_table[module]
+                    .id()
+                    .as_str()
+                    .strip_suffix(".js")
+                    .map(|js| std::path::PathBuf::from(format!("{js}.d.ts")))
+                    .filter(|p| p.exists());
+                  let obj = a.typed_export(dts, name.clone());
+                  for (i, sym) in chain.into_iter().enumerate() {
+                    let claim = match bind_rank.get(&sym) {
+                      None => true,
+                      Some(held) if i == 0 => *held <= BindRank::Default,
+                      Some(held) => *held < BindRank::Default,
+                    };
+                    if claim {
+                      sh.rule_symbols.insert(sym, obj);
+                      bind_rank.insert(sym, BindRank::Default);
+                    }
+                  }
+                  continue;
+                }
+                // A public export whose `.d.ts` ignores some arguments (`unknown`/`any`) or bounds
+                // its callbacks' parameters (`useSpan`'s `span: Span`) carries them (design
+                // section 8).
+                let bounds = specs.and_then(|_| {
                 let js = self.module_table[module].id().as_str().strip_suffix(".js")?;
                 let dts = std::path::PathBuf::from(format!("{js}.d.ts"));
                 let callbacks = a.dts.callback_bounds(&dts, name.as_str()).map(|b| {
@@ -273,9 +321,10 @@ impl LinkStage<'_> {
                 a.default_bounds.push(heap::DefaultBounds { ignored, callbacks });
                 u32::try_from(a.default_bounds.len() - 1).ok()
               });
-              (effect::default_object(&mut a, bounds), BindRank::Default)
+                (effect::default_object(&mut a, bounds), BindRank::Default)
+              }
             }
-          },
+          }
         };
         // Precedence does not depend on the walk order: an explicit rule beats a Key, and a
         // Key beats the default. `internal/effect.js` is walked before `Effect.js`, and its
@@ -304,7 +353,7 @@ impl LinkStage<'_> {
         let obj = effect::spec_object(&mut a, *spec);
         for sym in self.alias_chain(export.symbol_ref) {
           if sym.owner == *module {
-            sh.rule_symbols.entry(sym).or_insert(obj);
+            sh.rule_symbols.insert(sym, obj);
           }
         }
       }
