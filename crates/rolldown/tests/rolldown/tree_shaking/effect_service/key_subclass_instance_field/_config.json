@@ -1,0 +1,10 @@
+{
+  "_comment": "A subclass of a class-form key is ordinary class code: its constructor stores the service in an instance field, so the service's key bails and every method stays, though none is read.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
