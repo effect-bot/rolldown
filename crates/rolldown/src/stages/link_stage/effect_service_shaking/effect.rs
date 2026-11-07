@@ -466,7 +466,9 @@ fn policy_schedule(a: &mut Analysis, site: Site, policy: VarId) -> VarId {
 
 /// Steps the Schedules in `schedule` once through the bundled stable `Schedule.toStep`, and
 /// returns `(failure, output)`. Services never pass through a Schedule (issue, "Assumptions" 4):
-/// the step gets only the primitives of `input`, and `output` holds only the primitives of what
+/// the step gets `input` without the program's service values (`Analysis::service_free_of`:
+/// ordinary objects keep their structure, so a field may still name a method), and `output`
+/// holds only the primitives of what
 /// it outputs (a Pull's `[output, delay]`, or the `Done` it ends with), so a string may still
 /// name a method, but neither `Effect.repeat`'s result, `retryOrElse`'s fallback nor
 /// `Schedule.CurrentMetadata` carries a service. The Schedule's own code still runs, so
@@ -480,9 +482,9 @@ fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) ->
     let eff = invoke(a, site, to_step, None, vec![schedule]);
     let step = success_of(a, eff);
     let now = prim_var(a);
-    let scalars = a.var();
-    a.primitives_of(input, scalars);
-    let pull = invoke(a, site, step, None, vec![now, scalars]);
+    let admitted = a.var();
+    a.service_free_of(input, admitted);
+    let pull = invoke(a, site, step, None, vec![now, admitted]);
     let ps = success_of(a, pull);
     let decision = elem_of(a, ps);
     a.primitives_of(decision, output);

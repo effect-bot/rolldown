@@ -355,6 +355,10 @@ pub enum Constraint {
   /// `obj` flows into `dst` once anything reaches the variable (a walked object that has the
   /// protocol method loaded into the variable).
   Witness(ObjId, VarId),
+  /// What may enter a Schedule (issue, "Assumptions" 4): primitives and ordinary values flow
+  /// into the variable with their structure, a program service value never does, and a summary
+  /// becomes an unknown scalar (`Analysis::service_free`).
+  ServiceFree(VarId),
 }
 
 impl Key {
@@ -411,6 +415,7 @@ impl Constraint {
         C::Walk { walk: *walk, pool: v(*pool), arg: v(*arg), site: s(*site) }
       }
       C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
+      C::ServiceFree(dst) => C::ServiceFree(v(*dst)),
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
       C::Accessor(acc) => C::Accessor(Accessor {
         this: v(acc.this),
@@ -669,6 +674,8 @@ pub struct Analysis {
   ignored_pool: Option<VarId>,
   prim_arg: Option<VarId>,
   inspect_args: Option<VarId>,
+  /// `ServiceFree` objects waiting for the solve to settle (`service_free`).
+  pending_service_free: Vec<(ObjId, VarId)>,
   then_args: Option<VarId>,
   prim_ty: Option<u32>,
   pub hash_pool: Option<VarId>,
@@ -806,6 +813,7 @@ impl Analysis {
       ignored_pool: None,
       prim_arg: None,
       inspect_args: None,
+      pending_service_free: vec![],
       then_args: None,
       prim_ty: None,
       hash_pool: None,
@@ -1361,7 +1369,7 @@ impl Analysis {
         if self.activation_queue.is_empty() && self.new_constraints.is_empty() {
           // Rejected objects are re-checked as they change; this pass only confirms that
           // nothing became admissible without an event before the solve ends.
-          if self.recheck_all() {
+          if self.recheck_all() | self.admit_service_free() {
             continue;
           }
           break;
@@ -1515,6 +1523,7 @@ impl Analysis {
       }
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
       Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
+      Constraint::ServiceFree(dst) => self.service_free(obj, *dst),
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
       Constraint::EscapeReceiver(flavour, site, name) => {
         self.escape_receiver(obj, *flavour, *site, name);
@@ -2327,6 +2336,45 @@ impl Analysis {
     }
     self.then_args = Some(v);
     v
+  }
+
+  /// `ServiceFree`: a primitive flows on; a summary (which may stand for a service) becomes an
+  /// unknown scalar; a program service value (any key's value, `all_values`) is dropped, for
+  /// good, since being one only grows; any other object waits for the solve to settle, and
+  /// flows on then unless it has become a service value meanwhile. Admitting an object is
+  /// always sound; waiting only keeps a service whose provision is found late out of the
+  /// Schedule.
+  fn service_free(&mut self, obj: ObjId, dst: VarId) {
+    match self.objs[obj].kind {
+      ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim => self.seed(dst, obj),
+      ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. } => {
+        self.seed(dst, self.top_host);
+      }
+      _ => {
+        if !self.vars[self.all_values].pts.contains(&obj) {
+          self.pending_service_free.push((obj, dst));
+        }
+      }
+    }
+  }
+
+  /// Admits the waiting `ServiceFree` objects that are not service values; returns whether any
+  /// flowed.
+  fn admit_service_free(&mut self) -> bool {
+    let pending = std::mem::take(&mut self.pending_service_free);
+    let mut admitted = false;
+    for (obj, dst) in pending {
+      if !self.vars[self.all_values].pts.contains(&obj) && !self.vars[dst].pts.contains(&obj) {
+        self.seed(dst, obj);
+        admitted = true;
+      }
+    }
+    admitted
+  }
+
+  /// What may enter a Schedule from `src` flows into `dst` (`Constraint::ServiceFree`).
+  pub fn service_free_of(&mut self, src: VarId, dst: VarId) {
+    self.constrain(src, Constraint::ServiceFree(dst));
   }
 
   /// The primitives `src` holds flow into `dst`; objects don't, and a summary becomes an
