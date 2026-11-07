@@ -400,10 +400,16 @@ pub fn register(a: &mut Analysis) {
   }
   a.rule("Object.is", |a, c| a.seed(c.ret, a.prim));
   // Reflect
+  // A receiver is the `this` of the accessors the target's class declares: class code when
+  // the target is a class, its prototype or an instance (`Analysis::class_bail`).
   a.rule("Reflect.get", |a, c| {
     let o = arg(a, c, 0);
     let k = arg(a, c, 1);
     a.constrain(o, Constraint::Load { key: Key::Var(k), dst: c.ret });
+    if c.args.len() > 2 || c.has_spread() {
+      let receiver = arg(a, c, 2);
+      a.reflect_receivers.push((o, receiver));
+    }
   });
   a.rule("Reflect.set", |a, c| {
     let o = arg(a, c, 0);
@@ -411,6 +417,10 @@ pub fn register(a: &mut Analysis) {
     let v = arg(a, c, 2);
     a.constrain(o, Constraint::Store { key: Key::Var(k), src: v });
     a.seed(c.ret, a.prim);
+    if c.args.len() > 3 || c.has_spread() {
+      let receiver = arg(a, c, 3);
+      a.reflect_receivers.push((o, receiver));
+    }
   });
   a.rule("Reflect.ownKeys", |a, c| {
     let o = arg(a, c, 0);

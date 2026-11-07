@@ -634,6 +634,15 @@ impl LinkStage<'_> {
 
     let solved = start.elapsed();
     phase!("solved: {}", a.histogram());
+    // Tim's class rule: a service that reaches class code keeps every method.
+    if !a.bail_all {
+      let bailed = a.class_bail();
+      if report_enabled || debug {
+        for (key, why) in &bailed {
+          eprintln!("[effect-service-shaking] class bail: key {key} kept whole, a service {why}");
+        }
+      }
+    }
     if debug {
       let unknown: Vec<String> = a
         .pts(a.unknown_key_values)
