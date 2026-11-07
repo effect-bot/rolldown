@@ -259,6 +259,8 @@ pub enum Constraint {
   Contents(VarId),
   /// Only the callable objects (closures, classes, builtins) of the variable.
   Callables(VarId),
+  /// Only the closures and classes of the variable: callables with a body to analyse.
+  Bodies(VarId),
   /// The name is read on the objects of the variable (no value flows): demand only.
   Demand(ArcStr),
   /// Some unknown name is read on the objects of the variable: demand everything.
@@ -365,6 +367,7 @@ impl Constraint {
       C::ElemOf(x) => C::ElemOf(v(*x)),
       C::Contents(x) => C::Contents(v(*x)),
       C::Callables(x) => C::Callables(v(*x)),
+      C::Bodies(x) => C::Bodies(v(*x)),
       C::AwaitOf(x) => C::AwaitOf(v(*x)),
       C::SpreadTarget(x) => C::SpreadTarget(v(*x)),
       C::ProtoOf(x) => C::ProtoOf(v(*x)),
@@ -621,10 +624,11 @@ pub struct Analysis {
   pub log_annotations: Option<VarId>,
   /// Everything `Effect.log` logs, handed to the installed loggers (`effect::run_loggers`).
   pub log_messages: Option<VarId>,
-  /// Wraps that stand for the Cause `Cause.fail` builds of its error: a named read on one is a
-  /// read on the error (`load_name`). Other wraps, including `Exit.cause`, record only demand: a
-  /// named load through their merged values costs too much on large programs.
+  /// Wraps that stand for a Cause of their errors (`Cause.fail`, `Exit.cause`): a named read on
+  /// one also reads the methods of the errors (`load_name`). Other wraps record only demand.
   transparent_wraps: FxHashSet<ObjId>,
+  /// The methods read by name through a transparent wrap, per wrap and name.
+  transparent_members: FxHashMap<(ObjId, ArcStr), VarId>,
   /// Rule invocations, for diagnostics.
   pub rule_calls: FxHashMap<u16, usize>,
   /// One "any argument" variable per spread call, shared by every `arg` read of that call.
@@ -736,6 +740,7 @@ impl Analysis {
       log_annotations: None,
       log_messages: None,
       transparent_wraps: FxHashSet::default(),
+      transparent_members: FxHashMap::default(),
       rule_calls: FxHashMap::default(),
       rule_memo: FxHashMap::default(),
       spread_any: FxHashMap::default(),
@@ -1335,6 +1340,11 @@ impl Analysis {
         }
       }
       Constraint::DemandAll | Constraint::Enumerate => self.enumerate(obj),
+      Constraint::Bodies(dst) => {
+        if matches!(self.objs[obj].kind, ObjKind::Closure(_) | ObjKind::Class { .. }) {
+          self.seed(*dst, obj);
+        }
+      }
       Constraint::Callables(dst) => {
         if matches!(
           self.objs[obj].kind,
@@ -1536,13 +1546,28 @@ impl Analysis {
       }
       ObjKind::Wrap(inner) => {
         // Any access path yields the wrapped values; the read is recorded on them. Through a
-        // Cause from `Cause.fail` it is a read on the error itself, so a method read back
-        // through it is the method, and calling it runs its body (`transparent_wraps`). A
+        // Cause (`Cause.fail`, `Exit.cause`) it is also a read on the errors, so a method read
+        // back through it is the method, and calling it runs its body (`transparent_wraps`). A
         // default-rule wrap does not need that: the rule already calls every callable its
         // arguments hold.
         self.copy(inner, dst);
         if self.transparent_wraps.contains(&obj) {
-          self.constrain(inner, Constraint::Load { key: Key::Name(name.clone()), dst });
+          // Only the members with a body: the wrapped values themselves already flow, and a
+          // call needs the method. Data members would merge every error's fields, and a
+          // builtin member has no body (calling the wrap runs the callbacks handed to it).
+          // One load per wrap and name: a wrap reached by many variables is read many times.
+          let bodies = match self.transparent_members.get(&(obj, name.clone())) {
+            Some(v) => *v,
+            None => {
+              let member = self.var();
+              let bodies = self.var();
+              self.constrain(inner, Constraint::Load { key: Key::Name(name.clone()), dst: member });
+              self.constrain(member, Constraint::Bodies(bodies));
+              self.transparent_members.insert((obj, name.clone()), bodies);
+              bodies
+            }
+          };
+          self.copy(bodies, dst);
         } else {
           self.constrain(inner, Constraint::Demand(name.clone()));
         }
@@ -2306,8 +2331,8 @@ impl Analysis {
     self.holder(w)
   }
 
-  /// The Cause `Cause.fail` builds of the errors in `inner`: a wrap whose named reads read the
-  /// errors themselves.
+  /// A Cause of the errors in `inner` (`Cause.fail`, `Exit.cause`): a wrap whose named reads
+  /// also read the errors' methods.
   pub fn cause_of(&mut self, inner: VarId, site: Site) -> VarId {
     let v = self.wrap_of(inner, site);
     let w = self.wraps[&inner];

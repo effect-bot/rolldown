@@ -1524,7 +1524,7 @@ pub fn register(a: &mut Analysis) {
   a.rule("Exit.cause:get", |a, c| {
     let e = this_of(a, c);
     let fl = failure_of(a, e);
-    let cause = wrap(a, c.site, fl);
+    let cause = a.cause_of(fl, c.site);
     a.copy(cause, c.ret);
   });
   dual!(a, "effect:Effect.provide", 2, |a, c| {
@@ -2020,7 +2020,7 @@ pub fn register(a: &mut Analysis) {
   // == Read-back of values Effect stores for the program
 
   a.rule("effect:Cause.fail", |a, c| {
-    // `Cause.fail(error)`: a Cause of the error (`cause_of`), a wrap as `Exit.cause` is. The
+    // `Cause.fail(error)`: a Cause of the error (`cause_of`), as `Exit.cause` is. The
     // error is read back through the Cause (`Cause.findError`, `Effect.catch` of
     // `Effect.failCause`); nothing else is read on it.
     let error = arg(a, c, 0);
