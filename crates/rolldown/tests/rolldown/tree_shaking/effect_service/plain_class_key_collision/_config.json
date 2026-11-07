@@ -1,0 +1,10 @@
+{
+  "_comment": "A plain class (not built from Context.Service or Context.Reference) whose static `key` equals a provided service's key, handed to the default-modelled `Effect.succeedSome`; the program reads every value of the class back. The class is not a key, so nothing looks the service up through it: the method the program calls stays, the one nothing reads is removed, and the bundle runs. Red until a class counts as a key only when its heritage reaches a key.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
