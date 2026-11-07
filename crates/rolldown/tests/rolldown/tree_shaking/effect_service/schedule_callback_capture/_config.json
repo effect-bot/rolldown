@@ -1,0 +1,10 @@
+{
+  "_comment": "Two Schedule.map callbacks on Schedule.recurs(0), which run only when the Schedule completes, call a method of the service they close over: one returns a plain value, the other an Effect (mapped with Effect's internal map). Each method stays and the bundle runs; the unread method is removed. Guards that callbacks still run once Schedule values are untracked.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

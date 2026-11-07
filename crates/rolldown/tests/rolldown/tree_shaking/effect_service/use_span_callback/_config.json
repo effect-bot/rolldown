@@ -1,0 +1,10 @@
+{
+  "_comment": "An Effect.useSpan callback stores the service it closes over as a span attribute and calls one of its methods. Spans never carry services, so the attribute value is not tracked and keeps nothing: the called method stays and the bundle runs; the method nothing calls is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

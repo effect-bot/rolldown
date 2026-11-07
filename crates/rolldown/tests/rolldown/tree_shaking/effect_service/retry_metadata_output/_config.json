@@ -1,5 +1,5 @@
 {
-  "_comment": "Effect.retry provides Schedule.CurrentMetadata to each retry; its output is the Schedule's output, here the service, and the retry calls a method on it: that method stays, the unread one is removed.",
+  "_comment": "Effect.retry provides Schedule.CurrentMetadata to each retry; its output is the Schedule's output, here the service. Services never pass through a Schedule (assumption 4), so the read keeps nothing: both method definitions are removed and the bundle is not run.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

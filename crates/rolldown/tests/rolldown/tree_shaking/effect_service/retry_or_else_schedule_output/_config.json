@@ -1,5 +1,5 @@
 {
-  "_comment": "When Effect.retryOrElse's Schedule is exhausted, orElse receives the Schedule's last output, here the service: the method orElse calls on it stays, the unread one is removed.",
+  "_comment": "When Effect.retryOrElse's Schedule is exhausted, orElse receives the Schedule's last output, here the service. Services never pass through a Schedule (assumption 4), so the read keeps nothing: both method definitions are removed and the bundle is not run.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

@@ -1,5 +1,5 @@
 {
-  "_comment": "Effect.repeat provides Schedule.CurrentMetadata to each attempt; its input is the previous attempt's success, the service, and the next attempt calls a method on it: that method stays, the unread one is removed.",
+  "_comment": "Effect.repeat provides Schedule.CurrentMetadata to each attempt; its input is the previous attempt's success, here the service, so the service is the Schedule's input. Services never pass through a Schedule (assumption 4), so the read keeps nothing: both method definitions are removed and the bundle is not run.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

@@ -1,5 +1,5 @@
 {
-  "_comment": "Schedule (a public module outside the model) maps a user callback's Effect with internal/effect.js's map, and Effect.repeat with that schedule succeeds with the schedule's output, the service: the method read on it stays, the unread one is removed.",
+  "_comment": "Effect.repeat with a Schedule returns the Schedule's output; here Schedule.map's callback returns an Effect of the service, so the service is that output. Services never pass through a Schedule (assumption 4), so the read keeps nothing: both method definitions are removed and the bundle is not run. A Schedule callback's Effect calling a captured service is guarded by schedule_callback_capture.",
   "config": {
     "experimental": {
       "effectServiceShaking": true
