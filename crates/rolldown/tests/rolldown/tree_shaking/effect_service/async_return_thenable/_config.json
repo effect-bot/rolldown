@@ -1,0 +1,10 @@
+{
+  "_comment": "An async function returns a service that is a thenable, so the host adopts it and calls its then with resolve functions. then resolves with a nested thenable, adopted in turn, whose then calls another method of the service: that method stays, the unread one is removed and the bundle runs. Guards that host adoption runs then, not only reads it.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
