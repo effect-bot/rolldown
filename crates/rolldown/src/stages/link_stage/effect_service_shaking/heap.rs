@@ -100,6 +100,11 @@ pub enum Walk {
   /// `Equal.equals`: `[Equal.symbol]`, which receives the walked values that have one
   /// (`compareStructure` calls it only when both sides do). Both sides are hashed too.
   Equal,
+  /// `JSON.stringify` (`Protocol::Json`): `toJSON`, with the key.
+  Json,
+  /// `console.*` and `util.inspect` (`Protocol::Inspect`): `[util.inspect.custom]`, with the
+  /// depth, the options and `util.inspect`.
+  Inspect,
 }
 
 /// `Symbol.for("~effect/Redactable")`, `Equal.symbol` and `Hash.symbol` as model keys.
@@ -108,16 +113,15 @@ pub const EQUAL_KEY: &str = "~effect/Equal";
 pub const HASH_KEY: &str = "~effect/Hash";
 
 impl Walk {
-  /// The methods the walk calls on each object, and whether each receives the walk's argument.
-  fn protocols(self) -> &'static [(&'static str, bool)] {
+  /// The methods the walk calls on each object, and how many arguments each receives (each
+  /// one the walk's argument variable).
+  fn protocols(self) -> &'static [(&'static str, usize)] {
     match self {
-      Walk::Format => {
-        &[("toString", false), ("toJSON", false), ("toISOString", false), (REDACTABLE_KEY, true)]
-      }
-      Walk::Hash => {
-        &[(HASH_KEY, false), ("getTime", false), ("toISOString", false), ("toString", false)]
-      }
-      Walk::Equal => &[(EQUAL_KEY, true)],
+      Walk::Format => &[("toString", 0), ("toJSON", 0), ("toISOString", 0), (REDACTABLE_KEY, 1)],
+      Walk::Hash => &[(HASH_KEY, 0), ("getTime", 0), ("toISOString", 0), ("toString", 0)],
+      Walk::Equal => &[(EQUAL_KEY, 1)],
+      Walk::Json => &[("toJSON", 1)],
+      Walk::Inspect => &[(super::host::INSPECT_CUSTOM, 3)],
     }
   }
 }
@@ -309,6 +313,12 @@ pub enum Constraint {
   /// `obj` flows into `dst` once anything reaches the variable (a walked object that has the
   /// protocol method loaded into the variable).
   Witness(ObjId, VarId),
+  /// `src` flows into `dst` once an object that may be an Effect reaches the variable (an
+  /// Effect, or a value the pass can't see into).
+  IfEffect {
+    src: VarId,
+    dst: VarId,
+  },
 }
 
 impl Key {
@@ -364,6 +374,7 @@ impl Constraint {
         C::Walk { walk: *walk, pool: v(*pool), arg: v(*arg), site: s(*site) }
       }
       C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
+      C::IfEffect { src, dst } => C::IfEffect { src: v(*src), dst: v(*dst) },
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
       C::Accessor(acc) => C::Accessor(Accessor {
         this: v(acc.this),
@@ -601,6 +612,19 @@ pub struct Analysis {
   /// The program-wide pools of the formatting and hashing walks (`Walk`).
   pub format_pool: Option<VarId>,
   pub hash_pool: Option<VarId>,
+  /// The program-wide pools of host serialization and inspection (`host_protocol`).
+  json_pool: Option<VarId>,
+  inspect_pool: Option<VarId>,
+  /// Objects whose primitive conversion methods have been called.
+  primitive_converted: FxHashSet<ObjId>,
+  /// The record behind `References.CurrentLogAnnotations` (`effect:Effect.annotateLogs`).
+  pub log_annotations: Option<VarId>,
+  /// Everything `Effect.log` logs, handed to the installed loggers (`effect::run_loggers`).
+  pub log_messages: Option<VarId>,
+  /// Wraps that stand for the Cause `Cause.fail` builds of its error: a named read on one is a
+  /// read on the error (`load_name`). Other wraps, including `Exit.cause`, record only demand: a
+  /// named load through their merged values costs too much on large programs.
+  transparent_wraps: FxHashSet<ObjId>,
   /// Rule invocations, for diagnostics.
   pub rule_calls: FxHashMap<u16, usize>,
   /// One "any argument" variable per spread call, shared by every `arg` read of that call.
@@ -706,6 +730,12 @@ impl Analysis {
       walked: FxHashSet::default(),
       format_pool: None,
       hash_pool: None,
+      json_pool: None,
+      inspect_pool: None,
+      primitive_converted: FxHashSet::default(),
+      log_annotations: None,
+      log_messages: None,
+      transparent_wraps: FxHashSet::default(),
       rule_calls: FxHashMap::default(),
       rule_memo: FxHashMap::default(),
       spread_any: FxHashMap::default(),
@@ -1326,6 +1356,7 @@ impl Analysis {
         };
         self.objs[obj].protocols |= bit;
         let _ = var;
+        self.host_protocol(obj, *protocol);
       }
       Constraint::SpreadInto(target) => self.spread_into(obj, *target),
       Constraint::SpreadTarget(src) => self.constrain(*src, Constraint::SpreadInto(obj)),
@@ -1378,6 +1409,15 @@ impl Analysis {
       Constraint::Inherits(heir) => self.inherit(*heir, obj),
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
       Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
+      Constraint::IfEffect { src, dst } => {
+        if matches!(
+          self.objs[obj].kind,
+          ObjKind::Effect { .. } | ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. }
+        ) || self.is_default(obj)
+        {
+          self.copy(*src, *dst);
+        }
+      }
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
       Constraint::EscapeReceiver(flavour, site, name) => {
         self.escape_receiver(obj, *flavour, *site, name);
@@ -1495,9 +1535,17 @@ impl Analysis {
         }
       }
       ObjKind::Wrap(inner) => {
-        // Any access path yields the wrapped values; the read is recorded on them.
+        // Any access path yields the wrapped values; the read is recorded on them. Through a
+        // Cause from `Cause.fail` it is a read on the error itself, so a method read back
+        // through it is the method, and calling it runs its body (`transparent_wraps`). A
+        // default-rule wrap does not need that: the rule already calls every callable its
+        // arguments hold.
         self.copy(inner, dst);
-        self.constrain(inner, Constraint::Demand(name.clone()));
+        if self.transparent_wraps.contains(&obj) {
+          self.constrain(inner, Constraint::Load { key: Key::Name(name.clone()), dst });
+        } else {
+          self.constrain(inner, Constraint::Demand(name.clone()));
+        }
         self.seed(dst, obj);
       }
       ObjKind::Top(flavour) => {
@@ -2258,6 +2306,15 @@ impl Analysis {
     self.holder(w)
   }
 
+  /// The Cause `Cause.fail` builds of the errors in `inner`: a wrap whose named reads read the
+  /// errors themselves.
+  pub fn cause_of(&mut self, inner: VarId, site: Site) -> VarId {
+    let v = self.wrap_of(inner, site);
+    let w = self.wraps[&inner];
+    self.transparent_wraps.insert(w);
+    v
+  }
+
   pub fn top_of(&self, obj: ObjId) -> ObjId {
     match self.objs[obj].kind {
       ObjKind::Top(Flavour::Ext) | ObjKind::External { flavour: Flavour::Ext, .. } => self.top_ext,
@@ -2448,24 +2505,11 @@ impl Analysis {
           self.constrain(proto, again);
         }
         let this = self.holder(obj);
-        for (name, takes_arg) in walk.protocols() {
-          let method = self.var();
-          self
-            .constrain(this, Constraint::Load { key: Key::Name(ArcStr::from(*name)), dst: method });
+        for (name, arity) in walk.protocols() {
+          let method = self.protocol_call(this, name, *arity, arg, site, pool);
           if walk == Walk::Equal {
             self.constrain(method, Constraint::Witness(obj, arg));
           }
-          let ret = self.var();
-          let call = Call {
-            site: site.sub(method),
-            this: Some(this),
-            args: if *takes_arg { vec![Arg::Var(arg)] } else { vec![] },
-            ret,
-            is_new: false,
-            builtin: None,
-          };
-          self.constrain(method, Constraint::Call(Box::new(call)));
-          self.copy(ret, pool);
         }
       }
       // Printing an Effect (an Exit, say) prints what it holds; comparing two compares them.
@@ -2481,8 +2525,104 @@ impl Analysis {
         self.constrain(keys, Constraint::KeyUse(KeyUse::Lookup(services)));
         self.constrain(services, again);
       }
+      // Host printing of Effect's containers runs Effect's own `toJSON`/inspect, which prints
+      // the entries' services (as `prune::apply_protocols` assumes); a Promise prints its value.
+      ObjKind::Context { .. } | ObjKind::Runtime { .. } | ObjKind::Fiber
+        if matches!(walk, Walk::Json | Walk::Inspect) =>
+      {
+        self.copy(self.all_values, pool);
+      }
+      ObjKind::Promise { value } if matches!(walk, Walk::Json | Walk::Inspect) => {
+        self.constrain(value, again);
+      }
       _ => {}
     }
+  }
+
+  /// `this.name(arg, ...)` with `arity` copies of `arg`, as a protocol call: the method is
+  /// loaded by name (a read) and its result flows to `ret`. Returns the method variable.
+  fn protocol_call(
+    &mut self,
+    this: VarId,
+    name: &str,
+    arity: usize,
+    arg: VarId,
+    site: Site,
+    ret: VarId,
+  ) -> VarId {
+    let method = self.var();
+    self.constrain(this, Constraint::Load { key: Key::Name(ArcStr::from(name)), dst: method });
+    let result = self.var();
+    let call = Call {
+      site: site.sub(method),
+      this: Some(this),
+      args: vec![Arg::Var(arg); arity],
+      ret: result,
+      is_new: false,
+      builtin: None,
+    };
+    self.constrain(method, Constraint::Call(Box::new(call)));
+    self.copy(result, ret);
+    method
+  }
+
+  /// Host formatting (`Constraint::Protocol`) runs the protocol methods it calls, so their
+  /// bodies count; `prune::apply_protocols` also records them as demand. String and number
+  /// conversion calls `toString`, `valueOf` and `[Symbol.toPrimitive]` on the value itself.
+  /// `JSON.stringify` and `console.*`/`util.inspect` recurse, through the program-wide walks
+  /// `Walk::Json` and `Walk::Inspect`.
+  fn host_protocol(&mut self, obj: ObjId, protocol: Protocol) {
+    match protocol {
+      Protocol::Primitive => {
+        if !matches!(
+          self.objs[obj].kind,
+          ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. }
+        ) || !self.primitive_converted.insert(obj)
+        {
+          return;
+        }
+        let this = self.holder(obj);
+        let arg = self.var();
+        self.seed(arg, self.prim);
+        let ret = self.var();
+        let site = protocol_site(1);
+        for name in ["toString", "valueOf", "@@toPrimitive"] {
+          self.protocol_call(this, name, 1, arg, site, ret);
+        }
+      }
+      Protocol::Json | Protocol::Inspect => {
+        let pool = self.protocol_pool(protocol);
+        self.seed(pool, obj);
+      }
+    }
+  }
+
+  fn protocol_pool(&mut self, protocol: Protocol) -> VarId {
+    let (existing, walk, n) = match protocol {
+      Protocol::Json => (self.json_pool, Walk::Json, 2),
+      _ => (self.inspect_pool, Walk::Inspect, 3),
+    };
+    if let Some(pool) = existing {
+      return pool;
+    }
+    let pool = self.var();
+    if walk == Walk::Json {
+      self.json_pool = Some(pool);
+    } else {
+      self.inspect_pool = Some(pool);
+    }
+    // `toJSON(key)`; `[util.inspect.custom](depth, options, inspect)`.
+    let arg = self.var();
+    self.seed(arg, self.prim);
+    if walk == Walk::Inspect {
+      self.seed(arg, self.top_host);
+      if let Some(id) = self.rule_id("util.inspect") {
+        let inspect = self.builtin(id, None, None);
+        self.seed(arg, inspect);
+      }
+    }
+    self.constrain(pool, Constraint::Walk { walk, pool, arg, site: protocol_site(n) });
+    pool
   }
 
   pub fn enumerate(&mut self, obj: ObjId) {
@@ -2704,4 +2844,9 @@ fn function_prototype_rule(a: &Analysis, name: &str) -> Option<u16> {
     "bind" => "Function.prototype.bind",
     _ => return None,
   })
+}
+
+/// A call site no source position has, for the protocol calls of host formatting.
+fn protocol_site(n: u32) -> Site {
+  Site { module: ModuleIdx::from_raw(0), start: u32::MAX - 16 - n, sub: 0 }
 }

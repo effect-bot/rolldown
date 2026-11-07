@@ -31,6 +31,10 @@ pub const PARENT_SPAN_KEY: &str = "effect/Tracer/ParentSpan";
 pub const FIBER_METRICS_KEY: &str = "effect/Metric/FiberRuntimeMetrics";
 /// `Schedule.CurrentMetadata` (stable), which `repeat` and `retry` provide to each attempt.
 pub const SCHEDULE_METADATA_KEY: &str = "effect/Schedule/CurrentMetadata";
+/// `References.CurrentLogAnnotations` (stable), the record `Effect.annotateLogs` writes.
+pub const LOG_ANNOTATIONS_KEY: &str = "effect/References/CurrentLogAnnotations";
+/// `Logger.CurrentLoggers` (stable): the Set of loggers `Effect.log` calls.
+pub const CURRENT_LOGGERS_KEY: &str = "effect/Logger/CurrentLoggers";
 
 /// How a public export of a modelled module is bound.
 #[derive(Clone, Copy, Debug)]
@@ -214,7 +218,7 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("withSpan", Spec::Rule("effect:Effect.passthrough")),
       ("withSpanScoped", Spec::Rule("effect:Effect.passthrough")),
       ("withParentSpan", Spec::Rule("effect:Effect.passthrough")),
-      ("annotateLogs", Spec::Rule("effect:Effect.passthrough")),
+      ("annotateLogs", Spec::Rule("effect:Effect.annotateLogs")),
       ("annotateSpans", Spec::Rule("effect:Effect.passthrough")),
       ("withLogSpan", Spec::Rule("effect:Effect.passthrough")),
       ("withTracer", Spec::Rule("effect:Effect.passthrough")),
@@ -365,6 +369,8 @@ pub const LISTED_MODULES: &[(&str, &[(&str, Spec)])] = &[
     ],
   ),
   ("Equal", &[("equals", Spec::Rule("effect:Equal.equals"))]),
+  ("Cause", &[("fail", Spec::Rule("effect:Cause.fail"))]),
+  ("Logger", &[("make", Spec::Rule("effect:Logger.make"))]),
   ("Hash", &[("hash", Spec::Rule("effect:Hash.hash"))]),
 ];
 
@@ -519,6 +525,74 @@ fn hash_pool(a: &mut Analysis) -> VarId {
   let site = walk_site(2);
   a.constrain(pool, Constraint::Walk { walk: Walk::Hash, pool, arg, site });
   pool
+}
+
+/// What `Effect.log` and its level variants log reaches the installed loggers: the values of
+/// `Logger.CurrentLoggers` (a Set of loggers), whose `log` is called with
+/// `{ cause, fiber, date, logLevel, message }`. One call for the program: every message joins
+/// it.
+fn run_loggers(a: &mut Analysis, messages: &[VarId]) {
+  let pool = match a.log_messages {
+    Some(pool) => pool,
+    None => {
+      let pool = a.var();
+      a.log_messages = Some(pool);
+      let site = walk_site(3);
+      let (options, options_var) = new_object(a, site, 1);
+      let (_, message, elem) = new_array(a, site, 2);
+      a.copy(pool, elem);
+      let cause = wrap(a, site, pool);
+      let fb = fiber(a);
+      let prim = prim_var(a);
+      for (name, value) in
+        [("message", message), ("cause", cause), ("fiber", fb), ("date", prim), ("logLevel", prim)]
+      {
+        let field = a.field(options, &ArcStr::from(name));
+        a.copy(value, field);
+      }
+      let loggers = a.var();
+      let value = a.key_value_var(&ArcStr::from(CURRENT_LOGGERS_KEY));
+      a.copy(value, loggers);
+      let logger = elem_of(a, loggers);
+      let log = load(a, logger, "log");
+      invoke(a, site, log, Some(logger), vec![options_var]);
+      pool
+    }
+  };
+  for m in messages {
+    a.copy(*m, pool);
+  }
+}
+
+/// The record behind `References.CurrentLogAnnotations`, and a variable holding it.
+fn log_annotations(a: &mut Analysis) -> (ObjId, VarId) {
+  if let Some(holder) = a.log_annotations {
+    let record = *a.pts(holder).iter().next().expect("the annotations record");
+    return (record, holder);
+  }
+  let record = a.alloc(ObjKind::Object, None);
+  let holder = a.holder(record);
+  a.log_annotations = Some(holder);
+  let value = a.key_value_var(&ArcStr::from(LOG_ANNOTATIONS_KEY));
+  a.seed(value, record);
+  (record, holder)
+}
+
+/// `value` stored in the annotations record under the string keys of `key`.
+fn annotate_key(a: &mut Analysis, holder: VarId, key: VarId, value: VarId) {
+  let keys = a.var();
+  a.constrain(key, Constraint::MapKeys(keys));
+  a.constrain(keys, Constraint::StoreThrough { base: holder, src: value });
+}
+
+/// The annotated effect: `effect` with its success and failure.
+fn annotated(a: &mut Analysis, site: Site, effect: VarId, ret: VarId) {
+  let (out, os, of) = new_effect(a, site, 1);
+  let s = success_of(a, effect);
+  a.copy(s, os);
+  let fl = failure_of(a, effect);
+  a.copy(fl, of);
+  a.copy(out, ret);
 }
 
 /// One `Equal.equals` call site: its values are walked and hashed, and each `[Equal.symbol]`
@@ -1943,13 +2017,90 @@ pub fn register(a: &mut Analysis) {
     a.seed(c.ret, a.prim);
   });
 
+  // == Read-back of values Effect stores for the program
+
+  a.rule("effect:Cause.fail", |a, c| {
+    // `Cause.fail(error)`: a Cause of the error (`cause_of`), a wrap as `Exit.cause` is. The
+    // error is read back through the Cause (`Cause.findError`, `Effect.catch` of
+    // `Effect.failCause`); nothing else is read on it.
+    let error = arg(a, c, 0);
+    let inner = a.var();
+    a.copy(error, inner);
+    let cause = a.cause_of(inner, c.site);
+    a.copy(cause, c.ret);
+  });
+  a.rule("effect:Effect.annotateLogs", |a, c| {
+    // `annotateLogs(key, value)` and `annotateLogs(record)` return `self => self` with the
+    // annotations; `annotateLogs(self, key, value)` and `annotateLogs(self, record)` add them to
+    // `self`. Annotations are read back only as the record `References.CurrentLogAnnotations`
+    // holds, of unknown values: every call writes into one program-wide record, that key's value.
+    let (record, holder) = log_annotations(a);
+    let id = a.rule_id("effect:identity").expect("registered");
+    let identity = a.builtin(id, None, None);
+    if c.has_spread() {
+      // Which argument is which is unknown: any of them may be a key, a value or a record.
+      let any = arg(a, c, 0);
+      let keys = a.var();
+      a.seed(keys, a.all_keys);
+      a.constrain(keys, Constraint::StoreThrough { base: holder, src: any });
+      a.constrain(any, Constraint::SpreadInto(record));
+      annotated(a, c.site, any, c.ret);
+      a.seed(c.ret, identity);
+      return;
+    }
+    match c.args.len() {
+      0 => a.seed(c.ret, identity),
+      1 => {
+        let values = arg(a, c, 0);
+        a.constrain(values, Constraint::SpreadInto(record));
+        a.seed(c.ret, identity);
+      }
+      2 => {
+        // `(key, value)`, or `(self, record)` when argument 0 is an Effect.
+        let first = arg(a, c, 0);
+        let second = arg(a, c, 1);
+        annotate_key(a, holder, first, second);
+        let values = a.var();
+        a.constrain(first, Constraint::IfEffect { src: second, dst: values });
+        a.constrain(values, Constraint::SpreadInto(record));
+        annotated(a, c.site, first, c.ret);
+        a.seed(c.ret, identity);
+      }
+      _ => {
+        let effect = arg(a, c, 0);
+        let key = arg(a, c, 1);
+        let value = arg(a, c, 2);
+        annotate_key(a, holder, key, value);
+        annotated(a, c.site, effect, c.ret);
+      }
+    }
+  });
+
   a.rule("effect:Effect.log", |a, c| {
+    let mut messages = vec![];
     for x in args_from(a, c, 0) {
       let (Arg::Var(v) | Arg::Spread(v)) = x;
       a.constrain(v, Constraint::Protocol(super::heap::Protocol::Inspect));
+      messages.push(match x {
+        Arg::Var(v) => v,
+        Arg::Spread(v) => elem_of(a, v),
+      });
     }
+    run_loggers(a, &messages);
     let (out, _, _) = new_effect(a, c.site, 1);
     a.copy(out, c.ret);
+  });
+  a.rule("effect:Logger.make", |a, c| {
+    // `Logger.make(log)`: a logger whose `log` the runtime calls for each log (`run_loggers`).
+    let log = arg(a, c, 0);
+    let (logger, v) = new_object(a, c.site, 7);
+    let field = a.field(logger, &ArcStr::from("log"));
+    a.copy(log, field);
+    let id = a.rule_id("effect:Pipeable.pipe").expect("registered");
+    let pipe = a.builtin(id, None, None);
+    let field = a.field(logger, &ArcStr::from("pipe"));
+    a.seed(field, pipe);
+    a.copy(v, c.ret);
   });
 
   // == Layer
