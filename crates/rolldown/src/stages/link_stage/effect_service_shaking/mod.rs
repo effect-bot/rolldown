@@ -245,7 +245,35 @@ impl LinkStage<'_> {
                 links.extend(chain.iter().map(|sym| (target, *sym)));
                 continue;
               }
-              (effect::default_object(&mut a), BindRank::Default)
+              // A public export whose `.d.ts` ignores some arguments (`unknown`/`any`) or bounds
+              // its callbacks' parameters (`useSpan`'s `span: Span`) carries them (design
+              // section 8).
+              let bounds = specs.and_then(|_| {
+                let js = self.module_table[module].id().as_str().strip_suffix(".js")?;
+                let dts = std::path::PathBuf::from(format!("{js}.d.ts"));
+                let callbacks = a.dts.callback_bounds(&dts, name.as_str()).map(|b| {
+                  b.into_iter().map(|t| t.map(|t| a.intern_ty(t))).collect::<Vec<_>>()
+                });
+                let ignored: Vec<Vec<bool>> = (0..=4)
+                  .map(|n| {
+                    let b = a.dts.bounds(&dts, name.as_str(), n);
+                    b.params.iter().map(|t| t.as_ref().is_some_and(|t| t.ignored && t.prim_only())).collect()
+                  })
+                  .collect();
+                if callbacks.is_none() && ignored.iter().all(|v| v.iter().all(|x| !x)) {
+                  return None;
+                }
+                if debug {
+                  eprintln!(
+                    "[effect-service-shaking] default export {} {name}: ignored {ignored:?}, callbacks {}",
+                    dts.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                    callbacks.is_some()
+                  );
+                }
+                a.default_bounds.push(heap::DefaultBounds { ignored, callbacks });
+                u32::try_from(a.default_bounds.len() - 1).ok()
+              });
+              (effect::default_object(&mut a, bounds), BindRank::Default)
             }
           },
         };
@@ -452,8 +480,11 @@ impl LinkStage<'_> {
         continue;
       }
       let Some(ast) = self.ast_table[normal.idx].as_ref() else { continue };
-      for (name, span, nparams) in exported_functions(ast.program()) {
-        a.lazy_bounds.insert((normal.idx, span), (dts_path.clone(), name, nparams));
+      for (name, f, returned) in exported_functions(ast.program()) {
+        a.lazy_bounds.insert((normal.idx, f.0), (dts_path.clone(), name.clone(), f.1, false));
+        if let Some(r) = returned {
+          a.lazy_bounds.entry((normal.idx, r.0)).or_insert((dts_path.clone(), name, r.1, true));
+        }
       }
     }
 
@@ -465,9 +496,10 @@ impl LinkStage<'_> {
     a.solve();
     if debug {
       eprintln!(
-        "[effect-service-shaking] type bounds: {} exported functions resolved, {} not called; {} .d.ts files, {} ms",
+        "[effect-service-shaking] type bounds: {} exported functions resolved, {} not called, {} default exports bounded; {} .d.ts files, {} ms",
         a.bounded_functions(),
         a.lazy_bounds.len(),
+        a.default_bounds.len(),
         a.dts.files_parsed.get(),
         a.dts.resolve_ns.get() / 1_000_000
       );
@@ -759,13 +791,50 @@ fn find_top_level_init<'a>(
   None
 }
 
-/// The exported functions of a module: export name, the span start of the function that runs
-/// (for `dual(arity, body)`, the body), and its parameter count.
-fn exported_functions(program: &oxc::ast::ast::Program<'_>) -> Vec<(ArcStr, u32, usize)> {
-  fn function_of(e: &Expression<'_>) -> Option<(u32, usize)> {
+/// A function: its span start and parameter count.
+type FnAt = (u32, usize);
+
+/// The exported functions of a module: export name, the function that runs (for
+/// `dual(arity, body)`, the body), and the function literal it returns directly, if any
+/// (`return (input) => ...`), whose parameters the declared return type bounds.
+fn exported_functions(program: &oxc::ast::ast::Program<'_>) -> Vec<(ArcStr, FnAt, Option<FnAt>)> {
+  fn literal(e: &Expression<'_>) -> Option<FnAt> {
     match e.without_parentheses() {
       Expression::ArrowFunctionExpression(f) => Some((f.span.start, f.params.items.len())),
       Expression::FunctionExpression(f) => Some((f.span.start, f.params.items.len())),
+      _ => None,
+    }
+  }
+  /// The function literal a body returns, when its only top-level `return` returns one.
+  fn returned(body: &oxc::ast::ast::FunctionBody<'_>) -> Option<FnAt> {
+    let mut found = None;
+    for stmt in &body.statements {
+      if let Statement::ReturnStatement(r) = stmt {
+        if found.is_some() {
+          return None;
+        }
+        found = Some(literal(r.argument.as_ref()?)?);
+      }
+    }
+    found
+  }
+  fn with_returned(e: &Expression<'_>) -> Option<(FnAt, Option<FnAt>)> {
+    match e.without_parentheses() {
+      Expression::ArrowFunctionExpression(f) => {
+        let ret = match &f.body {
+          oxc::ast::ast::ArrowFunctionBody::FunctionBody(b) => returned(b),
+          other => other.as_expression().and_then(literal),
+        };
+        Some(((f.span.start, f.params.items.len()), ret))
+      }
+      Expression::FunctionExpression(f) => {
+        Some(((f.span.start, f.params.items.len()), f.body.as_ref().and_then(|b| returned(b))))
+      }
+      _ => None,
+    }
+  }
+  fn function_of(e: &Expression<'_>) -> Option<(FnAt, Option<FnAt>)> {
+    match e.without_parentheses() {
       Expression::CallExpression(c) => {
         let is_dual = match &c.callee {
           Expression::Identifier(i) => i.name.as_str() == "dual",
@@ -775,16 +844,12 @@ fn exported_functions(program: &oxc::ast::ast::Program<'_>) -> Vec<(ArcStr, u32,
         if !is_dual {
           return None;
         }
-        match c.arguments.get(1)?.as_expression()?.without_parentheses() {
-          Expression::ArrowFunctionExpression(f) => Some((f.span.start, f.params.items.len())),
-          Expression::FunctionExpression(f) => Some((f.span.start, f.params.items.len())),
-          _ => None,
-        }
+        with_returned(c.arguments.get(1)?.as_expression()?)
       }
-      _ => None,
+      e => with_returned(e),
     }
   }
-  let mut locals: FxHashMap<&str, (u32, usize)> = FxHashMap::default();
+  let mut locals: FxHashMap<&str, (FnAt, Option<FnAt>)> = FxHashMap::default();
   let mut exported: Vec<(ArcStr, &str)> = vec![];
   for stmt in &program.body {
     let (decl, is_export) = match stmt {
@@ -819,7 +884,8 @@ fn exported_functions(program: &oxc::ast::ast::Program<'_>) -> Vec<(ArcStr, u32,
       }
       oxc::ast::ast::Declaration::FunctionDeclaration(f) => {
         if let Some(id) = &f.id {
-          locals.insert(id.name.as_str(), (f.span.start, f.params.items.len()));
+          let ret = f.body.as_ref().and_then(|b| returned(b));
+          locals.insert(id.name.as_str(), ((f.span.start, f.params.items.len()), ret));
           if is_export {
             exported.push((ArcStr::from(id.name.as_str()), id.name.as_str()));
           }
@@ -830,6 +896,6 @@ fn exported_functions(program: &oxc::ast::ast::Program<'_>) -> Vec<(ArcStr, u32,
   }
   exported
     .into_iter()
-    .filter_map(|(name, local)| locals.get(local).map(|&(span, n)| (name, span, n)))
+    .filter_map(|(name, local)| locals.get(local).map(|&(f, ret)| (name, f, ret)))
     .collect()
 }

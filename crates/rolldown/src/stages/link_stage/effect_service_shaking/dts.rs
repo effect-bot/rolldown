@@ -6,9 +6,12 @@
 //! Primitives, functions, arrays, data-only records, objects that have certain members, or
 //! anything (open). It follows imports and re-exports between `.d.ts` files, aliases, unions,
 //! intersections (any one member is a superset), conditional types (both branches), interfaces
-//! with their bases and classes. Type parameters, `unknown`, `any`, `object`, mapped and indexed
-//! types, `typeof`, and anything it cannot follow are open, so a gap in the resolver never drops a
-//! flow. See design section 8.
+//! with their bases and classes. A position declared exactly `unknown` or `any` (or a rest
+//! parameter, record or index signature of them) is ignored (Tim's decision on assumption 2): it
+//! admits only primitives, and what reaches it is walked for its protocol methods instead. Type
+//! parameters (never their constraints), `object`, mapped and indexed types, `typeof`, and
+//! anything it cannot follow are open, so a gap in the resolver never drops a flow. See design
+//! section 8.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -26,11 +29,13 @@ use rustc_hash::FxHashMap;
 use self_cell::self_cell;
 
 /// What a declared type admits. `members` lists alternatives: an object passes one if it has
-/// every member named there (own fields or prototype chain).
+/// every member named there (own fields or prototype chain). `ignored` marks an `unknown`/`any`
+/// position: it admits nothing more, but what reaches it is walked for its protocol methods.
 #[derive(Clone, Debug, Default)]
 #[expect(clippy::struct_excessive_bools, reason = "one flag per kind of value a type admits")]
 pub struct Ty {
   pub open: bool,
+  pub ignored: bool,
   pub prim: bool,
   pub func: bool,
   pub arrays: bool,
@@ -48,8 +53,18 @@ impl Ty {
     Self { prim: true, ..Self::default() }
   }
 
+  fn ignored() -> Self {
+    Self { ignored: true, ..Self::default() }
+  }
+
+  /// `unknown`/`any` and nothing that admits an object.
+  fn only_ignored(&self) -> bool {
+    self.ignored && self.prim_only()
+  }
+
   fn join(&mut self, o: Ty) {
     self.open |= o.open;
+    self.ignored |= o.ignored;
     self.prim |= o.prim;
     self.func |= o.func;
     self.arrays |= o.arrays;
@@ -69,11 +84,12 @@ impl Ty {
   }
 }
 
-/// The bounds of one exported function: a type per parameter, and the return type (`None` is
-/// open).
+/// The bounds of one exported function: a type per parameter, the elements of its rest
+/// parameter, and the return type (`None` is open).
 #[derive(Clone, Debug, Default)]
 pub struct Bounds {
   pub params: Vec<Option<Ty>>,
+  pub rest: Option<Ty>,
   pub ret: Option<Ty>,
 }
 
@@ -91,6 +107,8 @@ enum Local<'a> {
 /// One parsed `.d.ts`: its declarations by local name and its exports.
 struct Index<'a> {
   dir: PathBuf,
+  /// The file's name (`Tracer.d.ts`).
+  file: String,
   locals: FxHashMap<String, Local<'a>>,
   /// Exported name to local name.
   exports: FxHashMap<String, String>,
@@ -145,6 +163,22 @@ fn spec_path(dir: &Path, spec: &str) -> Option<PathBuf> {
   Some(PathBuf::from(format!("{base}.d.ts")))
 }
 
+/// The `unknown`/`any` rule covers Effect's public API only: in a module under `internal/`, an
+/// ignored position is open.
+fn internal_open(path: &Path, b: &mut Bounds) {
+  if !path.components().any(|c| c.as_os_str() == "internal") {
+    return;
+  }
+  let reopen = |t: &mut Option<Ty>| {
+    if t.as_ref().is_some_and(|t| t.ignored) {
+      *t = None;
+    }
+  };
+  b.params.iter_mut().for_each(reopen);
+  reopen(&mut b.rest);
+  reopen(&mut b.ret);
+}
+
 fn export_name(n: &ModuleExportName<'_>) -> String {
   n.name().to_string()
 }
@@ -155,15 +189,107 @@ impl Dts {
   /// has), so a bound holds for every signature a call could match.
   pub fn bounds(&self, path: &Path, name: &str, nparams: usize) -> Bounds {
     let start = std::time::Instant::now();
-    let out = self.bounds_inner(path, name, nparams);
+    let mut out = self.bounds_inner(path, name, nparams);
+    internal_open(path, &mut out);
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    out
+  }
+
+  /// The parameter bounds shared by the callbacks the function exported as `name` takes: for
+  /// each position, the join over every function-typed parameter of every signature. `None`
+  /// when a parameter that is not a callback could still hold a function (an open or
+  /// function-admitting type, or a rest parameter), or when nothing is narrowed.
+  pub fn callback_bounds(&self, path: &Path, name: &str) -> Option<Vec<Option<Ty>>> {
+    let start = std::time::Instant::now();
+    let out = self.callback_bounds_inner(path, name);
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    out
+  }
+
+  fn callback_bounds_inner(&self, path: &Path, name: &str) -> Option<Vec<Option<Ty>>> {
+    let sigs = self.signatures(path, name)?;
+    let mut acc: Vec<Option<Ty>> = vec![];
+    let mut seen = 0usize;
+    for sig in &sigs {
+      for (t, rest) in &sig.params {
+        let t = (*t)?;
+        if *rest {
+          return None;
+        }
+        let mut cbs = vec![];
+        self.sigs_of_type(sig.file, t, &mut cbs, 0);
+        if cbs.is_empty() {
+          let ty = self.classify(sig.file, t, &sig.tparams, 0);
+          if ty.open || ty.func {
+            return None;
+          }
+          continue;
+        }
+        for cb in &mut cbs {
+          cb.tparams.extend(sig.tparams.iter().cloned());
+          for (k, (pt, prest)) in cb.params.iter().enumerate() {
+            let ty = match pt {
+              Some(pt) if !prest => self.classify(cb.file, pt, &cb.tparams, 0),
+              _ => Ty::open(),
+            };
+            if acc.len() <= k {
+              acc.resize(k + 1, None);
+              // A position earlier callbacks lacked is open for them.
+              if seen > 0 {
+                acc[k] = Some(Ty::open());
+              }
+            }
+            match &mut acc[k] {
+              Some(x) => x.join(ty),
+              None => acc[k] = Some(ty),
+            }
+          }
+          // Positions this callback lacks receive nothing from it: no change.
+          seen += 1;
+        }
+      }
+    }
+    let out: Vec<Option<Ty>> = acc.into_iter().map(|t| t.filter(|t| !t.open)).collect();
+    if out.iter().all(Option::is_none) { None } else { Some(out) }
+  }
+
+  /// The bounds of the function that the function exported as `name` returns (`(input) => ...`
+  /// in `decodeUnknownSync(schema)(input)`), which takes `nparams` parameters: the call
+  /// signatures of each declared return type, with the outer type parameters still open.
+  pub fn returned_bounds(&self, path: &Path, name: &str, nparams: usize) -> Bounds {
+    let start = std::time::Instant::now();
+    let mut inner = vec![];
+    for sig in self.signatures(path, name).unwrap_or_default() {
+      let Some(ret) = sig.ret else {
+        inner.clear();
+        break;
+      };
+      let before = inner.len();
+      self.sigs_of_type(sig.file, ret, &mut inner, 0);
+      if inner.len() == before {
+        // A return type with no call signature to read: the returned function stays open.
+        inner.clear();
+        break;
+      }
+      for s in &mut inner[before..] {
+        s.tparams.extend(sig.tparams.iter().cloned());
+      }
+    }
+    let mut out = self.bounds_of_sigs(&inner, nparams);
+    internal_open(path, &mut out);
     self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
     out
   }
 
   fn bounds_inner(&self, path: &Path, name: &str, nparams: usize) -> Bounds {
-    let Some(sigs) = self.signatures(path, name) else {
-      return Bounds { params: vec![None; nparams], ret: None };
-    };
+    let sigs = self.signatures(path, name).unwrap_or_default();
+    self.bounds_of_sigs(&sigs, nparams)
+  }
+
+  fn bounds_of_sigs(&self, sigs: &[Sig<'_>], nparams: usize) -> Bounds {
+    if sigs.is_empty() {
+      return Bounds { params: vec![None; nparams], rest: None, ret: None };
+    }
     let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
     let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
     let closed = |t: Ty| if t.open { None } else { Some(t) };
@@ -183,6 +309,21 @@ impl Dts {
       }
       params.push(acc.and_then(closed));
     }
+    // A rest parameter's elements: a declared rest at the same position in every matching
+    // signature, or open.
+    let mut rest: Option<Ty> = None;
+    for sig in &matching {
+      let t = match sig.params.last() {
+        Some((Some(t), true)) if sig.params.len() - 1 == nparams => {
+          self.rest_element(sig.file, t, &sig.tparams)
+        }
+        _ => Ty::open(),
+      };
+      match &mut rest {
+        Some(x) => x.join(t),
+        None => rest = Some(t),
+      }
+    }
     let mut ret: Option<Ty> = None;
     for sig in &matching {
       let t = sig.ret.map_or_else(Ty::open, |t| self.classify(sig.file, t, &sig.tparams, 0));
@@ -191,7 +332,31 @@ impl Dts {
         None => ret = Some(t),
       }
     }
-    Bounds { params, ret: ret.and_then(closed) }
+    Bounds { params, rest: rest.and_then(closed), ret: ret.and_then(closed) }
+  }
+
+  /// The element type of a rest parameter's array type, classified.
+  fn rest_element(&self, f: usize, t: &TSType<'_>, tp: &[String]) -> Ty {
+    match t {
+      TSType::TSArrayType(a) => self.classify(f, &a.element_type, tp, 1),
+      TSType::TSParenthesizedType(p) => self.rest_element(f, &p.type_annotation, tp),
+      TSType::TSTypeOperatorType(o) if o.operator == TSTypeOperatorOperator::Readonly => {
+        self.rest_element(f, &o.type_annotation, tp)
+      }
+      TSType::TSTypeReference(r) => match &r.type_name {
+        TSTypeName::IdentifierReference(id)
+          if matches!(id.name.as_str(), "Array" | "ReadonlyArray")
+            && !self.index(f).locals.contains_key(id.name.as_str()) =>
+        {
+          r.type_arguments
+            .as_ref()
+            .and_then(|a| a.params.first())
+            .map_or_else(Ty::open, |e| self.classify(f, e, tp, 1))
+        }
+        _ => Ty::open(),
+      },
+      _ => Ty::open(),
+    }
   }
 
   fn index(&self, file: usize) -> &Index<'_> {
@@ -207,7 +372,7 @@ impl Dts {
       let cell = DtsFile::new(Owner { source, allocator: Allocator::default() }, |owner| {
         let ret = Parser::new(&owner.allocator, &owner.source, SourceType::d_ts()).parse();
         let program: &Program<'_> = owner.allocator.alloc(ret.program);
-        index(program, dir)
+        index(program, dir, path.file_name().map(|n| n.to_string_lossy().to_string()))
       });
       self.files_parsed.set(self.files_parsed.get() + 1);
       self.files.push(cell)
@@ -362,6 +527,9 @@ impl Dts {
       | TSType::TSIntrinsicKeyword(_)
       | TSType::TSTypePredicate(_) => Ty::prim(),
       TSType::TSNeverKeyword(_) => Ty::default(),
+      // Ignored positions (assumption 2): only a declared `unknown`/`any`. A type parameter is a
+      // reference, and stays open whatever its constraint.
+      TSType::TSUnknownKeyword(_) | TSType::TSAnyKeyword(_) => Ty::ignored(),
       TSType::TSFunctionType(_) | TSType::TSConstructorType(_) => {
         Ty { func: true, ..Ty::default() }
       }
@@ -379,12 +547,13 @@ impl Dts {
         out
       }
       TSType::TSIntersectionType(i) => {
-        // Any member is a superset of the intersection: the first that is not open.
-        i.types
-          .iter()
-          .map(|m| self.classify(f, m, tp, depth + 1))
-          .find(|c| !c.open)
-          .unwrap_or_else(Ty::open)
+        // Any member is a superset of the intersection: the first that is not open. `unknown`
+        // is the identity of `&`, so it bounds nothing unless every member is ignored.
+        let members: Vec<Ty> = i.types.iter().map(|m| self.classify(f, m, tp, depth + 1)).collect();
+        if members.iter().all(Ty::only_ignored) {
+          return Ty::ignored();
+        }
+        members.into_iter().find(|c| !c.open && !c.only_ignored()).unwrap_or_else(Ty::open)
       }
       TSType::TSConditionalType(c) => {
         // The result is one of the branches; `infer` names are open.
@@ -394,8 +563,8 @@ impl Dts {
       }
       TSType::TSTypeLiteral(lit) => self.members_of(f, &lit.members, tp, depth),
       TSType::TSTypeReference(r) => self.reference(f, r, tp, depth),
-      // `any`, `unknown`, `object`, `this`, mapped and indexed types, `typeof`, `import()`,
-      // `infer` and anything else: open.
+      // `object`, `this`, mapped and indexed types, `typeof`, `import()`, `infer` and anything
+      // else: open.
       _ => Ty::open(),
     }
   }
@@ -426,6 +595,10 @@ impl Dts {
       }
     }
     if let Some(v) = index_value {
+      // `{ [k: string]: unknown }`: a record of ignored values is ignored.
+      if v.only_ignored() && req.is_empty() && !out.func {
+        return Ty::ignored();
+      }
       if v.prim_only() {
         out.data_record = true;
       } else {
@@ -458,10 +631,10 @@ impl Dts {
         let arg = |i: usize| r.type_arguments.as_ref().and_then(|a| a.params.get(i));
         return match n {
           "Array" | "ReadonlyArray" => Ty { arrays: true, ..Ty::default() },
-          "Record" => match arg(1) {
-            Some(v) if self.classify(f, v, tp, depth + 1).prim_only() => {
-              Ty { data_record: true, ..Ty::default() }
-            }
+          "Record" => match arg(1).map(|v| self.classify(f, v, tp, depth + 1)) {
+            // `Record<string, unknown>`: a record of ignored values is ignored.
+            Some(v) if v.only_ignored() => Ty::ignored(),
+            Some(v) if v.prim_only() => Ty { data_record: true, ..Ty::default() },
             Some(_) => Ty { any_object: true, ..Ty::default() },
             None => Ty::open(),
           },
@@ -483,6 +656,15 @@ impl Dts {
       }
     }
     let Some((rf, local)) = self.name_in(f, &r.type_name, 0) else { return Ty::open() };
+    let idx = self.index(rf);
+    let public = idx.dir.file_name().is_some_and(|d| d == "dist");
+    if public
+      && super::effect::INERT_TYPES
+        .iter()
+        .any(|(file, names)| *file == idx.file && names.contains(&local.as_str()))
+    {
+      return Ty::ignored();
+    }
     match self.index(rf).locals.get(&local) {
       Some(Local::Alias(a)) => {
         let mut tp2: Vec<String> = tp.to_vec();
@@ -614,9 +796,10 @@ fn sig_of<'a>(
   Sig { params: ps, ret, tparams, file }
 }
 
-fn index<'a>(program: &'a Program<'a>, dir: PathBuf) -> Index<'a> {
+fn index<'a>(program: &'a Program<'a>, dir: PathBuf, file: Option<String>) -> Index<'a> {
   let mut f = Index {
     dir,
+    file: file.unwrap_or_default(),
     locals: FxHashMap::default(),
     exports: FxHashMap::default(),
     reexports: FxHashMap::default(),

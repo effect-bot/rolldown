@@ -67,9 +67,22 @@ impl Site {
 
 pub type Rule = fn(&mut Analysis, &Call);
 
-/// The type bounds of a function: a declared type per parameter and for the return value, as
-/// indices into `Analysis::tys` (`None` is open).
-type FnBounds = (Vec<Option<u32>>, Option<u32>);
+/// The `.d.ts` bounds of a default-modelled export: which arguments are at `unknown`/`any`
+/// positions, by argument count, and its callbacks' parameter types.
+#[derive(Clone, Default)]
+pub struct DefaultBounds {
+  pub ignored: Vec<Vec<bool>>,
+  pub callbacks: Option<Vec<Option<u32>>>,
+}
+
+/// The type bounds of a function: a declared type per parameter, for the return value and for
+/// the elements of its rest parameter, as indices into `Analysis::tys` (`None` is open).
+#[derive(Clone)]
+struct FnBounds {
+  params: Vec<Option<u32>>,
+  ret: Option<u32>,
+  rest: Option<u32>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Flavour {
@@ -95,9 +108,12 @@ pub enum Protocol {
 /// protocol methods it calls on each object are read and run like any call (`Analysis::walk`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Walk {
-  /// `Formatter.format` and `Formatter.formatJson`: `toString`, `toJSON`, a Date's
-  /// `toISOString` and `[Redactable.symbolRedactable]`, which receives the current Context.
-  Format,
+  /// What reaches an `unknown`/`any` position of Effect's public API (`Analysis::ignored_pool`):
+  /// the implicit protocol methods Effect and the host may call on such a value (issue,
+  /// assumption 2's protocol exception), and a Date's `toISOString`.
+  /// `[Redactable.symbolRedactable]` receives the current Context; every other argument is a
+  /// primitive.
+  Protocol,
   /// `Hash.hash`: `[Hash.symbol]`, and a Date's `getTime`/`toISOString` or a RegExp's
   /// `toString`.
   Hash,
@@ -115,6 +131,8 @@ pub enum Walk {
 pub const REDACTABLE_KEY: &str = "@@for:~effect/Redactable";
 pub const EQUAL_KEY: &str = "~effect/Equal";
 pub const HASH_KEY: &str = "~effect/Hash";
+/// `HttpServerRespondable.symbol`.
+pub const RESPONDABLE_KEY: &str = "~effect/http/HttpServerRespondable";
 /// Effect's TypeId, the member its `Effect` type requires.
 pub const EFFECT_TYPE_ID: &str = "~effect/Effect";
 
@@ -123,7 +141,19 @@ impl Walk {
   /// one the walk's argument variable).
   fn protocols(self) -> &'static [(&'static str, usize)] {
     match self {
-      Walk::Format => &[("toString", 0), ("toJSON", 0), ("toISOString", 0), (REDACTABLE_KEY, 1)],
+      Walk::Protocol => &[
+        ("toJSON", 1),
+        ("toString", 0),
+        ("valueOf", 0),
+        ("@@toPrimitive", 1),
+        (super::host::INSPECT_CUSTOM, 3),
+        ("then", 2),
+        (EQUAL_KEY, 1),
+        (HASH_KEY, 0),
+        (REDACTABLE_KEY, 1),
+        (RESPONDABLE_KEY, 0),
+        ("toISOString", 0),
+      ],
       Walk::Hash => &[(HASH_KEY, 0), ("getTime", 0), ("toISOString", 0), ("toString", 0)],
       Walk::Equal => &[(EQUAL_KEY, 1)],
       Walk::Json => &[("toJSON", 1)],
@@ -325,12 +355,6 @@ pub enum Constraint {
   /// `obj` flows into `dst` once anything reaches the variable (a walked object that has the
   /// protocol method loaded into the variable).
   Witness(ObjId, VarId),
-  /// `src` flows into `dst` once an object that may be an Effect reaches the variable (an
-  /// Effect, or a value the pass can't see into).
-  IfEffect {
-    src: VarId,
-    dst: VarId,
-  },
 }
 
 impl Key {
@@ -387,7 +411,6 @@ impl Constraint {
         C::Walk { walk: *walk, pool: v(*pool), arg: v(*arg), site: s(*site) }
       }
       C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
-      C::IfEffect { src, dst } => C::IfEffect { src: v(*src), dst: v(*dst) },
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
       C::Accessor(acc) => C::Accessor(Accessor {
         this: v(acc.this),
@@ -620,6 +643,8 @@ pub struct Analysis {
   accessors: FxHashMap<ObjId, Vec<Accessor>>,
   /// Declared types from `.d.ts` files, by index (`Constraint::FilterCopy`).
   tys: Vec<super::dts::Ty>,
+  /// The `.d.ts` bounds of default-modelled exports (`effect:default`).
+  pub default_bounds: Vec<DefaultBounds>,
   /// The type `Effect` (`effect_type`), once interned.
   effect_ty: Option<u32>,
   /// For each variable receiving what an object run as an effect yields, the variable whose
@@ -628,9 +653,9 @@ pub struct Analysis {
   /// Type bounds of exported functions of `effect`'s ordinary modules, by (module, span start):
   /// a type index per parameter and for the return value (`None` is open).
   fn_bounds: FxHashMap<(ModuleIdx, u32), FnBounds>,
-  /// Exported functions whose bounds are resolved when first called: their `.d.ts`, export name
-  /// and parameter count.
-  pub lazy_bounds: FxHashMap<(ModuleIdx, u32), (std::path::PathBuf, ArcStr, usize)>,
+  /// Exported functions whose bounds are resolved when first called: their `.d.ts`, export name,
+  /// parameter count, and whether the function is the one the export returns.
+  pub lazy_bounds: FxHashMap<(ModuleIdx, u32), (std::path::PathBuf, ArcStr, usize, bool)>,
   /// The `.d.ts` files read so far.
   pub dts: super::dts::Dts,
   /// Objects a bounded edge rejected, with the edges that wait for them: a later field,
@@ -640,17 +665,17 @@ pub struct Analysis {
   pub budget_exceeded: bool,
   /// Objects each walk pool has walked.
   walked: FxHashSet<(VarId, ObjId)>,
-  /// The program-wide pools of the formatting and hashing walks (`Walk`).
-  pub format_pool: Option<VarId>,
+  /// The program-wide pools of the protocol and hashing walks (`Walk`).
+  ignored_pool: Option<VarId>,
+  prim_arg: Option<VarId>,
   pub hash_pool: Option<VarId>,
   /// The program-wide pools of host serialization and inspection (`host_protocol`).
   json_pool: Option<VarId>,
   inspect_pool: Option<VarId>,
   /// Objects whose primitive conversion methods have been called.
   primitive_converted: FxHashSet<ObjId>,
-  /// The record behind `References.CurrentLogAnnotations` (`effect:Effect.annotateLogs`).
-  pub log_annotations: Option<VarId>,
-  /// Everything `Effect.log` logs, handed to the installed loggers (`effect::run_loggers`).
+  /// The options the installed loggers are called with, once `Effect.log` is reached
+  /// (`effect::run_loggers`).
   pub log_messages: Option<VarId>,
   /// The failure slot every model Effect shares. Services never enter the error channel
   /// (issue, "Assumptions" 3), so nothing reads it: `failure_of` yields nothing.
@@ -767,6 +792,7 @@ impl Analysis {
       accessors: FxHashMap::default(),
       tys: vec![],
       effect_ty: None,
+      default_bounds: vec![],
       effect_gates: FxHashMap::default(),
       fn_bounds: FxHashMap::default(),
       lazy_bounds: FxHashMap::default(),
@@ -774,12 +800,12 @@ impl Analysis {
       rejected: FxHashMap::default(),
       budget_exceeded: false,
       walked: FxHashSet::default(),
-      format_pool: None,
+      ignored_pool: None,
+      prim_arg: None,
       hash_pool: None,
       json_pool: None,
       inspect_pool: None,
       primitive_converted: FxHashSet::default(),
-      log_annotations: None,
       log_messages: None,
       failure_sink,
       done_values,
@@ -1473,23 +1499,16 @@ impl Analysis {
         ) && !self.admits(*ty, obj)
         {
           // A summary may stand for a value the type admits, such as a scalar or a key: it
-          // becomes an unknown scalar, which carries no service but stays any key.
-          self.seed(*dst, self.top_host);
+          // becomes an unknown scalar, which carries no service but stays any key. At an
+          // ignored position it is a plain primitive: nothing of it is read.
+          let t = if self.tys[*ty as usize].ignored { self.prim } else { self.top_host };
+          self.seed(*dst, t);
         } else {
           self.filter(obj, *ty, *dst);
         }
       }
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
       Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
-      Constraint::IfEffect { src, dst } => {
-        if matches!(
-          self.objs[obj].kind,
-          ObjKind::Effect { .. } | ObjKind::Wrap(_) | ObjKind::Top(_) | ObjKind::External { .. }
-        ) || self.is_default(obj)
-        {
-          self.copy(*src, *dst);
-        }
-      }
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
       Constraint::EscapeReceiver(flavour, site, name) => {
         self.escape_receiver(obj, *flavour, *site, name);
@@ -2204,8 +2223,12 @@ impl Analysis {
   /// The type bounds of `f` (or the function it clones), resolving them on first use.
   fn bounds_of(&mut self, f: FnId) -> Option<FnBounds> {
     let key = (self.fns[f].module, self.fns[f].span_start);
-    if let Some((path, name, nparams)) = self.lazy_bounds.remove(&key) {
-      let b = self.dts.bounds(&path, &name, nparams);
+    if let Some((path, name, nparams, returned)) = self.lazy_bounds.remove(&key) {
+      let b = if returned {
+        self.dts.returned_bounds(&path, &name, nparams)
+      } else {
+        self.dts.bounds(&path, &name, nparams)
+      };
       let mut intern = |t: Option<super::dts::Ty>| {
         t.map(|t| {
           self.tys.push(t);
@@ -2214,17 +2237,69 @@ impl Analysis {
       };
       let params = b.params.into_iter().map(&mut intern).collect();
       let ret = intern(b.ret);
-      self.fn_bounds.insert(key, (params, ret));
+      let rest = intern(b.rest);
+      self.fn_bounds.insert(key, FnBounds { params, ret, rest });
     }
     self.fn_bounds.get(&key).cloned()
   }
 
-  /// `src` flows into `dst`, filtered by the declared type `ty` if there is one.
+  /// `src` flows into `dst`, filtered by the declared type `ty` if there is one. What reaches an
+  /// ignored (`unknown`/`any`) position is also walked for its protocol methods.
   fn bounded_copy(&mut self, src: VarId, dst: VarId, ty: Option<u32>) {
     match ty {
-      Some(ty) => self.constrain(src, Constraint::FilterCopy { dst, ty }),
+      Some(ty) => {
+        self.constrain(src, Constraint::FilterCopy { dst, ty });
+        if self.tys[ty as usize].ignored {
+          let pool = self.ignored_pool();
+          self.copy(src, pool);
+        }
+      }
       None => self.copy(src, dst),
     }
+  }
+
+  /// `bounded_copy` for a rule: `src` into `dst` filtered by `ty`, or `open` into `dst` when the
+  /// position is open.
+  pub fn bounded_copy_pub(&mut self, src: VarId, dst: VarId, ty: Option<u32>, open: VarId) {
+    match ty {
+      Some(_) => self.bounded_copy(src, dst, ty),
+      None => self.copy(open, dst),
+    }
+  }
+
+  /// Interns a declared type for `Constraint::FilterCopy`.
+  pub fn intern_ty(&mut self, t: super::dts::Ty) -> u32 {
+    self.tys.push(t);
+    u32::try_from(self.tys.len() - 1).expect("too many declared types")
+  }
+
+  /// The program-wide pool of what reaches an `unknown`/`any` position of Effect's public API
+  /// (Tim's decision on assumption 2): it is walked for its protocol methods (`Walk::Protocol`),
+  /// and nothing else of it is read.
+  pub fn ignored_pool(&mut self) -> VarId {
+    if let Some(pool) = self.ignored_pool {
+      return pool;
+    }
+    let pool = self.var();
+    self.ignored_pool = Some(pool);
+    let context = self.var();
+    self.seed(context, self.ambient_context);
+    self.constrain(
+      pool,
+      Constraint::Walk { walk: Walk::Protocol, pool, arg: context, site: protocol_site(4) },
+    );
+    pool
+  }
+
+  /// A variable holding a primitive, for arguments that carry nothing.
+  fn prim_arg(&mut self) -> VarId {
+    if let Some(v) = self.prim_arg {
+      return v;
+    }
+    let v = self.var();
+    self.seed(v, self.prim);
+    self.prim_arg = Some(v);
+    v
   }
 
   /// Whether a value of the declared type `ty` may be this abstract object (Effect's public
@@ -2239,10 +2314,13 @@ impl Analysis {
     let objects = t.data_record || !t.members.is_empty();
     match &self.objs[obj].kind {
       ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim => true,
-      ObjKind::Closure(_)
-      | ObjKind::Builtin { .. }
-      | ObjKind::Class { .. }
-      | ObjKind::Key { .. } => t.func || !t.members.is_empty(),
+      // A function passes an object type only if it has the members (a function with fields).
+      ObjKind::Closure(_) => {
+        t.func || t.members.iter().any(|alt| alt.iter().all(|m| self.has_member(obj, m, 0)))
+      }
+      ObjKind::Builtin { .. } | ObjKind::Class { .. } | ObjKind::Key { .. } => {
+        t.func || !t.members.is_empty()
+      }
       ObjKind::Array => t.arrays || !t.members.is_empty(),
       ObjKind::Object => {
         if !objects {
@@ -2373,7 +2451,8 @@ impl Analysis {
       (info.params.clone(), info.rest, info.this, info.ret, info.kind, info.arguments_elem)
     };
     let bounds = self.bounds_of(f);
-    let param_ty = |i: usize| bounds.as_ref().and_then(|b| b.0.get(i).copied().flatten());
+    let param_ty = |i: usize| bounds.as_ref().and_then(|b| b.params.get(i).copied().flatten());
+    let rest_ty = bounds.as_ref().and_then(|b| b.rest);
     if let Some(i) = instance {
       self.seed(this_var, i);
     } else if let Some(this) = call.this {
@@ -2404,7 +2483,7 @@ impl Analysis {
       if let Some(r) = rest {
         let arr = self.rest_array(f);
         let elem = self.elem(arr);
-        self.copy(any, elem);
+        self.bounded_copy(any, elem, rest_ty);
         self.seed(r, arr);
       }
       self.copy(any, arguments_elem);
@@ -2419,7 +2498,7 @@ impl Analysis {
         let elem = self.elem(arr);
         for a in call.args.iter().skip(params.len()) {
           if let Arg::Var(v) = a {
-            self.copy(*v, elem);
+            self.bounded_copy(*v, elem, rest_ty);
           }
         }
         self.seed(r, arr);
@@ -2433,7 +2512,7 @@ impl Analysis {
     match kind {
       FnKind::Normal | FnKind::Arrow => {
         if instance.is_none() {
-          let ret_ty = bounds.as_ref().and_then(|b| b.1);
+          let ret_ty = bounds.as_ref().and_then(|b| b.ret);
           self.bounded_copy(ret, call.ret, ret_ty);
         }
       }
@@ -2820,7 +2899,12 @@ impl Analysis {
           self.constrain(proto, again);
         }
         let this = self.holder(obj);
+        let inert = if walk == Walk::Protocol { Some(self.prim_arg()) } else { None };
         for (name, arity) in walk.protocols() {
+          let arg = match inert {
+            Some(inert) if *name != REDACTABLE_KEY => inert,
+            _ => arg,
+          };
           let method = self.protocol_call(this, name, *arity, arg, site, pool);
           if walk == Walk::Equal {
             self.constrain(method, Constraint::Witness(obj, arg));
@@ -2833,7 +2917,7 @@ impl Analysis {
       // A wrapped value may be any of the values it wraps. A Promise has no keys of its own.
       ObjKind::Wrap(inner) => self.constrain(inner, again),
       // A printed Context or runtime prints its services. Context equality is ignored.
-      ObjKind::Context { keys } | ObjKind::Runtime { keys } if walk == Walk::Format => {
+      ObjKind::Context { keys } | ObjKind::Runtime { keys } if walk == Walk::Protocol => {
         let services = self.var();
         self.constrain(keys, Constraint::KeyUse(KeyUse::Lookup(services)));
         self.constrain(services, again);

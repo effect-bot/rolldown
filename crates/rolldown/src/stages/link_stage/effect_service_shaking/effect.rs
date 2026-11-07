@@ -29,8 +29,6 @@ pub const SCOPE_KEY: &str = "effect/Scope";
 pub const MEMO_MAP_KEY: &str = "effect/Layer/CurrentMemoMap";
 pub const PARENT_SPAN_KEY: &str = "effect/Tracer/ParentSpan";
 pub const FIBER_METRICS_KEY: &str = "effect/Metric/FiberRuntimeMetrics";
-/// `References.CurrentLogAnnotations` (stable), the record `Effect.annotateLogs` writes.
-pub const LOG_ANNOTATIONS_KEY: &str = "effect/References/CurrentLogAnnotations";
 /// `Logger.CurrentLoggers` (stable): the Set of loggers `Effect.log` calls.
 pub const CURRENT_LOGGERS_KEY: &str = "effect/Logger/CurrentLoggers";
 
@@ -57,6 +55,12 @@ pub enum Spec {
 /// `Effect.retryOrElse` step a Schedule with.
 pub const SCHEDULE_MODULE: &str = "/dist/Schedule.js";
 pub const SCHEDULE_TO_STEP: &str = "toStep";
+
+/// Public types whose values never carry an app value (Tim's span decision, assumption 2):
+/// a position declared with one is ignored, like `unknown`. A span's attribute values, events
+/// and links go in as `unknown`, and nothing comes back out at a type that could be a service.
+pub const INERT_TYPES: &[(&str, &[&str])] =
+  &[("Tracer.d.ts", &["Span", "AnySpan", "ExternalSpan", "NativeSpan", "SpanLink"])];
 
 /// The `effect` major version the model is written against.
 pub const SUPPORTED_MAJOR: &str = "4";
@@ -355,20 +359,16 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("Class", Spec::PipeableClass),
     ],
   ),
-  ("Tracer", &[("ParentSpan", Spec::Key(PARENT_SPAN_KEY))]),
+  (
+    "Tracer",
+    &[("ParentSpan", Spec::Key(PARENT_SPAN_KEY)), ("make", Spec::Rule("effect:Tracer.make"))],
+  ),
 ];
 
 /// Public modules that are otherwise ordinary code: only the exports listed here take a rule, and
 /// the rest of each module is analysed generically. Effect's own formatting and structural
 /// equality walk a value's keys, which keeps nothing (issue, "When a method is kept").
 pub const LISTED_MODULES: &[(&str, &[(&str, Spec)])] = &[
-  (
-    "Formatter",
-    &[
-      ("format", Spec::Rule("effect:Formatter.format")),
-      ("formatJson", Spec::Rule("effect:Formatter.format")),
-    ],
-  ),
   ("Equal", &[("equals", Spec::Rule("effect:Equal.equals"))]),
   (
     "Cause",
@@ -529,20 +529,6 @@ fn ambient(a: &mut Analysis) -> VarId {
   v
 }
 
-/// The program-wide pool of the formatting walk. The walk passes the current Context to
-/// `[Redactable.symbolRedactable]`, as `Redactable.getRedacted` does.
-fn format_pool(a: &mut Analysis) -> VarId {
-  if let Some(pool) = a.format_pool {
-    return pool;
-  }
-  let pool = a.var();
-  a.format_pool = Some(pool);
-  let context = ambient(a);
-  let site = walk_site(1);
-  a.constrain(pool, Constraint::Walk { walk: Walk::Format, pool, arg: context, site });
-  pool
-}
-
 /// The program-wide pool of the hashing walk.
 fn hash_pool(a: &mut Analysis) -> VarId {
   if let Some(pool) = a.hash_pool {
@@ -556,60 +542,34 @@ fn hash_pool(a: &mut Analysis) -> VarId {
   pool
 }
 
-/// What `Effect.log` and its level variants log reaches the installed loggers: the values of
+/// `Effect.log` and its level variants call the installed loggers: the values of
 /// `Logger.CurrentLoggers` (a Set of loggers), whose `log` is called with
-/// `{ cause, fiber, date, logLevel, message }`. One call for the program: every message joins
-/// it.
+/// `{ fiber, date, logLevel, message }`. The messages are `ReadonlyArray<any>`, so they are
+/// ignored (assumption 2): the loggers see an empty message, and the messages are walked for
+/// their protocol methods (`Analysis::ignored_pool`). One call for the program.
 fn run_loggers(a: &mut Analysis, messages: &[VarId]) {
-  let pool = match a.log_messages {
-    Some(pool) => pool,
-    None => {
-      let pool = a.var();
-      a.log_messages = Some(pool);
-      let site = walk_site(3);
-      let (options, options_var) = new_object(a, site, 1);
-      let (_, message, elem) = new_array(a, site, 2);
-      a.copy(pool, elem);
-      let fb = fiber(a);
-      let prim = prim_var(a);
-      for (name, value) in [("message", message), ("fiber", fb), ("date", prim), ("logLevel", prim)]
-      {
-        let field = a.field(options, &ArcStr::from(name));
-        a.copy(value, field);
-      }
-      let loggers = a.var();
-      let value = a.key_value_var(&ArcStr::from(CURRENT_LOGGERS_KEY));
-      a.copy(value, loggers);
-      let logger = elem_of(a, loggers);
-      let log = load(a, logger, "log");
-      invoke(a, site, log, Some(logger), vec![options_var]);
-      pool
+  if a.log_messages.is_none() {
+    let site = walk_site(3);
+    let (options, options_var) = new_object(a, site, 1);
+    let (_, message, _) = new_array(a, site, 2);
+    let fb = fiber(a);
+    let prim = prim_var(a);
+    for (name, value) in [("message", message), ("fiber", fb), ("date", prim), ("logLevel", prim)] {
+      let field = a.field(options, &ArcStr::from(name));
+      a.copy(value, field);
     }
-  };
+    let loggers = a.var();
+    let value = a.key_value_var(&ArcStr::from(CURRENT_LOGGERS_KEY));
+    a.copy(value, loggers);
+    let logger = elem_of(a, loggers);
+    let log = load(a, logger, "log");
+    invoke(a, site, log, Some(logger), vec![options_var]);
+    a.log_messages = Some(options_var);
+  }
+  let pool = a.ignored_pool();
   for m in messages {
     a.copy(*m, pool);
   }
-}
-
-/// The record behind `References.CurrentLogAnnotations`, and a variable holding it.
-fn log_annotations(a: &mut Analysis) -> (ObjId, VarId) {
-  if let Some(holder) = a.log_annotations {
-    let record = *a.pts(holder).iter().next().expect("the annotations record");
-    return (record, holder);
-  }
-  let record = a.alloc(ObjKind::Object, None);
-  let holder = a.holder(record);
-  a.log_annotations = Some(holder);
-  let value = a.key_value_var(&ArcStr::from(LOG_ANNOTATIONS_KEY));
-  a.seed(value, record);
-  (record, holder)
-}
-
-/// `value` stored in the annotations record under the string keys of `key`.
-fn annotate_key(a: &mut Analysis, holder: VarId, key: VarId, value: VarId) {
-  let keys = a.var();
-  a.constrain(key, Constraint::MapKeys(keys));
-  a.constrain(keys, Constraint::StoreThrough { base: holder, src: value });
 }
 
 /// The annotated effect: `effect` with its success and failure.
@@ -1995,13 +1955,6 @@ pub fn register(a: &mut Analysis) {
   });
   // == Formatter, Equal and Hash: walks that keep nothing (see `Walk`)
 
-  a.rule("effect:Formatter.format", |a, c| {
-    // `format(input, options)`, `formatJson(input, options)`: the options hold no callbacks.
-    let input = arg(a, c, 0);
-    let pool = format_pool(a);
-    a.copy(input, pool);
-    a.seed(c.ret, a.top_host);
-  });
   a.rule("effect:Hash.hash", |a, c| {
     let input = arg(a, c, 0);
     let pool = hash_pool(a);
@@ -2074,18 +2027,16 @@ pub fn register(a: &mut Analysis) {
   a.rule("effect:Effect.annotateLogs", |a, c| {
     // `annotateLogs(key, value)` and `annotateLogs(record)` return `self => self` with the
     // annotations; `annotateLogs(self, key, value)` and `annotateLogs(self, record)` add them to
-    // `self`. Annotations are read back only as the record `References.CurrentLogAnnotations`
-    // holds, of unknown values: every call writes into one program-wide record, that key's value.
-    let (record, holder) = log_annotations(a);
+    // `self`. The values are `unknown` (`Record<string, unknown>`), so they are ignored
+    // (assumption 2): they are walked for their protocol methods, and
+    // `References.CurrentLogAnnotations` holds none of them. Only the annotated effect flows.
     let id = a.rule_id("effect:identity").expect("registered");
     let identity = a.builtin(id, None, None);
+    let pool = a.ignored_pool();
     if c.has_spread() {
-      // Which argument is which is unknown: any of them may be a key, a value or a record.
+      // Which argument is which is unknown: any of them may be the effect or a value.
       let any = arg(a, c, 0);
-      let keys = a.var();
-      a.seed(keys, a.all_keys);
-      a.constrain(keys, Constraint::StoreThrough { base: holder, src: any });
-      a.constrain(any, Constraint::SpreadInto(record));
+      a.copy(any, pool);
       annotated(a, c.site, any, c.ret);
       a.seed(c.ret, identity);
       return;
@@ -2094,25 +2045,21 @@ pub fn register(a: &mut Analysis) {
       0 => a.seed(c.ret, identity),
       1 => {
         let values = arg(a, c, 0);
-        a.constrain(values, Constraint::SpreadInto(record));
+        a.copy(values, pool);
         a.seed(c.ret, identity);
       }
       2 => {
         // `(key, value)`, or `(self, record)` when argument 0 is an Effect.
         let first = arg(a, c, 0);
         let second = arg(a, c, 1);
-        annotate_key(a, holder, first, second);
-        let values = a.var();
-        a.constrain(first, Constraint::IfEffect { src: second, dst: values });
-        a.constrain(values, Constraint::SpreadInto(record));
+        a.copy(second, pool);
         annotated(a, c.site, first, c.ret);
         a.seed(c.ret, identity);
       }
       _ => {
         let effect = arg(a, c, 0);
-        let key = arg(a, c, 1);
         let value = arg(a, c, 2);
-        annotate_key(a, holder, key, value);
+        a.copy(value, pool);
         annotated(a, c.site, effect, c.ret);
       }
     }
@@ -2129,8 +2076,6 @@ pub fn register(a: &mut Analysis) {
   a.rule("effect:Effect.log", |a, c| {
     let mut messages = vec![];
     for x in args_from(a, c, 0) {
-      let (Arg::Var(v) | Arg::Spread(v)) = x;
-      a.constrain(v, Constraint::Protocol(super::heap::Protocol::Inspect));
       messages.push(match x {
         Arg::Var(v) => v,
         Arg::Spread(v) => elem_of(a, v),
@@ -2139,6 +2084,26 @@ pub fn register(a: &mut Analysis) {
     run_loggers(a, &messages);
     let (out, _, _) = new_effect(a, c.site, 1);
     a.copy(out, c.ret);
+  });
+  a.rule("effect:Tracer.make", |a, c| {
+    // `Tracer.make(options)`: a Tracer written in bundled code. Spans never carry app values
+    // (assumption 2), so the runtime's calls are modelled with inert arguments: `span` runs, and
+    // `end`, `attribute`, `event` and `addLinks` run on what it returns; `context` runs with no
+    // primitive. The Tracer itself holds nothing.
+    let options = arg(a, c, 0);
+    let prim = prim_var(a);
+    let span_fn = load(a, options, "span");
+    let span = invoke(a, c.site, span_fn, Some(options), vec![prim]);
+    for name in ["end", "attribute", "event", "addLinks"] {
+      let m = load(a, span, name);
+      invoke(a, c.site, m, Some(span), vec![prim, prim, prim]);
+    }
+    let context = load(a, options, "context");
+    let primitive = a.var();
+    let fb = fiber(a);
+    invoke(a, c.site, context, Some(options), vec![primitive, fb]);
+    let (_, tracer) = new_object(a, c.site, 8);
+    a.copy(tracer, c.ret);
   });
   a.rule("effect:Logger.make", |a, c| {
     // `Logger.make(log)`: a logger whose `log` the runtime calls for each log (`run_loggers`).
@@ -2661,6 +2626,16 @@ pub fn register(a: &mut Analysis) {
   // == default for other exports of the modelled modules
 
   a.rule("effect:default", |a, c| {
+    // An export with `.d.ts` bounds (`Analysis::default_bounds`, design section 8) carries their
+    // index as the builtin's arity. An argument at an `unknown`/`any` position is ignored: it is
+    // walked for its protocol methods and nothing else of it is read. A callback passed directly
+    // receives, at each bounded position, only the argument-derived values that type admits.
+    let bounds = a.builtin_arity(c).and_then(|i| a.default_bounds.get(i as usize).cloned());
+    let callback_bounds = bounds.as_ref().and_then(|b| b.callbacks.clone());
+    let ignored: Vec<bool> = match &bounds {
+      Some(b) if !c.has_spread() => b.ignored.get(c.args.len()).cloned().unwrap_or_default(),
+      _ => vec![],
+    };
     // Sound by construction: the result yields every argument-derived value, and callbacks
     // receive those values at every parameter position. Calling the result falls to the `Wrap`
     // call path in the heap, so no per-result callable is minted here.
@@ -2671,13 +2646,19 @@ pub fn register(a: &mut Analysis) {
     // inside is assumed not to reach services through Fibers (the issue's one assumption), so
     // the default must not invent one (design section 3).
     let derived = a.var();
+    let results = a.var();
     let w = wrap(a, c.site, derived);
     let (_, every_arg, every_elem) = new_array(a, c.site, 22);
     a.copy(w, every_elem);
-    for x in args_from(a, c, 0) {
+    for (i, x) in args_from(a, c, 0).into_iter().enumerate() {
       let v = match x {
         Arg::Var(v) | Arg::Spread(v) => v,
       };
+      if ignored.get(i).copied().unwrap_or(false) {
+        let pool = a.ignored_pool();
+        a.copy(v, pool);
+        continue;
+      }
       a.copy(v, derived);
       let s = success_of(a, v);
       a.copy(s, derived);
@@ -2691,15 +2672,32 @@ pub fn register(a: &mut Analysis) {
       a.copy(inner, derived);
       // Only functions run; a wrapped value or an effect among the arguments is not called.
       let callable = a.var();
-      a.constrain(v, Constraint::Callables(callable));
       a.constrain(inner, Constraint::Callables(callable));
+      match &callback_bounds {
+        Some(bounds) => {
+          let direct = a.var();
+          a.constrain(v, Constraint::Callables(direct));
+          let args = bounds
+            .iter()
+            .map(|ty| {
+              let p = a.var();
+              a.bounded_copy_pub(derived, p, *ty, w);
+              Arg::Var(p)
+            })
+            .collect();
+          let r = invoke_args(a, c.site, direct, None, args);
+          a.copy(r, results);
+        }
+        None => a.constrain(v, Constraint::Callables(callable)),
+      }
       let r = invoke_args(a, c.site, callable, None, vec![Arg::Spread(every_arg)]);
-      a.copy(r, derived);
-      let rs = success_of(a, r);
-      a.copy(rs, derived);
-      let rf = failure_of(a, r);
-      a.copy(rf, derived);
+      a.copy(r, results);
     }
+    let rs = success_of(a, results);
+    a.copy(rs, derived);
+    let rf = failure_of(a, results);
+    a.copy(rf, derived);
+    a.copy(results, derived);
     let (out, os, of) = new_effect(a, c.site, 21);
     a.copy(w, os);
     a.copy(w, of);
@@ -2774,10 +2772,11 @@ pub fn spec_object(a: &mut Analysis, spec: Spec) -> ObjId {
   }
 }
 
-pub fn default_object(a: &mut Analysis) -> ObjId {
+/// The default model object; `bounds` indexes `Analysis::default_bounds`.
+pub fn default_object(a: &mut Analysis, bounds: Option<u32>) -> ObjId {
   let id = a.rule_id("effect:default").unwrap();
   a.default_rule = Some(id);
-  a.builtin(id, None, None)
+  a.builtin_full(id, None, bounds, None)
 }
 
 /// A key declared by `Context.Service(...)`, `Context.Service<..>()(...)` or
