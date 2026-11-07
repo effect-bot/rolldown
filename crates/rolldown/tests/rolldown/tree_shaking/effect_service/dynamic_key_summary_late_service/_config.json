@@ -1,0 +1,10 @@
+{
+  "_comment": "A summary (an Option) stored under a dynamic key before it holds a service, which it gains later: the method read through it must stay.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

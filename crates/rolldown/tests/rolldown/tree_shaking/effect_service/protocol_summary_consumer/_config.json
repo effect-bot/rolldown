@@ -1,0 +1,10 @@
+{
+  "_comment": "An effect export reached only as a protocol method (JSON.stringify's toJSON) whose module reads a constructor key: the FileSystem service keeps stat.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

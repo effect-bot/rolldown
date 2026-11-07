@@ -1,0 +1,10 @@
+{
+  "_comment": "A record with no service is walked by Object.entries, then gets a service stored into it, which is read back through another walk: the method read must stay.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
