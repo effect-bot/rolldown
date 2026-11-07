@@ -259,8 +259,6 @@ pub enum Constraint {
   Contents(VarId),
   /// Only the callable objects (closures, classes, builtins) of the variable.
   Callables(VarId),
-  /// Only the closures and classes of the variable: callables with a body to analyse.
-  Bodies(VarId),
   /// The name is read on the objects of the variable (no value flows): demand only.
   Demand(ArcStr),
   /// Some unknown name is read on the objects of the variable: demand everything.
@@ -367,7 +365,6 @@ impl Constraint {
       C::ElemOf(x) => C::ElemOf(v(*x)),
       C::Contents(x) => C::Contents(v(*x)),
       C::Callables(x) => C::Callables(v(*x)),
-      C::Bodies(x) => C::Bodies(v(*x)),
       C::AwaitOf(x) => C::AwaitOf(v(*x)),
       C::SpreadTarget(x) => C::SpreadTarget(v(*x)),
       C::ProtoOf(x) => C::ProtoOf(v(*x)),
@@ -625,9 +622,9 @@ pub struct Analysis {
   /// Everything `Effect.log` logs, handed to the installed loggers (`effect::run_loggers`).
   pub log_messages: Option<VarId>,
   /// Wraps that stand for a Cause of their errors (`Cause.fail`, `Exit.cause`): a named read on
-  /// one also reads the methods of the errors (`load_name`). Other wraps record only demand.
+  /// one also reads that member of the errors (`load_name`). Other wraps record only demand.
   transparent_wraps: FxHashSet<ObjId>,
-  /// The methods read by name through a transparent wrap, per wrap and name.
+  /// The members read by name through a transparent wrap, per wrap and name.
   transparent_members: FxHashMap<(ObjId, ArcStr), VarId>,
   /// Rule invocations, for diagnostics.
   pub rule_calls: FxHashMap<u16, usize>,
@@ -1340,11 +1337,6 @@ impl Analysis {
         }
       }
       Constraint::DemandAll | Constraint::Enumerate => self.enumerate(obj),
-      Constraint::Bodies(dst) => {
-        if matches!(self.objs[obj].kind, ObjKind::Closure(_) | ObjKind::Class { .. }) {
-          self.seed(*dst, obj);
-        }
-      }
       Constraint::Callables(dst) => {
         if matches!(
           self.objs[obj].kind,
@@ -1546,28 +1538,26 @@ impl Analysis {
       }
       ObjKind::Wrap(inner) => {
         // Any access path yields the wrapped values; the read is recorded on them. Through a
-        // Cause (`Cause.fail`, `Exit.cause`) it is also a read on the errors, so a method read
-        // back through it is the method, and calling it runs its body (`transparent_wraps`). A
-        // default-rule wrap does not need that: the rule already calls every callable its
-        // arguments hold.
+        // Cause (`Cause.fail`, `Exit.cause`) it is also a read on the errors: every member they
+        // hold under that name flows, so a method read back through it is the method and its
+        // body runs, and a data member, a bound function or a builtin reaches its use
+        // (`transparent_wraps`). A default-rule wrap does not need that: the rule already calls
+        // every callable its arguments hold.
         self.copy(inner, dst);
         if self.transparent_wraps.contains(&obj) {
-          // Only the members with a body: the wrapped values themselves already flow, and a
-          // call needs the method. Data members would merge every error's fields, and a
-          // builtin member has no body (calling the wrap runs the callbacks handed to it).
-          // One load per wrap and name: a wrap reached by many variables is read many times.
-          let bodies = match self.transparent_members.get(&(obj, name.clone())) {
+          // One load per wrap and name: a wrap reached by many variables is read many times,
+          // and a load per read would mint a variable and a constraint each time.
+          let members = match self.transparent_members.get(&(obj, name.clone())) {
             Some(v) => *v,
             None => {
-              let member = self.var();
-              let bodies = self.var();
-              self.constrain(inner, Constraint::Load { key: Key::Name(name.clone()), dst: member });
-              self.constrain(member, Constraint::Bodies(bodies));
-              self.transparent_members.insert((obj, name.clone()), bodies);
-              bodies
+              let members = self.var();
+              self
+                .constrain(inner, Constraint::Load { key: Key::Name(name.clone()), dst: members });
+              self.transparent_members.insert((obj, name.clone()), members);
+              members
             }
           };
-          self.copy(bodies, dst);
+          self.copy(members, dst);
         } else {
           self.constrain(inner, Constraint::Demand(name.clone()));
         }
@@ -2332,7 +2322,7 @@ impl Analysis {
   }
 
   /// A Cause of the errors in `inner` (`Cause.fail`, `Exit.cause`): a wrap whose named reads
-  /// also read the errors' methods.
+  /// also read the errors' members.
   pub fn cause_of(&mut self, inner: VarId, site: Site) -> VarId {
     let v = self.wrap_of(inner, site);
     let w = self.wraps[&inner];
