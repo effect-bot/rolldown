@@ -70,10 +70,11 @@ pub type Rule = fn(&mut Analysis, &Call);
 /// `ObjKind::Typed::export` of a value that is not an export.
 pub const NO_EXPORT: u32 = u32::MAX;
 
-/// An export of a type-modelled `effect` module: its `.d.ts` (if any) and export name.
+/// An export of a type-modelled `effect` module: its `.d.ts` (if any), export name and module.
 pub struct TypedExport {
   pub dts: Option<std::path::PathBuf>,
   pub name: ArcStr,
+  pub module: ModuleIdx,
 }
 
 /// What a call to a type-modelled export with a given argument count reads from its `.d.ts`.
@@ -82,6 +83,46 @@ struct TypedSig {
   params: Vec<Option<u32>>,
   rest: Option<u32>,
   ret: super::dts::RetShape,
+  /// The call may store an argument in a value another argument holds, and may hand back what
+  /// a container holds (`Dts::container_shape`).
+  stores: bool,
+  reads: bool,
+  /// Per parameter, and for the rest parameter: whether its declared type mentions a type
+  /// parameter (`Dts::generic_positions`). Only generic positions join the slot.
+  generic: Vec<bool>,
+  rest_generic: bool,
+}
+
+/// A stand-in for the service-free values a type-modelled call site is handed (direction 2's
+/// admission filter, `Analysis::admit`): every access path on it yields itself, and anything that
+/// could write into or hand over what it stands for (a store, an escape, a call with arguments)
+/// taints it, after which those values flow as themselves.
+struct StandIn {
+  /// The values it stands for, and the variable each was held back from.
+  held: Vec<(ObjId, VarId)>,
+  /// The values it stands for, as a variable: uses that only read or hand them over (a walk,
+  /// an escape, a conversion, a spread) apply to them through it.
+  held_var: VarId,
+  tainted: bool,
+  /// Called (`stand_in_called`): a record it holds that reaches code taints it.
+  called: bool,
+  /// What calls through it return besides itself: the admitted values they were handed.
+  returns: VarId,
+}
+
+/// Work the admission filter holds back until the object may hold a service
+/// (`Analysis::may_hold`); re-checked whenever the solve settles.
+enum Deferred {
+  /// The object flows into the variable.
+  Admit(ObjId, VarId),
+  /// A walk of the object.
+  Walk(ObjId, Walk, VarId, VarId, Site),
+  /// Host adoption of the object (`adopt`).
+  Adopt(ObjId, VarId),
+  /// The object's contribution as an argument of a type-modelled call (`typed_arg`).
+  TypedArg(ObjId, VarId, VarId, Site),
+  /// The object at a concrete position of a type-modelled call (`typed_concrete`).
+  Concrete(ObjId, u32, Site),
 }
 
 /// The `.d.ts` bounds of a default-modelled export: which arguments are at `unknown`/`any`
@@ -380,8 +421,22 @@ pub enum Constraint {
   /// An argument of a call into type-modelled `effect` code (`Analysis::typed_arg`): what it
   /// contributes to the call's slot.
   TypedArg(VarId, VarId, Site),
-  /// Values entering a type-modelled value's slot (`Analysis::slot_in`).
-  SlotIn(VarId),
+  /// Values entering a type-modelled value's slot (`Analysis::slot_in`); the object is the
+  /// stand-in for what the admission filter holds back.
+  SlotIn(VarId, ObjId),
+  /// Direction 2's admission filter (`Analysis::admit`): what may hold a service flows into the
+  /// variable; anything else is stood for by the stand-in object until it may.
+  Admit(VarId, ObjId),
+  /// A call reaching only the functions (closures, classes, builtins) of the variable.
+  CallFn(Box<Call>),
+  /// A member of an options object handed to type-modelled code: a function effect code may
+  /// call with the slot (`typed_callback`); a type-modelled function among them is routed as
+  /// `pool_route` does.
+  TypedNested(VarId, VarId, Site),
+  /// An argument at a concrete position of a call into type-modelled code (its declared type,
+  /// interned, mentions no type parameter; `u32::MAX` if unknown): it joins no slot, but its
+  /// callbacks run and its declared members are read (`Analysis::typed_concrete`).
+  TypedConcrete(u32, Site),
   /// Every key named by these strings keeps all its methods (a key handed to type-modelled
   /// code, which may provide or read it).
   BailKeys,
@@ -461,7 +516,25 @@ impl Constraint {
       C::ThenableBail(obj) => C::ThenableBail(*obj),
       C::ThenableAwait(dst) => C::ThenableAwait(v(*dst)),
       C::TypedArg(slot, back, site) => C::TypedArg(v(*slot), v(*back), *site),
-      C::SlotIn(dst) => C::SlotIn(v(*dst)),
+      C::SlotIn(dst, stand_in) => C::SlotIn(v(*dst), *stand_in),
+      C::Admit(dst, stand_in) => C::Admit(v(*dst), *stand_in),
+      C::TypedConcrete(ty, site) => C::TypedConcrete(*ty, *site),
+      C::TypedNested(slot, back, site) => C::TypedNested(v(*slot), v(*back), *site),
+      C::CallFn(call) => {
+        let mut c = (**call).clone();
+        c.this = c.this.map(v);
+        c.ret = v(c.ret);
+        c.args = c
+          .args
+          .iter()
+          .map(|a| match a {
+            Arg::Var(x) => Arg::Var(v(*x)),
+            Arg::Spread(x) => Arg::Spread(v(*x)),
+          })
+          .collect();
+        c.site = s(c.site);
+        C::CallFn(Box::new(c))
+      }
       C::BailKeys => C::BailKeys,
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
       C::Accessor(acc) => C::Accessor(Accessor {
@@ -674,6 +747,7 @@ pub struct Var {
   queued: bool,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "independent switches of the analysis")]
 pub struct Analysis {
   pub vars: IndexVec<VarId, Var>,
   pub objs: IndexVec<ObjId, Obj>,
@@ -732,6 +806,8 @@ pub struct Analysis {
   pub typed_exports: Vec<TypedExport>,
   /// Signatures read for a type-modelled export, by (export, argument count).
   typed_sigs: FxHashMap<(u32, usize), TypedSig>,
+  /// Signatures of the functions export calls return, by (origin, argument count).
+  returned_sigs: FxHashMap<((u32, usize), usize), Option<TypedSig>>,
   /// The value a call into type-modelled code returns, and the variable of what the call is
   /// handed, by (site, callee).
   typed_results: FxHashMap<(Site, Option<ObjId>), (ObjId, VarId)>,
@@ -739,15 +815,55 @@ pub struct Analysis {
   typed_slot_fns: FxHashSet<(ObjId, VarId)>,
   /// (result, receiver) pairs of method calls already joined (`typed_call`).
   typed_receivers: FxHashSet<(ObjId, ObjId)>,
-  /// The one type-modelled value that stands, inside slots, for every type-modelled value held
-  /// there (`slot_in`).
-  typed_any: Option<ObjId>,
   /// Each call's handed-values variable, translated for slots (`slot_in`).
   typed_backs: FxHashMap<VarId, VarId>,
   /// (object, slot) pairs `typed_arg` has handled.
   typed_args_seen: FxHashSet<(ObjId, VarId)>,
   /// The method summary read off a type-modelled value.
   typed_methods: FxHashMap<ObjId, ObjId>,
+  /// The module each type-modelled call result comes from, for its container pool.
+  typed_result_module: FxHashMap<ObjId, ModuleIdx>,
+  /// The result of a call whose declared return is concrete (`RetShape::concrete`), by the
+  /// same key as `typed_results`: a summary that holds nothing.
+  typed_plain_results: FxHashMap<(Site, Option<ObjId>), ObjId>,
+  /// What concrete-position callbacks receive: an unknown, service-free host value.
+  concrete_args: Option<VarId>,
+  /// (object, position type, site) triples `typed_concrete` has handled.
+  concrete_seen: FxHashSet<(ObjId, u32, Site)>,
+  /// The export call (export, argument count) each type-modelled call result comes from: a
+  /// call of the result is a call of the function that export returns.
+  typed_result_origin: FxHashMap<ObjId, (u32, usize)>,
+  /// One program-wide container pool per type-modelled module (direction 2): what calls that may
+  /// store an argument hand it, read by every call into the module.
+  typed_pools: FxHashMap<ModuleIdx, VarId>,
+  /// The member names each type-modelled module declares only as methods
+  /// (`Dts::method_only_names`).
+  method_only: FxHashMap<ModuleIdx, std::rc::Rc<FxHashSet<String>>>,
+  /// Whether method calls on each type-modelled module's values may store into them
+  /// (`Dts::methods_store`).
+  methods_store: FxHashMap<ModuleIdx, bool>,
+  /// Debug: why stand-ins were tainted.
+  pub taint_log: FxHashMap<String, usize>,
+  /// Debug: which calls write each pool.
+  pool_writers: FxHashMap<ModuleIdx, FxHashSet<String>>,
+  /// The type-modelled modules whose exports the program calls.
+  pub typed_called_modules: FxHashSet<ModuleIdx>,
+  /// Stand-ins (`StandIn`), and the one of each type-modelled call site.
+  stand_ins: FxHashMap<ObjId, StandIn>,
+  site_stand_ins: FxHashMap<Site, ObjId>,
+  /// The admission-filtered copy of each variable stored under an unknown key, with its stand-in.
+  unknown_store_filters: FxHashMap<VarId, VarId>,
+  /// Work held back by the admission filter (`Deferred`).
+  deferred: Vec<Deferred>,
+  /// Objects known to hold something that may be a service (`may_hold` only grows).
+  live: FxHashSet<ObjId>,
+  /// Objects known to reach code (`reaches_code` only grows).
+  live_code: FxHashSet<ObjId>,
+  /// Admission counters for the report: admitted, held back, tainted stand-ins.
+  pub admission_stats: (u64, u64, u64),
+  /// Direction 2's admission lever on the protocol walks, host adoption and unknown-key stores.
+  /// On with the type model (`ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL=1`), which is opt-in.
+  pub admission: bool,
   /// What awaiting each summary gives (`AwaitOf` on a `Wrap`).
   awaited_wraps: FxHashMap<ObjId, VarId>,
   /// Each adopted object's `then` (`adopt`).
@@ -906,10 +1022,29 @@ impl Analysis {
       thenables_bailed: FxHashSet::default(),
       typed_exports: vec![],
       typed_sigs: FxHashMap::default(),
+      returned_sigs: FxHashMap::default(),
       typed_results: FxHashMap::default(),
       typed_methods: FxHashMap::default(),
+      typed_result_module: FxHashMap::default(),
+      typed_result_origin: FxHashMap::default(),
+      typed_plain_results: FxHashMap::default(),
+      concrete_args: None,
+      concrete_seen: FxHashSet::default(),
+      typed_pools: FxHashMap::default(),
+      pool_writers: FxHashMap::default(),
+      taint_log: FxHashMap::default(),
+      methods_store: FxHashMap::default(),
+      method_only: FxHashMap::default(),
+      typed_called_modules: FxHashSet::default(),
+      stand_ins: FxHashMap::default(),
+      site_stand_ins: FxHashMap::default(),
+      unknown_store_filters: FxHashMap::default(),
+      deferred: vec![],
+      live: FxHashSet::default(),
+      live_code: FxHashSet::default(),
+      admission_stats: (0, 0, 0),
+      admission: false,
       typed_args_seen: FxHashSet::default(),
-      typed_any: None,
       typed_backs: FxHashMap::default(),
       typed_receivers: FxHashSet::default(),
       typed_slot_fns: FxHashSet::default(),
@@ -1476,7 +1611,7 @@ impl Analysis {
         if self.activation_queue.is_empty() && self.new_constraints.is_empty() {
           // Rejected objects are re-checked as they change; this pass only confirms that
           // nothing became admissible without an event before the solve ends.
-          if self.recheck_all() | self.admit_service_free() {
+          if self.recheck_all() | self.admit_service_free() | self.recheck_deferred() {
             continue;
           }
           break;
@@ -1509,6 +1644,9 @@ impl Analysis {
   }
 
   fn apply(&mut self, var: VarId, obj: ObjId, c: &Constraint) {
+    if !self.stand_ins.is_empty() && self.stand_in_use(obj, c) {
+      return;
+    }
     match c {
       Constraint::Load { key, dst } => self.load(obj, key, *dst),
       Constraint::Store { key, src } => self.store(obj, key, *src),
@@ -1560,9 +1698,14 @@ impl Analysis {
         ObjKind::Promise { value } => self.copy(value, *dst),
         ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
           // The object itself (awaiting a non-thenable yields it); a hand-written thenable
-          // bails (`adopt`).
+          // bails (`adopt`). An object that can't reach a callable has no callable `then`, so
+          // its adoption waits until it may (direction 2's admission lever).
           self.seed(*dst, obj);
-          self.adopt(obj, *dst);
+          if !self.admission || self.reaches_code(obj) {
+            self.adopt(obj, *dst);
+          } else {
+            self.deferred.push(Deferred::Adopt(obj, *dst));
+          }
         }
         // Awaiting a type-modelled value yields what it holds.
         ObjKind::Typed { slot, .. } => {
@@ -1675,7 +1818,15 @@ impl Analysis {
         }
       }
       Constraint::TypedArg(slot, back, site) => self.typed_arg(obj, *slot, *back, *site),
-      Constraint::SlotIn(dst) => self.slot_in(obj, *dst),
+      Constraint::SlotIn(dst, stand_in) => self.slot_in(obj, *dst, *stand_in),
+      Constraint::Admit(dst, stand_in) => self.admit(obj, *dst, *stand_in),
+      Constraint::TypedConcrete(ty, site) => self.typed_concrete(obj, *ty, *site),
+      Constraint::CallFn(call) => {
+        if Self::function_kind(&self.objs[obj].kind) {
+          self.call(obj, call);
+        }
+      }
+      Constraint::TypedNested(slot, back, site) => self.typed_nested(obj, *slot, *back, *site),
       Constraint::BailKeys => match &self.objs[obj].kind {
         ObjKind::Str(name) => {
           let name = name.clone();
@@ -1705,6 +1856,37 @@ impl Analysis {
           self.copy(*src, pv);
         }
       }
+    }
+  }
+
+  /// A use of a stand-in (`StandIn`): one that only reads what the values it holds hold, or
+  /// hands them over, applies to them (`held_var`); a call goes through `stand_in_call`.
+  /// Returns whether the use is fully handled.
+  fn stand_in_use(&mut self, obj: ObjId, c: &Constraint) -> bool {
+    let Some(s) = self.stand_ins.get(&obj) else { return false };
+    let held_var = s.held_var;
+    match c {
+      Constraint::Walk { .. }
+      | Constraint::Escape(..)
+      | Constraint::Protocol(_)
+      | Constraint::Enumerate
+      | Constraint::DemandAll
+      | Constraint::SpreadInto(_)
+      | Constraint::Contents(_)
+      | Constraint::TypedConcrete(..)
+      | Constraint::TypedNested(..)
+      | Constraint::TypedArg(..)
+      | Constraint::AwaitOf(_)
+      | Constraint::ThenableBail(_) => {
+        self.constrain(held_var, c.clone());
+        false
+      }
+      Constraint::Call(call) => {
+        let call = (**call).clone();
+        self.stand_in_call(obj, held_var, &call);
+        true
+      }
+      _ => false,
     }
   }
 
@@ -1808,7 +1990,7 @@ impl Analysis {
         self.constrain(inner, Constraint::Demand(name.clone()));
         self.seed(dst, obj);
       }
-      ObjKind::Typed { slot, .. } => self.typed_member(obj, slot, dst),
+      ObjKind::Typed { slot, .. } => self.typed_member(obj, slot, dst, Some(name)),
       ObjKind::Top(flavour) => {
         let t = if flavour == Flavour::Ext { self.top_ext } else { self.top_host };
         self.seed(dst, t);
@@ -1934,7 +2116,7 @@ impl Analysis {
         self.constrain(inner, Constraint::DemandAll);
         self.seed(dst, obj);
       }
-      ObjKind::Typed { slot, .. } => self.typed_member(obj, slot, dst),
+      ObjKind::Typed { slot, .. } => self.typed_member(obj, slot, dst, None),
       ObjKind::Str(_) => self.seed(dst, self.top_host),
       ObjKind::Top(_) | ObjKind::External { .. } => {
         let t = self.top_of(obj);
@@ -2008,6 +2190,9 @@ impl Analysis {
       ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
         self.constrain(src, Constraint::Escape(flavour, None));
       }
+      ObjKind::Typed { .. } if self.is_stand_in(obj) => {
+        self.taint_by(obj, &format!("store {name}"));
+      }
       ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => self.copy(src, inner),
       // The only writable public member of a container is `ManagedRuntime.cachedContext`: the
       // Context written there provides its services. Other writes don't type check, so they
@@ -2043,6 +2228,9 @@ impl Analysis {
         if let Some(Flavour::Ext) = self.objs[obj].escaped {
           self.constrain(src, Constraint::Escape(Flavour::Ext, None));
         }
+        // Direction 2's admission lever: a value stored under an unknown name reaches every
+        // field, so only what may hold a service flows as itself; the rest is stood for.
+        let src = if self.admission { self.admitted_store(src) } else { src };
         let elem = self.elem(obj);
         self.copy(src, elem);
         if !self.objs[obj].unknown_stores.contains(&src) {
@@ -2057,6 +2245,7 @@ impl Analysis {
       ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
         self.constrain(src, Constraint::Escape(flavour, None));
       }
+      ObjKind::Typed { .. } if self.is_stand_in(obj) => self.taint_by(obj, "unknown store"),
       ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => self.copy(src, inner),
       ObjKind::Context { .. }
       | ObjKind::Layer { .. }
@@ -2580,11 +2769,50 @@ impl Analysis {
 
   /// An export of a type-modelled `effect` module (design section 11): its body is not
   /// analysed; calls take their flow from its `.d.ts` signature (`typed_call`).
-  pub fn typed_export(&mut self, dts: Option<std::path::PathBuf>, name: ArcStr) -> ObjId {
+  pub fn typed_export(
+    &mut self,
+    dts: Option<std::path::PathBuf>,
+    name: ArcStr,
+    module: ModuleIdx,
+  ) -> ObjId {
     let export = u32::try_from(self.typed_exports.len()).expect("too many exports");
-    self.typed_exports.push(TypedExport { dts, name });
+    self.typed_exports.push(TypedExport { dts, name, module });
     let slot = self.var();
     self.alloc(ObjKind::Typed { slot, export }, None)
+  }
+
+  /// The signature of a call with `nargs` arguments of a value an export call returned (a
+  /// data-last form), read from the export's declared return; its container shape is the
+  /// export's (`Dts::container_shape` counts the returned function's positions).
+  fn returned_sig(&mut self, origin: (u32, usize), nargs: usize) -> Option<TypedSig> {
+    if let Some(sig) = self.returned_sigs.get(&(origin, nargs)) {
+      return sig.clone();
+    }
+    let outer = self.typed_sig(origin.0, origin.1);
+    let e = &self.typed_exports[origin.0 as usize];
+    let sig = match (&e.dts, outer) {
+      (Some(dts), Some(outer)) => {
+        let (dts, name) = (dts.clone(), e.name.clone());
+        self.dts.returned_call(&dts, &name, origin.1, nargs).map(
+          |(b, ret, (generic, rest_generic))| {
+            let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
+            let rest = b.rest.map(|t| self.intern_ty(t));
+            TypedSig {
+              params,
+              rest,
+              ret,
+              stores: outer.stores,
+              reads: outer.reads,
+              generic,
+              rest_generic,
+            }
+          },
+        )
+      }
+      _ => None,
+    };
+    self.returned_sigs.insert((origin, nargs), sig.clone());
+    sig
   }
 
   fn typed_sig(&mut self, export: u32, nargs: usize) -> Option<TypedSig> {
@@ -2600,25 +2828,70 @@ impl Analysis {
         let (dts, name) = (dts.clone(), e.name.clone());
         let b = self.dts.bounds(&dts, &name, nargs);
         let ret = self.dts.ret_shape(&dts, &name, nargs);
+        let (stores, reads) = self.dts.container_shape(&dts, &name, nargs);
+        let (generic, rest_generic) =
+          self.dts.generic_positions(&dts, &name, nargs).unwrap_or((vec![true; nargs], true));
         let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
         let rest = b.rest.map(|t| self.intern_ty(t));
-        TypedSig { params, rest, ret }
+        TypedSig { params, rest, ret, stores, reads, generic, rest_generic }
       }
       None => TypedSig {
         params: vec![],
         rest: None,
         ret: super::dts::RetShape { unknown: true, ..Default::default() },
+        stores: true,
+        reads: true,
+        generic: vec![true; nargs],
+        rest_generic: true,
       },
     };
     self.typed_sigs.insert((export, nargs), sig.clone());
     Some(sig)
   }
 
+  /// The module a type-modelled value comes from: an export's, or the producing call's.
+  fn typed_module(&self, obj: ObjId) -> Option<ModuleIdx> {
+    match self.objs[obj].kind {
+      ObjKind::Typed { export, .. } if export != NO_EXPORT => {
+        Some(self.typed_exports[export as usize].module)
+      }
+      _ => self.typed_result_module.get(&obj).copied(),
+    }
+  }
+
   /// A member read off a type-modelled value: what it holds, and a method summary that shares
-  /// its slot (a method or a getter may hand out any of it; what a method's caller passes joins
-  /// it, the way a container's setter does).
-  fn typed_member(&mut self, obj: ObjId, slot: VarId, dst: VarId) {
-    self.copy(slot, dst);
+  /// its slot (a method or a getter may hand out any of it). `pipe` is `Pipeable`'s, which every
+  /// one of Effect's data types declares: the `effect:Pipeable.pipe` builtin, called with the
+  /// value as `this`. A stand-in's members are values it stands for: itself.
+  fn typed_member(&mut self, obj: ObjId, slot: VarId, dst: VarId, name: Option<&ArcStr>) {
+    if name.is_some_and(|n| n.as_str() == "pipe") && !self.is_stand_in(obj) {
+      if let Some(id) = self.rule_id("effect:Pipeable.pipe") {
+        let pipe = self.builtin(id, None, None);
+        self.seed(dst, pipe);
+        return;
+      }
+    }
+    // A name the value's module declares only as a method holds no value of a type parameter.
+    let method = match (name, self.typed_module(obj)) {
+      (Some(n), Some(m)) => {
+        let names = match self.method_only.get(&m) {
+          Some(s) => std::rc::Rc::clone(s),
+          None => {
+            let path =
+              self.typed_exports.iter().find(|e| e.module == m).and_then(|e| e.dts.clone());
+            let set =
+              std::rc::Rc::new(path.map(|p| self.dts.method_only_names(&p)).unwrap_or_default());
+            self.method_only.insert(m, std::rc::Rc::clone(&set));
+            set
+          }
+        };
+        names.contains(n.as_str())
+      }
+      _ => false,
+    };
+    if !method {
+      self.copy(slot, dst);
+    }
     // A value's method is the value itself (calling it is a call on it); an export's is a
     // separate summary, so that its own signature is not applied to a method call.
     if matches!(self.objs[obj].kind, ObjKind::Typed { export: NO_EXPORT, .. }) {
@@ -2630,6 +2903,9 @@ impl Analysis {
       None => {
         let m = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, None);
         self.typed_methods.insert(obj, m);
+        if let Some(module) = self.typed_module(obj) {
+          self.typed_result_module.insert(m, module);
+        }
         m
       }
     };
@@ -2637,55 +2913,147 @@ impl Analysis {
   }
 
   /// A call into type-modelled `effect` code (an export, or a value it made). The body is not
-  /// analysed. Flow follows the declared signature, with one slot per call site standing for
-  /// every type parameter:
-  /// - each argument, filtered by its declared parameter type (`unknown`/`any` is ignored and
-  ///   walked for protocols; a primitive-only type passes primitives), contributes to the slot
-  ///   (`typed_arg`): a plain value joins it, a type-modelled value's slot is unified with it, an
-  ///   Effect contributes its success, an array its elements, and callbacks (direct, or in an
-  ///   options object) run with the slot and their results join it;
+  /// analysed (direction 2, Tim's decision of 2026-11-07). Flow follows the declared signature,
+  /// with one slot per call site standing for every type parameter, and only what may hold a
+  /// service is tracked:
+  /// - each argument, filtered by its declared parameter type (concrete types pass no object,
+  ///   `unknown`/`any` is ignored and walked for protocols), then by the admission filter
+  ///   (`admit`: a value that reaches no callable, Effect value, key, container or opaque value
+  ///   is stood for by the site's stand-in), contributes to the slot (`typed_arg`): a plain value
+  ///   joins it, a type-modelled value's contents flow in, an Effect contributes its success, an
+  ///   array its elements, and callbacks (direct, or in an options object that may hold a
+  ///   service) run with the slot and their results join it;
   /// - a key handed over keeps all its methods (the code may provide or read it);
-  /// - calling a value it made (a curried result, a method) unifies with that value's slot;
+  /// - stateful containers: one program-wide pool per module. A call that may store an argument
+  ///   into a value another argument holds (`Dts::container_shape`, or no signature) hands what it is
+  ///   handed to its module's pool, and every call into the module reads the pool. This replaces
+  ///   writing into the slots of the values handed over, so it holds wherever the container
+  ///   lives (nested in a record, or behind a stand-in);
+  /// - calling a value it made (a curried result, a method) reads that value's contents, and
+  ///   uses its module's pool; calling a stand-in with arguments taints it;
   /// - the result follows the declared return: an `Effect` (succeeding with a summary, and with
   ///   the slot when its success is a type parameter), the slot for a bare type parameter, a
   ///   primitive, or a summary holding the slot. Without a signature it is both.
   fn typed_call(&mut self, callee: ObjId, callee_slot: VarId, export: u32, call: &Call) {
+    // Diagnostic only (bound A): every call into type-modelled code is an opaque host call.
+    if std::env::var_os("ROLLDOWN_ESS_OPAQUE").is_some() {
+      self.escape_args(call, Flavour::Host);
+      self.seed(call.ret, self.top_host);
+      return;
+    }
+    let stand_in = self.site_stand_in(call.site);
+    let module = self.typed_module(callee);
+    if export != NO_EXPORT {
+      if let Some(m) = module {
+        self.typed_called_modules.insert(m);
+      }
+    }
     // One result per source call site and export: the clones of a function share it, and so do
     // the values a method call is made on (a result per receiver would chain without bound when
     // a value's own result is called again, `loop(x.pipe(…))`).
-    let key = (Site { sub: 0, ..call.site }, if export == NO_EXPORT { None } else { Some(callee) });
-    let (result, back) = match self.typed_results.get(&key) {
+    let key_site = if std::env::var_os("ROLLDOWN_ESS_CLONE_SITES").is_some() {
+      call.site
+    } else {
+      Site { sub: 0, ..call.site }
+    };
+    let key = (key_site, if export == NO_EXPORT { None } else { Some(callee) });
+    let (result, handed) = match self.typed_results.get(&key) {
       Some(r) => *r,
       None => {
         let slot = self.var();
-        // What the call is handed, as it may be stored into the values it is handed.
+        // What the call is handed, admitted, as a container may store it.
         let handed = self.var();
         let back = self.var();
-        self.constrain(handed, Constraint::SlotIn(back));
+        self.constrain(handed, Constraint::SlotIn(back, stand_in));
         let r = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, Some(call.site));
         self.typed_results.insert(key, (r, handed));
         self.typed_backs.insert(handed, back);
         (r, handed)
       }
     };
-    if export == NO_EXPORT && self.typed_receivers.insert((result, callee)) {
-      // A call on a value it made: what that value holds flows into the result, and what the
-      // call is handed may be stored in it.
-      let ObjKind::Typed { slot, .. } = self.objs[result].kind else { unreachable!() };
-      let back = self.typed_backs[&back];
-      self.copy(callee_slot, slot);
-      self.copy(back, callee_slot);
+    if let Some(m) = module {
+      self.typed_result_module.entry(result).or_insert(m);
+    }
+    let nargs = call.args.len();
+    if export != NO_EXPORT {
+      self.typed_result_origin.entry(result).or_insert((export, nargs));
     }
     let ObjKind::Typed { slot, .. } = self.objs[result].kind else { unreachable!() };
-    let handed = back;
     let back = self.typed_backs[&handed];
+    if export == NO_EXPORT && self.typed_receivers.insert((result, callee)) {
+      // A call on a value it made: what that value holds flows into the result.
+      if self.is_stand_in(callee) {
+        self.seed(slot, callee);
+      } else {
+        self.copy(callee_slot, slot);
+      }
+    }
     if export == NO_EXPORT {
       if let Some(this) = call.this {
         self.constrain(this, Constraint::TypedArg(slot, back, call.site));
       }
     }
-    let nargs = call.args.len();
-    let sig = self.typed_sig(export, nargs);
+    let sig = if export != NO_EXPORT {
+      self.typed_sig(export, nargs)
+    } else if call.this.is_none() && !call.is_new {
+      self.typed_result_origin.get(&callee).copied().and_then(|o| self.returned_sig(o, nargs))
+    } else {
+      None
+    };
+    // The module's container pool, used by calls whose declared shape may store into or read a
+    // container. Calling a value an export returned (a data-last form) has that export's shape;
+    // a method call, or a call without a signature, may do both.
+    if let Some(m) = module {
+      let shape = if call.is_new {
+        // A class's instance holds what it is constructed with (its slot).
+        Some((false, false))
+      } else if export != NO_EXPORT {
+        sig.as_ref().map(|s| (s.stores, s.reads))
+      } else if call.this.is_some() {
+        // A method call: it may hand back what the value holds, and stores only if the module
+        // declares a method that takes a value of its type's parameter.
+        let stores = self.module_methods_store(m);
+        Some((stores, true))
+      } else {
+        self
+          .typed_result_origin
+          .get(&callee)
+          .copied()
+          .and_then(|(e, n)| self.typed_sig(e, n))
+          .map(|s| (s.stores, s.reads))
+      };
+      // A call the summary can't resolve (a value with no known signature, called as a function)
+      // bails the services it is handed: they escape to code the pass can't see.
+      let (stores, reads) = match shape {
+        Some(s) => s,
+        None => {
+          self.constrain(handed, Constraint::Escape(Flavour::Ext, None));
+          (false, true)
+        }
+      };
+      if stores || reads {
+        let pool = self.typed_pool(m);
+        if reads {
+          self.copy(pool, slot);
+        }
+        if stores {
+          self.copy(back, pool);
+          if self.debug {
+            let who = if export != NO_EXPORT {
+              format!("export {}", self.typed_exports[export as usize].name)
+            } else if call.this.is_some() {
+              format!("method call at {:?}", (call.site.module.raw(), call.site.start))
+            } else {
+              match self.typed_result_origin.get(&callee) {
+                Some((e, n)) => format!("result of {}/{n}", self.typed_exports[*e as usize].name),
+                None => format!("call of value at {:?}", (call.site.module.raw(), call.site.start)),
+              }
+            };
+            self.pool_writers.entry(m).or_default().insert(who);
+          }
+        }
+      }
+    }
     let pool = self.ignored_pool();
     for (i, a) in call.args.iter().enumerate() {
       let v = match a {
@@ -2697,18 +3065,55 @@ impl Analysis {
         }
       };
       let ty = sig.as_ref().and_then(|s| s.params.get(i).copied().flatten().or(s.rest));
+      let generic =
+        sig.as_ref().is_none_or(|s| s.generic.get(i).copied().unwrap_or(s.rest_generic));
       let arg = self.var();
       self.bounded_copy(v, arg, ty);
-      self.copy(arg, handed);
-      self.constrain(arg, Constraint::TypedArg(slot, back, call.site));
-      // Effect's code may call a value's implicit protocol methods.
+      if generic {
+        self.constrain(arg, Constraint::Admit(handed, stand_in));
+        self.constrain(arg, Constraint::TypedArg(slot, back, call.site));
+      } else {
+        self.constrain(arg, Constraint::TypedConcrete(ty.unwrap_or(u32::MAX), call.site));
+      }
+      // Effect's code may call a value's implicit protocol methods (the walk skips values that
+      // reach no callable).
       self.copy(arg, pool);
     }
     let ret = sig.map_or(super::dts::RetShape { unknown: true, ..Default::default() }, |s| s.ret);
+    let plain = if ret.concrete || ret.effect_concrete {
+      let p = match self.typed_plain_results.get(&key) {
+        Some(p) => *p,
+        None => {
+          let empty = self.var();
+          let p = self.alloc(ObjKind::Typed { slot: empty, export: NO_EXPORT }, Some(call.site));
+          self.typed_plain_results.insert(key, p);
+          if let Some(m) = module {
+            self.typed_result_module.insert(p, m);
+          }
+          if export != NO_EXPORT {
+            self.typed_result_origin.insert(p, (export, nargs));
+          }
+          p
+        }
+      };
+      Some(p)
+    } else {
+      None
+    };
+    if ret.concrete {
+      if let Some(p) = plain {
+        self.seed(call.ret, p);
+      }
+    }
     if ret.effect {
       let (eff, success, _) = self.new_effect(call.site, 41);
       if ret.effect_other || ret.effect_param {
         self.seed(success, result);
+      }
+      if ret.effect_concrete {
+        if let Some(p) = plain {
+          self.seed(success, p);
+        }
       }
       if ret.effect_param {
         self.copy(slot, success);
@@ -2726,34 +3131,421 @@ impl Analysis {
     }
   }
 
-  /// The value standing for every type-modelled value held in a slot (`slot_in`), and its slot.
-  fn typed_any(&mut self) -> (ObjId, VarId) {
-    if let Some(o) = self.typed_any {
-      let ObjKind::Typed { slot, .. } = self.objs[o].kind else { unreachable!() };
-      return (o, slot);
-    }
-    let slot = self.var();
-    let o = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, None);
-    self.typed_any = Some(o);
-    (o, slot)
+  // == direction 2: the admission filter
+
+  /// Whether the object may hold a service (direction 2's admission test, over-approximate):
+  /// whether anything it reaches through fields, elements, prototypes, spread sources, unknown
+  /// stores, a summary's slot or a promise's value is a callable, an Effect value, a key or
+  /// container, a summary that may stand for anything, or a value from code the pass can't see.
+  /// A service has methods, so a value that reaches none of these holds no service, and nothing
+  /// read from it can call or name one. Strings, numbers and other primitives hold nothing. The
+  /// answer only turns from false to true as the solve grows (`live` keeps the positives), so a
+  /// held-back object is re-checked whenever the solve settles (`recheck_deferred`).
+  fn may_hold(&mut self, obj: ObjId) -> bool {
+    self.reaches(obj, false)
   }
 
-  /// A value entering a slot. Slots hold no type-modelled value of their own: one held there
-  /// (a Stream in an `Option`, an Effect's success) contributes what it holds, and is stood for
-  /// by one shared value (`typed_any`) whose slot holds what every such value holds. Each value
-  /// in its own slot made slots grow with every one upstream of them.
-  fn slot_in(&mut self, obj: ObjId, dst: VarId) {
-    match self.objs[obj].kind {
-      ObjKind::Typed { slot, .. } => {
-        let (any, any_slot) = self.typed_any();
-        if obj != any {
-          self.copy(slot, dst);
-          self.copy(slot, any_slot);
-        }
-        self.seed(dst, any);
+  /// Whether the object reaches code: a callable, or anything `may_hold` counts. A walk, an
+  /// adoption or effect code calling the handlers it is handed can only run code the value
+  /// reaches, so a value that reaches none has nothing for them to do.
+  fn reaches_code(&mut self, obj: ObjId) -> bool {
+    self.reaches(obj, true)
+  }
+
+  /// `may_hold` (`code` false) and `reaches_code` (`code` true). A service is a value provided
+  /// under a key (`all_values`), so a value holds one only if it reaches a provided value, a
+  /// summary that may stand for anything (a `Wrap`), a value from code the pass can't see, a
+  /// key, a container of services or an Effect. A function, class or builtin that holds none
+  /// of these is no service: what code may do with one it gets back (call it, read or write
+  /// it, hand it on) goes through the stand-in, which releases it (`taint`) or applies the use
+  /// to it (`held_var`).
+  fn reaches(&mut self, obj: ObjId, code: bool) -> bool {
+    const LIMIT: usize = 4096;
+    let live = if code { &self.live_code } else { &self.live };
+    if live.contains(&obj) {
+      return true;
+    }
+    let mut seen: FxHashSet<ObjId> = FxHashSet::default();
+    let mut stack = vec![obj];
+    let mut vars: Vec<VarId> = vec![];
+    while let Some(o) = stack.pop() {
+      if !seen.insert(o) {
+        continue;
       }
-      ObjKind::Effect { success, .. } => self.constrain(success, Constraint::SlotIn(dst)),
-      ObjKind::Promise { value } => self.constrain(value, Constraint::SlotIn(dst)),
+      let known = if code { &self.live_code } else { &self.live };
+      let provided = !code && self.vars[self.all_values].pts.contains(&o);
+      if known.contains(&o) || provided || seen.len() > LIMIT {
+        if code {
+          self.live_code.insert(obj)
+        } else {
+          self.live.insert(obj)
+        };
+        return true;
+      }
+      let ob = &self.objs[o];
+      match &ob.kind {
+        ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim | ObjKind::AllKeys => continue,
+        // What only reads, provides or runs through a stand-in stays sound behind one: a
+        // Context or Layer (lookups and provision through a stand-in see every key), a value
+        // from unseen code or a builtin (a call through a stand-in releases it), an Effect's
+        // body (run when the Effect is built; only its success matters).
+        ObjKind::Context { .. }
+        | ObjKind::Layer { .. }
+        | ObjKind::Runtime { .. }
+        | ObjKind::Fiber
+        | ObjKind::MemoMap
+        | ObjKind::Top(_)
+        | ObjKind::External { .. }
+        | ObjKind::Namespace
+        | ObjKind::Builtin { .. }
+          if !code =>
+        {
+          continue;
+        }
+        ObjKind::Effect { success, .. } if !code => vars.push(*success),
+        ObjKind::Object | ObjKind::Array | ObjKind::Closure(_)
+          if !code || matches!(ob.kind, ObjKind::Object | ObjKind::Array) =>
+        {
+          if code && (ob.builtin_proto || self.accessors.contains_key(&o)) {
+            self.live_code.insert(obj);
+            return true;
+          }
+          vars.extend(ob.fields.values().copied());
+          vars.extend(ob.elem);
+          vars.extend(ob.proto);
+          vars.extend(ob.spread_from.iter().copied());
+          vars.extend(ob.unknown_stores.iter().copied());
+        }
+        ObjKind::Typed { slot, .. } => vars.push(*slot),
+        ObjKind::Promise { value } => vars.push(*value),
+        _ => {
+          if code {
+            self.live_code.insert(obj)
+          } else {
+            self.live.insert(obj)
+          };
+          return true;
+        }
+      }
+      for v in vars.drain(..) {
+        stack.extend(self.vars[v].pts.iter().copied());
+      }
+    }
+    false
+  }
+
+  /// A fresh stand-in (`StandIn`).
+  fn new_stand_in(&mut self) -> ObjId {
+    let slot = self.var();
+    let held_var = self.var();
+    let returns = self.var();
+    let o = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, None);
+    self
+      .stand_ins
+      .insert(o, StandIn { held: vec![], held_var, tainted: false, called: false, returns });
+    o
+  }
+
+  /// The stand-in of a type-modelled call site: one per source site, shared by its clones.
+  fn site_stand_in(&mut self, site: Site) -> ObjId {
+    let key = Site { sub: 0, ..site };
+    if let Some(o) = self.site_stand_ins.get(&key) {
+      return *o;
+    }
+    let o = self.new_stand_in();
+    self.site_stand_ins.insert(key, o);
+    o
+  }
+
+  fn is_stand_in(&self, obj: ObjId) -> bool {
+    self.stand_ins.contains_key(&obj)
+  }
+
+  /// The admission filter: `obj` flows into `dst` if it may hold a service; otherwise the
+  /// stand-in flows there for it until it may, or until the stand-in is tainted.
+  fn admit(&mut self, obj: ObjId, dst: VarId, stand_in: ObjId) {
+    if self.is_stand_in(obj) || self.stand_ins.get(&stand_in).is_none_or(|s| s.tainted) {
+      self.seed(dst, obj);
+      return;
+    }
+    if self.may_hold(obj) {
+      self.admission_stats.0 += 1;
+      self.seed(dst, obj);
+      return;
+    }
+    self.admission_stats.1 += 1;
+    self.seed(dst, stand_in);
+    let held_var = match self.stand_ins.get_mut(&stand_in) {
+      Some(s) => {
+        s.held.push((obj, dst));
+        Some(s.held_var)
+      }
+      None => None,
+    };
+    if let Some(v) = held_var {
+      self.seed(v, obj);
+    }
+    if self.stand_ins.get(&stand_in).is_some_and(|s| s.called) && self.held_call_needs_release(obj)
+    {
+      self.taint_by(stand_in, "call of a held record with code");
+    }
+    if !matches!(self.objs[obj].kind, ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim) {
+      self.deferred.push(Deferred::Admit(obj, dst));
+    }
+  }
+
+  /// A call through a stand-in: the call reaches the callables it holds (`held_var`). A member
+  /// read off a stand-in is the stand-in, so the call may also be a method of a record or array
+  /// it holds: one that reaches code taints it. Data with no code in it has no method to call.
+  /// A call through a stand-in: the functions it holds are called; the call is otherwise a
+  /// call into effect code on a value that holds no service (a held summary's method: its
+  /// callbacks run, and it returns what it was handed that may hold a service, or service-free
+  /// data, the stand-in itself). `stand_in_called` releases it where that is not enough.
+  fn stand_in_call(&mut self, stand_in: ObjId, held_var: VarId, call: &Call) {
+    self.constrain(held_var, Constraint::CallFn(Box::new(call.clone())));
+    let returns = self.stand_ins[&stand_in].returns;
+    for a in &call.args {
+      let v = match a {
+        Arg::Var(v) | Arg::Spread(v) => *v,
+      };
+      self.constrain(v, Constraint::TypedArg(returns, returns, call.site));
+    }
+    self.seed(call.ret, stand_in);
+    self.copy(returns, call.ret);
+    self.stand_in_called(stand_in);
+  }
+
+  fn stand_in_called(&mut self, stand_in: ObjId) {
+    let Some(s) = self.stand_ins.get_mut(&stand_in) else { return };
+    if s.tainted {
+      return;
+    }
+    s.called = true;
+    let held: Vec<ObjId> = s.held.iter().map(|(o, _)| *o).collect();
+    if held.into_iter().any(|o| self.held_call_needs_release(o)) {
+      self.taint_by(stand_in, "call of a held record with code");
+    }
+  }
+
+  /// Whether a call through a stand-in holding `obj` must release it: `obj` is a record or array
+  /// with code (one of its methods may be what is called), or a summary from a module whose
+  /// methods may store their arguments (`Dts::methods_store`).
+  fn held_call_needs_release(&mut self, obj: ObjId) -> bool {
+    match self.objs[obj].kind {
+      ObjKind::Object | ObjKind::Array => self.reaches_code(obj),
+      ObjKind::Typed { .. } if !self.is_stand_in(obj) => match self.typed_module(obj) {
+        Some(m) => self.module_methods_store(m),
+        None => false,
+      },
+      _ => false,
+    }
+  }
+
+  fn module_methods_store(&mut self, m: ModuleIdx) -> bool {
+    if let Some(b) = self.methods_store.get(&m) {
+      return *b;
+    }
+    let path = self.typed_exports.iter().find(|e| e.module == m).and_then(|e| e.dts.clone());
+    let b = path.is_none_or(|p| self.dts.methods_store(&p));
+    self.methods_store.insert(m, b);
+    b
+  }
+
+  /// Something may write into, hand over or call what the stand-in stands for: from now on its
+  /// values flow as themselves.
+  fn taint_by(&mut self, stand_in: ObjId, why: &str) {
+    let Some(s) = self.stand_ins.get_mut(&stand_in) else { return };
+    if s.tainted {
+      return;
+    }
+    s.tainted = true;
+    let held = std::mem::take(&mut s.held);
+    if self.debug {
+      let site = self
+        .site_stand_ins
+        .iter()
+        .find(|(_, o)| **o == stand_in)
+        .map(|(s, _)| (s.module.raw(), s.start));
+      *self
+        .taint_log
+        .entry(format!("{why} stand-in of {site:?} holding {}", held.len()))
+        .or_default() += 1;
+    }
+    self.admission_stats.2 += 1;
+    for (obj, dst) in held {
+      self.seed(dst, obj);
+    }
+  }
+
+  /// `src` filtered by the admission test, as the variable an unknown-key store copies into the
+  /// target's fields (one per source variable, with its own stand-in).
+  fn admitted_store(&mut self, src: VarId) -> VarId {
+    if let Some(v) = self.unknown_store_filters.get(&src) {
+      return *v;
+    }
+    let v = self.var();
+    let stand_in = self.new_stand_in();
+    self.unknown_store_filters.insert(src, v);
+    self.constrain(src, Constraint::Admit(v, stand_in));
+    v
+  }
+
+  /// Runs the held-back work whose object may now hold a service; returns whether any ran.
+  fn recheck_deferred(&mut self) -> bool {
+    let called: Vec<ObjId> =
+      self.stand_ins.iter().filter(|(_, s)| s.called && !s.tainted).map(|(o, _)| *o).collect();
+    let mut tainted_any = false;
+    for o in called {
+      self.stand_in_called(o);
+      tainted_any |= self.stand_ins[&o].tainted;
+    }
+    if self.deferred.is_empty() {
+      return tainted_any;
+    }
+    let pending = std::mem::take(&mut self.deferred);
+    let mut ran = false;
+    let mut keep = vec![];
+    for d in pending {
+      let obj = match &d {
+        Deferred::Admit(o, _)
+        | Deferred::Walk(o, ..)
+        | Deferred::Adopt(o, _)
+        | Deferred::TypedArg(o, ..)
+        | Deferred::Concrete(o, ..) => *o,
+      };
+      let ready = match &d {
+        Deferred::Admit(..) => self.may_hold(obj),
+        _ => self.reaches_code(obj),
+      };
+      if !ready {
+        keep.push(d);
+        continue;
+      }
+      ran = true;
+      match d {
+        Deferred::Admit(o, dst) => {
+          self.admission_stats.0 += 1;
+          self.seed(dst, o);
+        }
+        Deferred::Walk(o, walk, pool, arg, site) => self.walk(o, walk, pool, arg, site),
+        Deferred::Adopt(o, dst) => self.adopt(o, dst),
+        Deferred::TypedArg(o, slot, back, site) => self.typed_arg(o, slot, back, site),
+        Deferred::Concrete(o, ty, site) => self.typed_concrete(o, ty, site),
+      }
+    }
+    keep.append(&mut self.deferred);
+    self.deferred = keep;
+    ran || tainted_any
+  }
+
+  /// Debug census of the type model: pool sizes by module, the largest slots and what fills
+  /// them.
+  pub fn typed_census(&self, names: &dyn Fn(ModuleIdx) -> String) -> String {
+    let mut pools: Vec<(usize, String)> =
+      self.typed_pools.iter().map(|(m, v)| (self.vars[*v].pts.len(), names(*m))).collect();
+    pools.sort_by_key(|x| std::cmp::Reverse(x.0));
+    let mut slots: Vec<(usize, ObjId)> = self
+      .objs
+      .iter_enumerated()
+      .filter_map(|(o, ob)| match ob.kind {
+        ObjKind::Typed { slot, .. } => Some((self.vars[slot].pts.len(), o)),
+        _ => None,
+      })
+      .collect();
+    slots.sort_by_key(|x| std::cmp::Reverse(x.0));
+    let total: usize = slots.iter().map(|x| x.0).sum();
+    let describe = |o: ObjId| -> String {
+      let ob = &self.objs[o];
+      let what = match ob.kind {
+        ObjKind::Typed { export, .. } if export != NO_EXPORT => {
+          format!("export {}", self.typed_exports[export as usize].name)
+        }
+        _ if self.is_stand_in(o) => "stand-in".to_string(),
+        _ => format!(
+          "result {:?} of {}",
+          ob.site.map(|s| (s.module.raw(), s.start)),
+          self.typed_result_module.get(&o).map(|m| names(*m)).unwrap_or_default()
+        ),
+      };
+      let ObjKind::Typed { slot, .. } = ob.kind else { return what };
+      let mut kinds: FxHashMap<String, usize> = FxHashMap::default();
+      for x in &self.vars[slot].pts {
+        let k = if self.is_stand_in(*x) {
+          "StandIn".to_string()
+        } else {
+          format!("{:?}", self.objs[*x].kind)
+            .split([' ', '(', '{'])
+            .next()
+            .unwrap_or("")
+            .to_string()
+        };
+        *kinds.entry(k).or_default() += 1;
+      }
+      format!("{what} {kinds:?}")
+    };
+    let top: Vec<String> =
+      slots.iter().take(12).map(|(n, o)| format!("{n}: {}", describe(*o))).collect();
+    let mut origins: FxHashMap<String, usize> = FxHashMap::default();
+    if let Some((_, o)) = slots.first() {
+      if let ObjKind::Typed { slot, .. } = self.objs[*o].kind {
+        for x in &self.vars[slot].pts {
+          let ob = &self.objs[*x];
+          let k = format!(
+            "{} {:?}",
+            format!("{:?}", ob.kind).split([' ', '(', '{']).next().unwrap_or(""),
+            ob.site.map(|s| (names(s.module), s.start))
+          );
+          *origins.entry(k).or_default() += 1;
+        }
+      }
+    }
+    let mut origins: Vec<(String, usize)> = origins.into_iter().collect();
+    origins.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let top = {
+      let mut t = top;
+      t.push(format!("first slot by origin: {:?}", &origins[..origins.len().min(40)]));
+      t
+    };
+    let typed_vars: usize = self.vars.iter().filter(|v| v.pts.len() > 100).count();
+    let writers: Vec<String> = self
+      .pool_writers
+      .iter()
+      .map(|(m, w)| {
+        let mut w: Vec<&String> = w.iter().collect();
+        w.sort();
+        format!("{}: {:?}", names(*m), &w[..w.len().min(12)])
+      })
+      .collect();
+    let mut taints: Vec<(&String, &usize)> = self.taint_log.iter().collect();
+    taints.sort_by_key(|x| std::cmp::Reverse(*x.1));
+    let taints: Vec<String> = taints.iter().take(25).map(|(k, n)| format!("{n} x {k}")).collect();
+    format!(
+      "taints {taints:#?}; pools {:?}; writers {writers:#?}; {} Typed, slot entries {total}; vars over 100 entries {typed_vars}; largest slots {top:#?}",
+      &pools[..pools.len().min(10)],
+      slots.len()
+    )
+  }
+
+  /// The container pool of a type-modelled module.
+  fn typed_pool(&mut self, module: ModuleIdx) -> VarId {
+    if let Some(v) = self.typed_pools.get(&module) {
+      return *v;
+    }
+    let v = self.var();
+    self.typed_pools.insert(module, v);
+    v
+  }
+
+  /// A value entering a slot (or what a call is handed, for its module's pool): an Effect
+  /// contributes its success and a promise its value; a function runs with what the slot holds
+  /// (a Schedule's step, a stored callback); a stand-in enters as itself; anything else, a
+  /// summary included, goes through the admission filter.
+  fn slot_in(&mut self, obj: ObjId, dst: VarId, stand_in: ObjId) {
+    match self.objs[obj].kind {
+      ObjKind::Effect { success, .. } => {
+        self.constrain(success, Constraint::SlotIn(dst, stand_in));
+      }
+      ObjKind::Promise { value } => self.constrain(value, Constraint::SlotIn(dst, stand_in)),
       // A function a type-modelled value holds may be called by its code (a Schedule's step, a
       // stored callback): it runs with what the value holds.
       ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
@@ -2763,31 +3555,53 @@ impl Analysis {
           self.typed_callback(obj, dst, back, protocol_site(6));
         }
       }
-      _ => self.seed(dst, obj),
+      _ => self.admit(obj, dst, stand_in),
     }
   }
 
-  /// What one argument of a type-modelled call contributes to its slot (`typed_call`).
+  /// What one argument of a type-modelled call contributes to its slot (`typed_call`). A record
+  /// or array that may hold no service is stood for by the site's stand-in, and its handlers are
+  /// not looked up until it may: it has none, and the containers it may hold are pooled by module.
   fn typed_arg(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site) {
+    let stand_in = self.site_stand_in(site);
+    if matches!(self.objs[obj].kind, ObjKind::Object | ObjKind::Array)
+      && !self.typed_args_seen.contains(&(obj, slot))
+      && !self.stand_ins.get(&stand_in).is_some_and(|s| s.tainted)
+      && !self.may_hold(obj)
+    {
+      // Held back from the slot; effect code still calls the handlers it holds.
+      self.admit(obj, slot, stand_in);
+      if self.reaches_code(obj) {
+        if self.typed_args_seen.insert((obj, slot)) {
+          self.typed_nested_callbacks(obj, slot, back, site);
+        }
+      } else {
+        self.deferred.push(Deferred::TypedArg(obj, slot, back, site));
+      }
+      return;
+    }
     // Once per (object, slot): a callback's result feeds the same slot back.
     if !self.typed_args_seen.insert((obj, slot)) {
       return;
     }
     match self.objs[obj].kind.clone() {
-      // A type-modelled value handed over: what it holds flows on, and what the call is handed
-      // may be stored in it (`Ref.set`, `Queue.offer`, …).
+      // A type-modelled value handed over: what it holds flows on. What a call stores into a
+      // container goes to its module's pool (`typed_call`).
+      ObjKind::Typed { .. } if self.is_stand_in(obj) => self.seed(slot, obj),
       ObjKind::Typed { slot: other, .. } => {
         self.copy(other, slot);
-        self.copy(back, other);
+        self.pool_route(obj, back);
       }
-      ObjKind::Effect { success, .. } => self.constrain(success, Constraint::SlotIn(slot)),
-      ObjKind::Promise { value } => self.constrain(value, Constraint::SlotIn(slot)),
+      ObjKind::Effect { success, .. } => {
+        self.constrain(success, Constraint::SlotIn(slot, stand_in));
+      }
+      ObjKind::Promise { value } => self.constrain(value, Constraint::SlotIn(slot, stand_in)),
       ObjKind::Wrap(inner) => {
         self.seed(slot, obj);
-        self.constrain(inner, Constraint::SlotIn(slot));
+        self.constrain(inner, Constraint::SlotIn(slot, stand_in));
       }
       ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
-        self.seed(slot, obj);
+        self.admit(obj, slot, stand_in);
         self.typed_callback(obj, slot, back, site);
       }
       ObjKind::Key { strings, .. } => {
@@ -2803,14 +3617,90 @@ impl Analysis {
       ObjKind::Array => {
         self.seed(slot, obj);
         let elem = self.elem(obj);
-        self.copy(elem, slot);
+        self.constrain(elem, Constraint::Admit(slot, stand_in));
         self.typed_nested_callbacks(obj, slot, back, site);
       }
       ObjKind::Object => {
         self.seed(slot, obj);
         self.typed_nested_callbacks(obj, slot, back, site);
       }
+      ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim => self.admit(obj, slot, stand_in),
       _ => self.seed(slot, obj),
+    }
+  }
+
+  /// An argument at a concrete position of a type-modelled call (direction 2: a value at a
+  /// concretely typed position can't flow into a type parameter's slot). What the code may still
+  /// do with it under its declared type: call the callbacks it is or holds (with unknown,
+  /// service-free arguments, as builtin callbacks are run), provide or read a key handed over,
+  /// and read the members the type declares (a service passed as `FileSystem` has those read).
+  /// An `unknown`/`any` position does none of this. A record that can reach no callable waits
+  /// until it may: it has no callbacks, and a read of its members demands nothing of a service.
+  fn typed_concrete(&mut self, obj: ObjId, ty: u32, site: Site) {
+    let t = if ty == u32::MAX { None } else { Some(self.tys[ty as usize].clone()) };
+    if t.as_ref().is_some_and(|t| t.ignored && t.prim_only()) {
+      return;
+    }
+    if matches!(self.objs[obj].kind, ObjKind::Object | ObjKind::Array)
+      && !self.concrete_seen.contains(&(obj, ty, site))
+      && !self.reaches_code(obj)
+    {
+      self.deferred.push(Deferred::Concrete(obj, ty, site));
+      return;
+    }
+    if !self.concrete_seen.insert((obj, ty, site)) {
+      return;
+    }
+    let args = match self.concrete_args {
+      Some(v) => v,
+      None => {
+        let v = self.var();
+        self.seed(v, self.top_host);
+        self.concrete_args = Some(v);
+        v
+      }
+    };
+    let call_with_unknowns = |a: &mut Self, callee: VarId| {
+      let ret = a.var();
+      let call =
+        Call { site, this: None, args: vec![Arg::Var(args); 4], ret, is_new: false, builtin: None };
+      a.constrain(callee, Constraint::Call(Box::new(call)));
+    };
+    match self.objs[obj].kind.clone() {
+      ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
+        let holder = self.holder(obj);
+        call_with_unknowns(self, holder);
+      }
+      ObjKind::Key { strings, .. } => self.constrain(strings, Constraint::BailKeys),
+      ObjKind::Class { .. } => {
+        let strings = self.var();
+        self.key_use(obj, &KeyUse::Strings(strings));
+        self.constrain(strings, Constraint::BailKeys);
+      }
+      ObjKind::Object | ObjKind::Array => {
+        let holder = self.holder(obj);
+        let members: Vec<ArcStr> = t
+          .as_ref()
+          .map(|t| t.members.iter().flatten().map(|m| ArcStr::from(m.as_str())).collect())
+          .unwrap_or_default();
+        let fields = self.var();
+        if members.is_empty() {
+          // No declared members to go by: every member may be read.
+          self.constrain(holder, Constraint::Load { key: Key::Unknown, dst: fields });
+        } else {
+          for m in members {
+            self.constrain(holder, Constraint::Load { key: Key::Name(m), dst: fields });
+          }
+        }
+        if matches!(self.objs[obj].kind, ObjKind::Array) {
+          let elem = self.elem(obj);
+          self.constrain(elem, Constraint::TypedConcrete(u32::MAX, site));
+        }
+        let callables = self.var();
+        self.constrain(fields, Constraint::Callables(callables));
+        call_with_unknowns(self, callables);
+      }
+      _ => {}
     }
   }
 
@@ -2833,13 +3723,41 @@ impl Analysis {
     let holder = self.holder(obj);
     let fields = self.var();
     self.constrain(holder, Constraint::Load { key: Key::Unknown, dst: fields });
-    let callables = self.var();
-    self.constrain(fields, Constraint::Callables(callables));
-    let ret = self.var();
-    let call =
-      Call { site, this: None, args: vec![Arg::Var(slot); 4], ret, is_new: false, builtin: None };
-    self.constrain(callables, Constraint::Call(Box::new(call)));
-    self.constrain(ret, Constraint::TypedArg(slot, back, site));
+    self.constrain(fields, Constraint::TypedNested(slot, back, site));
+  }
+
+  fn function_kind(kind: &ObjKind) -> bool {
+    matches!(kind, ObjKind::Closure(_) | ObjKind::Class { .. } | ObjKind::Builtin { .. })
+  }
+
+  /// One member of an options object handed to type-modelled code (`Constraint::TypedNested`).
+  fn typed_nested(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site) {
+    if Self::function_kind(&self.objs[obj].kind) {
+      if self.typed_slot_fns.insert((obj, slot)) {
+        self.typed_callback(obj, slot, back, site);
+      }
+    } else if matches!(self.objs[obj].kind, ObjKind::Typed { .. }) && !self.is_stand_in(obj) {
+      self.pool_route(obj, back);
+    }
+  }
+
+  /// A data-last function a type-modelled call is handed (`Queue.offer(q)` as a callback): if
+  /// its export may store into a container, what the call is handed goes to that module's pool.
+  fn pool_route(&mut self, obj: ObjId, back: VarId) {
+    let Some(m) = self.typed_module(obj) else { return };
+    // Only a value whose export is known can be told to be a function that stores; the rest
+    // (a schema, a request) are data, which effect code at a type parameter's position can't
+    // call.
+    let stores = self
+      .typed_result_origin
+      .get(&obj)
+      .copied()
+      .and_then(|(e, n)| self.typed_sig(e, n))
+      .is_some_and(|s| s.stores);
+    if stores {
+      let pool = self.typed_pool(m);
+      self.copy(back, pool);
+    }
   }
 
   /// A value that may be called: a function, class or builtin, or a value that may stand for one.
@@ -3244,6 +4162,8 @@ impl Analysis {
       ObjKind::Promise { value } => self.copy(value, dst),
       ObjKind::Wrap(_) => self.seed(dst, obj),
       // Run as an effect, a type-modelled value yields what it holds.
+      // A stand-in's elements are values it stands for.
+      ObjKind::Typed { .. } if self.is_stand_in(obj) => self.seed(dst, obj),
       ObjKind::Typed { slot, .. } => self.copy(slot, dst),
       ObjKind::Top(Flavour::Ext) | ObjKind::External { flavour: Flavour::Ext, .. } => {
         // An effect built by code the pass can't see runs in this runtime. It reaches services
@@ -3463,6 +4383,8 @@ impl Analysis {
       }
       ObjKind::Str(_) => self.seed(dst, self.top_host),
       ObjKind::Wrap(_) => self.seed(dst, obj),
+      // A stand-in's elements are values it stands for.
+      ObjKind::Typed { .. } if self.is_stand_in(obj) => self.seed(dst, obj),
       ObjKind::Typed { slot, .. } => self.copy(slot, dst),
       ObjKind::Top(_) | ObjKind::External { .. } => {
         let t = self.top_of(obj);
@@ -3491,6 +4413,8 @@ impl Analysis {
         self.load_unknown(obj, dst);
       }
       ObjKind::Wrap(_) => self.seed(dst, obj),
+      // A stand-in's elements are values it stands for.
+      ObjKind::Typed { .. } if self.is_stand_in(obj) => self.seed(dst, obj),
       ObjKind::Typed { slot, .. } => self.copy(slot, dst),
       ObjKind::Top(_) | ObjKind::External { .. } => {
         let t = self.top_of(obj);
@@ -3511,6 +4435,16 @@ impl Analysis {
   /// object as `this`, exactly as `obj.toString()` in bundled code would be: they count as
   /// reads and their bodies run. Their results are walked too.
   fn walk(&mut self, obj: ObjId, walk: Walk, pool: VarId, arg: VarId, site: Site) {
+    // Direction 2's admission lever: a value that reaches no callable has no protocol method to
+    // call and holds no service, so walking it reads nothing. Its walk waits until it may.
+    if self.admission
+      && matches!(self.objs[obj].kind, ObjKind::Object | ObjKind::Array)
+      && !self.walked.contains(&(pool, obj))
+      && !self.reaches_code(obj)
+    {
+      self.deferred.push(Deferred::Walk(obj, walk, pool, arg, site));
+      return;
+    }
     if !self.walked.insert((pool, obj)) {
       return;
     }
@@ -3788,6 +4722,8 @@ impl Analysis {
         }
       }
       ObjKind::Closure(f) => self.escape_fn(f, flavour, site),
+      // A stand-in's values escape themselves (`apply` hands the escape to `held_var`).
+      ObjKind::Typed { .. } if self.is_stand_in(obj) => {}
       ObjKind::Promise { value } | ObjKind::Wrap(value) | ObjKind::Typed { slot: value, .. } => {
         self.constrain(value, Constraint::Escape(flavour, site));
       }

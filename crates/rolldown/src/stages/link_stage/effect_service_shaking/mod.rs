@@ -50,6 +50,7 @@ impl LinkStage<'_> {
     }
     let start = std::time::Instant::now();
     let debug = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_DEBUG").is_some();
+    let report_enabled = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some();
     macro_rules! phase {
       ($($t:tt)*) => {
         if debug {
@@ -223,16 +224,93 @@ impl LinkStage<'_> {
     // Opt-in while the engine is incomplete: `ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL=1`.
     let mut typed_modules: FxHashSet<ModuleIdx> = FxHashSet::default();
     let type_model = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL").is_some();
-    for module in order.iter().map(|idx| &self.module_table.modules[*idx]).filter(|_| type_model) {
-      let Module::Normal(normal) = module else { continue };
-      let is_effect = normal
+    let is_effect_module = |idx: ModuleIdx| match &self.module_table.modules[idx] {
+      Module::Normal(normal) => normal
         .originative_resolved_id
         .package_json
         .as_ref()
-        .is_some_and(|pkg| pkg.name() == Some("effect"));
-      if is_effect && !modelled.contains(&normal.idx) {
-        typed_modules.insert(normal.idx);
-        modelled.insert(normal.idx);
+        .is_some_and(|pkg| pkg.name() == Some("effect")),
+      Module::External(_) => false,
+    };
+    // Service constructors (Tim's decision on NodeFileSystem, option (b)): exports whose `.d.ts`
+    // takes an implementation and returns the shape of a key declared in `effect`, or an Effect
+    // or Layer of it, found by type (`Dts::constructed_shapes`). Their modules are analysed as
+    // ordinary code, so the default methods they build count as reads, together with the
+    // internal modules they import (helpers with no public types to summarise, such as
+    // `internal/glob.js` behind `FileSystem.make`). Everything else they reach is type-modelled.
+    a.admission = type_model;
+    let mut constructors: Vec<(String, ArcStr, String)> = vec![];
+    let mut constructor_keys: Vec<(ArcStr, ModuleIdx)> = vec![];
+    let mut analysed: FxHashSet<ModuleIdx> = FxHashSet::default();
+    if type_model {
+      for module in order.iter().copied().filter(|m| is_effect_module(*m) && !modelled.contains(m))
+      {
+        let Some(js) = self.module_table[module].id().as_str().strip_suffix(".js") else {
+          continue;
+        };
+        let dts = std::path::PathBuf::from(format!("{js}.d.ts"));
+        if !dts.exists() {
+          continue;
+        }
+        for (name, _) in self.sorted_exports(module) {
+          for (iface, local) in a.dts.constructed_shapes(&dts, name.as_str()) {
+            let Some(target) = iface
+              .to_str()
+              .and_then(|p| p.strip_suffix(".d.ts"))
+              .map(|p| format!("{p}.js"))
+              .and_then(|p| {
+                order.iter().copied().find(|m| self.module_table[*m].id().as_str() == p)
+              })
+            else {
+              continue;
+            };
+            let Some(export) = self.metas[target].resolved_exports.get(local.as_str()) else {
+              continue;
+            };
+            let key = self
+              .alias_chain(export.symbol_ref)
+              .into_iter()
+              .find_map(|sym| self.key_declaration_of(sym).map(|k| (k, sym.owner)));
+            let Some(((Some(key_name), _), owner)) = key else { continue };
+            if !is_effect_module(owner) {
+              continue;
+            }
+            let file = self.module_table[module].id().as_str();
+            let file = file.rsplit_once("/dist/").map_or(file, |(_, f)| f).to_string();
+            // Diagnostic only: leave matching constructor modules type-modelled.
+            if std::env::var("ROLLDOWN_ESS_SKIP_CTOR")
+              .is_ok_and(|v| !v.is_empty() && file.contains(v.as_str()))
+            {
+              continue;
+            }
+            constructors.push((file, name.clone(), key_name.clone()));
+            if !constructor_keys.iter().any(|(k, _)| k.as_str() == key_name) {
+              constructor_keys.push((ArcStr::from(key_name.as_str()), owner));
+            }
+            analysed.insert(module);
+            analysed.insert(owner);
+          }
+        }
+      }
+      let helpers: Vec<ModuleIdx> = analysed
+        .iter()
+        .filter_map(|m| match &self.module_table.modules[*m] {
+          Module::Normal(n) => Some(n),
+          Module::External(_) => None,
+        })
+        .flat_map(|n| n.ecma_view.import_records.iter().filter_map(|r| r.resolved_module))
+        .filter(|t| {
+          is_effect_module(*t)
+            && !modelled.contains(t)
+            && self.module_table[*t].id().as_str().contains("/internal/")
+        })
+        .collect();
+      analysed.extend(helpers);
+    }
+    for module in order.iter().copied().filter(|_| type_model) {
+      if is_effect_module(module) && !modelled.contains(&module) && !analysed.contains(&module) {
+        typed_modules.insert(module);
+        modelled.insert(module);
       }
     }
     // Model-bound declarations that alias ordinary code, linked once every rule is bound.
@@ -279,7 +357,7 @@ impl LinkStage<'_> {
                     .strip_suffix(".js")
                     .map(|js| std::path::PathBuf::from(format!("{js}.d.ts")))
                     .filter(|p| p.exists());
-                  let obj = a.typed_export(dts, name.clone());
+                  let obj = a.typed_export(dts, name.clone(), module);
                   for (i, sym) in chain.into_iter().enumerate() {
                     let claim = match bind_rank.get(&sym) {
                       None => true,
@@ -591,6 +669,93 @@ impl LinkStage<'_> {
       }
     }
 
+    // A key declared in `effect` whose services a constructor builds prunes (option (b)) only
+    // while no type-modelled code the program calls may read its service: that code reads the
+    // services it reaches through the Context invisibly, so the key keeps every method if any
+    // called type-modelled module imports, directly or through other `effect` modules, the
+    // module declaring the key.
+    let mut forced_keys: Vec<String> = vec![];
+    if !constructor_keys.is_empty() {
+      let mut reach: FxHashSet<ModuleIdx> = FxHashSet::default();
+      let mut stack: Vec<ModuleIdx> = a.typed_called_modules.iter().copied().collect();
+      while let Some(m) = stack.pop() {
+        if !reach.insert(m) {
+          continue;
+        }
+        if let Module::Normal(n) = &self.module_table.modules[m] {
+          stack.extend(
+            n.ecma_view
+              .import_records
+              .iter()
+              .filter_map(|r| r.resolved_module)
+              .filter(|t| is_effect_module(*t)),
+          );
+        }
+      }
+      for (key, owner) in &constructor_keys {
+        let consumers: Vec<ModuleIdx> = a
+          .typed_called_modules
+          .iter()
+          .copied()
+          .filter(|m| {
+            let mut seen: FxHashSet<ModuleIdx> = FxHashSet::default();
+            let mut st = vec![*m];
+            while let Some(x) = st.pop() {
+              if x == *owner {
+                return true;
+              }
+              if !seen.insert(x) {
+                continue;
+              }
+              if let Module::Normal(n) = &self.module_table.modules[x] {
+                st.extend(
+                  n.ecma_view
+                    .import_records
+                    .iter()
+                    .filter_map(|r| r.resolved_module)
+                    .filter(|t| is_effect_module(*t)),
+                );
+              }
+            }
+            false
+          })
+          .collect();
+        if reach.contains(owner) {
+          let mut names: Vec<String> = consumers
+            .iter()
+            .map(|m| {
+              let id = self.module_table[*m].id().as_str();
+              id.rsplit_once("/dist/").map_or(id, |(_, f)| f).to_string()
+            })
+            .collect();
+          names.sort();
+          forced_keys.push(format!("{key} (read by type-modelled {})", names.join(", ")));
+          a.never_prune.insert(key.clone());
+        }
+      }
+    }
+    if report_enabled || debug {
+      let (admitted, held, tainted) = a.admission_stats;
+      eprintln!(
+        "[effect-service-shaking] type model: {} type-modelled modules, {} called; admission: {admitted} admitted, {held} held back, {tainted} stand-ins tainted",
+        typed_modules.len(),
+        a.typed_called_modules.len()
+      );
+      if debug {
+        let names = |m: ModuleIdx| {
+          let id = self.module_table[m].id().as_str();
+          id.rsplit_once("/dist/").map_or(id, |(_, f)| f).to_string()
+        };
+        eprintln!("[effect-service-shaking] type census: {}", a.typed_census(&names));
+      }
+      for (file, name, key) in &constructors {
+        eprintln!("[effect-service-shaking] service constructor {file}#{name} -> {key}");
+      }
+      for k in &forced_keys {
+        eprintln!("[effect-service-shaking] constructor key kept whole: {k}");
+      }
+    }
+
     // == prune
     let names: Vec<String> = self.module_table.modules.iter().map(|m| m.id().to_string()).collect();
     let (edits, mut report) =
@@ -618,9 +783,10 @@ impl LinkStage<'_> {
     #[expect(clippy::print_stderr, reason = "opt-in report for measuring the experimental pass")]
     if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some() {
       eprintln!(
-        "[effect-service-shaking] {} vars, {} objects, {} steps, solve {} ms, total {} ms",
+        "[effect-service-shaking] {} vars, {} objects, {} entries, {} steps, solve {} ms, total {} ms",
         a.vars.len(),
         a.objs.len(),
+        a.total_pts + a.total_copies,
         a.steps,
         solved.as_millis(),
         start.elapsed().as_millis()

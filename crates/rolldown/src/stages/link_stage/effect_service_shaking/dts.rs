@@ -93,8 +93,13 @@ pub struct RetShape {
   pub effect: bool,
   pub effect_param: bool,
   pub effect_other: bool,
+  /// An `Effect` whose success is an object type that mentions no type parameter.
+  pub effect_concrete: bool,
   pub prim: bool,
   pub other: bool,
+  /// An object type that mentions no type parameter: what the call returns holds nothing the
+  /// caller handed it (direction 2: results at concrete types are service-free).
+  pub concrete: bool,
   pub unknown: bool,
 }
 
@@ -120,6 +125,8 @@ enum Local<'a> {
 
 /// One parsed `.d.ts`: its declarations by local name and its exports.
 struct Index<'a> {
+  /// The file's source text, for `Dts::mentions_tparam`.
+  source: &'a str,
   dir: PathBuf,
   /// The file's name (`Tracer.d.ts`).
   file: String,
@@ -264,13 +271,22 @@ impl Dts {
                 out.effect_param = true;
               }
               Some(st) if self.classify(f, st, tp, depth + 1).prim_only() => {}
+              Some(st)
+                if !self.mentions_tparam(f, st, tp)
+                  && !self.classify(f, st, tp, depth + 1).open =>
+              {
+                out.effect_concrete = true;
+              }
               _ => out.effect_other = true,
             }
             return;
           }
         }
-        if self.classify(f, t, tp, depth + 1).prim_only() {
+        let c = self.classify(f, t, tp, depth + 1);
+        if c.prim_only() {
           out.prim = true;
+        } else if !c.open && !c.func && !self.mentions_tparam(f, t, tp) {
+          out.concrete = true;
         } else {
           out.other = true;
         }
@@ -281,11 +297,364 @@ impl Dts {
           out.prim = true;
         } else if c.open {
           out.unknown = true;
+        } else if !c.func && !self.mentions_tparam(f, t, tp) {
+          out.concrete = true;
         } else {
           out.other = true;
         }
       }
     }
+  }
+
+  /// Whether the declared type `t` (in file `f`) mentions one of the type parameters `tp`, by
+  /// name anywhere in its text: function types and members included. A false positive only
+  /// makes a position generic.
+  fn mentions_tparam(&self, f: usize, t: &TSType<'_>, tp: &[String]) -> bool {
+    use oxc::span::GetSpan;
+    if tp.is_empty() {
+      return false;
+    }
+    let span = t.span();
+    let src = self.index(f).source;
+    let Some(text) = src.get(span.start as usize..span.end as usize) else { return true };
+    let bytes = text.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    tp.iter().any(|p| {
+      text.match_indices(p.as_str()).any(|(i, _)| {
+        let before = i == 0 || !word(bytes[i - 1]);
+        let end = i + p.len();
+        let after = end >= bytes.len() || !word(bytes[end]);
+        before && after
+      })
+    })
+  }
+
+  /// For a call to the function exported as `name` with `nparams` arguments: whether each
+  /// parameter (and the rest parameter) is generic, its declared type mentioning a type
+  /// parameter or being one the resolver can't follow. Values at the other, concrete, positions
+  /// join no slot (direction 2). Joined over the overloads that fit; `None` without a signature.
+  pub fn generic_positions(
+    &self,
+    path: &Path,
+    name: &str,
+    nparams: usize,
+  ) -> Option<(Vec<bool>, bool)> {
+    let start = std::time::Instant::now();
+    let sigs = self.signatures(path, name)?;
+    let out = self.generic_of_sigs(&sigs, nparams);
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    Some(out)
+  }
+
+  fn generic_of_sigs(&self, sigs: &[Sig<'_>], nparams: usize) -> (Vec<bool>, bool) {
+    let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
+    let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
+    let mut params = vec![false; nparams];
+    let mut rest = false;
+    for sig in matching {
+      let generic = |t: Option<&TSType<'_>>| match t {
+        None => true,
+        Some(t) => {
+          self.mentions_tparam(sig.file, t, &sig.tparams)
+            || self.classify(sig.file, t, &sig.tparams, 0).open
+        }
+      };
+      for (i, (t, is_rest)) in sig.params.iter().enumerate() {
+        let g = generic(*t);
+        if *is_rest {
+          rest |= g;
+          for p in params.iter_mut().skip(i) {
+            *p |= g;
+          }
+        } else if let Some(p) = params.get_mut(i) {
+          *p |= g;
+        }
+      }
+      // Arguments beyond the declared parameters: open.
+      for p in params.iter_mut().skip(sig.params.len()) {
+        if !sig.params.last().is_some_and(|(_, r)| *r) {
+          *p = true;
+        }
+      }
+    }
+    (params, rest)
+  }
+
+  /// The call signatures of the function a call to the export `name` with `nparams` arguments
+  /// returns (a data-last form's `(self: X) => Y`), with the outer type parameters in scope.
+  /// `None` when a matching signature's return has no call signature to read.
+  fn returned_sigs(&self, path: &Path, name: &str, nparams: usize) -> Option<Vec<Sig<'_>>> {
+    let sigs = self.signatures(path, name)?;
+    let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
+    let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
+    let mut inner = vec![];
+    for sig in matching {
+      let ret = sig.ret?;
+      let before = inner.len();
+      self.sigs_of_type(sig.file, ret, &mut inner, 0);
+      if inner.len() == before {
+        return None;
+      }
+      for s in &mut inner[before..] {
+        s.tparams.extend(sig.tparams.iter().cloned());
+      }
+    }
+    Some(inner)
+  }
+
+  /// For a call with `nargs` arguments of the function the export `name` returns when called
+  /// with `nparams`: its parameter bounds, return shape and generic positions. `None` when the
+  /// returned function's signature can't be read.
+  pub fn returned_call(
+    &self,
+    path: &Path,
+    name: &str,
+    nparams: usize,
+    nargs: usize,
+  ) -> Option<(Bounds, RetShape, (Vec<bool>, bool))> {
+    let start = std::time::Instant::now();
+    let inner = self.returned_sigs(path, name, nparams);
+    let out = inner.map(|inner| {
+      let mut bounds = self.bounds_of_sigs(&inner, nargs);
+      internal_open(path, &mut bounds);
+      let mut shape = RetShape::default();
+      let same: Vec<&Sig<'_>> = inner.iter().filter(|s| s.params.len() == nargs).collect();
+      let matching: Vec<&Sig<'_>> = if same.is_empty() { inner.iter().collect() } else { same };
+      for sig in matching {
+        match sig.ret {
+          Some(t) => self.ret_shape_of(sig.file, t, &sig.tparams, &mut shape, 0),
+          None => shape.unknown = true,
+        }
+      }
+      (bounds, shape, self.generic_of_sigs(&inner, nargs))
+    });
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    out
+  }
+
+  /// The member names the interfaces and classes of the `.d.ts` at `path` declare only as
+  /// methods (or function-typed properties), never as data properties. A read of one off a
+  /// value of the module is a method, not a value of a type parameter (assumption 2).
+  pub fn method_only_names(&self, path: &Path) -> rustc_hash::FxHashSet<String> {
+    let start = std::time::Instant::now();
+    let mut methods = rustc_hash::FxHashSet::default();
+    let mut props = rustc_hash::FxHashSet::default();
+    if let Some(f) = self.file(path) {
+      let idx = self.index(f);
+      let key =
+        |k: &oxc::ast::ast::PropertyKey<'_>| k.static_name().map(|n| n.display().to_string());
+      for l in idx.locals.values() {
+        match l {
+          Local::Iface(is) => {
+            for i in is {
+              for m in &i.body.body {
+                match m {
+                  TSSignature::TSMethodSignature(ms) => {
+                    if let Some(n) = key(&ms.key) {
+                      methods.insert(n);
+                    }
+                  }
+                  TSSignature::TSPropertySignature(ps) => {
+                    if let Some(n) = key(&ps.key) {
+                      let func = matches!(
+                        ps.type_annotation.as_ref().map(|a| strip_parens(&a.type_annotation)),
+                        Some(TSType::TSFunctionType(_))
+                      );
+                      if func {
+                        methods.insert(n)
+                      } else {
+                        props.insert(n)
+                      };
+                    }
+                  }
+                  _ => {}
+                }
+              }
+            }
+          }
+          Local::Class(c) => {
+            for e in &c.body.body {
+              match e {
+                ClassElement::MethodDefinition(m) => {
+                  if let Some(n) = key(&m.key) {
+                    methods.insert(n);
+                  }
+                }
+                ClassElement::PropertyDefinition(p) => {
+                  if let Some(n) = key(&p.key) {
+                    props.insert(n);
+                  }
+                }
+                ClassElement::AccessorProperty(p) => {
+                  if let Some(n) = key(&p.key) {
+                    props.insert(n);
+                  }
+                }
+                _ => {}
+              }
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    for p in &props {
+      methods.remove(p);
+    }
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    methods
+  }
+
+  /// Whether a method of a value the `.d.ts` at `path` declares may store its argument in that
+  /// value: some interface or class there has a method (or function-typed property) with a
+  /// parameter whose type is one of the interface's own type parameters, or an array or
+  /// iterable of one (`publish(value: A)` on `PubSub.Atomic<A>`). Effect's data types are
+  /// otherwise immutable, their containers written through functions (`Ref.set`). True when
+  /// the file can't be read.
+  pub fn methods_store(&self, path: &Path) -> bool {
+    let start = std::time::Instant::now();
+    let out = self.file(path).is_none_or(|f| {
+      let idx = self.index(f);
+      idx.locals.values().any(|l| match l {
+        Local::Iface(is) => is.iter().any(|i| {
+          let tp: Vec<String> = i
+            .type_parameters
+            .as_deref()
+            .map(|d| d.params.iter().map(|p| p.name.name.as_str().to_string()).collect())
+            .unwrap_or_default();
+          !tp.is_empty() && i.body.body.iter().any(|m| member_stores(m, &tp))
+        }),
+        Local::Class(c) => {
+          let tp: Vec<String> = c
+            .type_parameters
+            .as_deref()
+            .map(|d| d.params.iter().map(|p| p.name.name.as_str().to_string()).collect())
+            .unwrap_or_default();
+          !tp.is_empty()
+            && c.body.body.iter().any(|e| match e {
+              ClassElement::MethodDefinition(m) => params_store(&m.value.params, &tp),
+              _ => false,
+            })
+        }
+        _ => false,
+      })
+    });
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    out
+  }
+
+  /// `(stores, reads)` for a call to the function exported as `name` with `nparams` arguments,
+  /// or to the function it returns. `stores`: the call may store one argument in a value
+  /// another argument holds (a container's setter): some type parameter is the type of one
+  /// position (`value: A`, `ReadonlyArray<A>`, `Iterable<A>`) and an argument of a type
+  /// reference at another (`self: Ref<A>`). A data-last form counts the parameters of the
+  /// function it returns as positions too (`set(value: A): (self: Ref<A>) => …`). Callback
+  /// parameters (`f: (a: A) => B`) are read positions, not stores. `reads`: some type parameter is
+  /// an argument of a type reference at a position (`self: Ref<A>`) and appears in what the call
+  /// finally returns (`Effect<A>`), so the call may hand back what a container holds. Both are
+  /// true without a signature.
+  pub fn container_shape(&self, path: &Path, name: &str, nparams: usize) -> (bool, bool) {
+    let start = std::time::Instant::now();
+    let class = self
+      .export(path, name, 0)
+      .is_some_and(|(f, local)| matches!(self.index(f).locals.get(&local), Some(Local::Class(_))));
+    let out = match self.signatures(path, name) {
+      // A class's instances hold what they are constructed with themselves.
+      None if class => (false, false),
+      None => (true, true),
+      Some(sigs) => {
+        let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
+        let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
+        let mut out = (false, false);
+        for sig in matching {
+          let mut positions: Vec<&TSType<'_>> = sig.params.iter().filter_map(|(t, _)| *t).collect();
+          let mut tparams = sig.tparams.clone();
+          let mut ret = sig.ret;
+          if let Some(TSType::TSFunctionType(ft)) = sig.ret.map(strip_parens) {
+            positions.extend(
+              ft.params
+                .items
+                .iter()
+                .filter_map(|p| p.type_annotation.as_ref())
+                .map(|a| &a.type_annotation),
+            );
+            if let Some(tps) = ft.type_parameters.as_deref() {
+              tparams.extend(tps.params.iter().map(|p| p.name.name.as_str().to_string()));
+            }
+            ret = Some(&ft.return_type.type_annotation);
+          }
+          let uses: Vec<(Vec<String>, Vec<String>)> = positions
+            .iter()
+            .map(|t| {
+              let (mut bare, mut nested) = (vec![], vec![]);
+              tparams_in(t, &tparams, true, &mut bare, &mut nested, 0);
+              (bare, nested)
+            })
+            .collect();
+          out.0 |= uses.iter().enumerate().any(|(i, (bare, _))| {
+            bare.iter().any(|p| uses.iter().enumerate().any(|(j, (_, n))| j != i && n.contains(p)))
+          });
+          let returned: Vec<String> = match ret {
+            Some(r) => {
+              let (mut bare, mut nested) = (vec![], vec![]);
+              tparams_in(r, &tparams, true, &mut bare, &mut nested, 0);
+              bare.into_iter().chain(nested).collect()
+            }
+            None => tparams.clone(),
+          };
+          out.1 |= uses.iter().any(|(_, n)| n.iter().any(|p| returned.contains(p)));
+        }
+        out
+      }
+    };
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    out
+  }
+
+  /// A service constructor (Tim's decision on NodeFileSystem, option (b)): a function exported
+  /// as `name` that takes an implementation and returns a named type, or an `Effect` or `Layer`
+  /// of one. An implementation is a parameter typed as a function (`HttpClient.make(f)`) or by
+  /// a type that names the returned one (`FileSystem.make(impl: Omit<FileSystem, …>)`,
+  /// `makeNoop(fs: Partial<FileSystem>)`); a parameter of data (`fromWeb(request: Request)`,
+  /// `layerCurrentZone(zone: TimeZone)`) is not one. Returns the returned type's declaring
+  /// `.d.ts` and local name for each such signature; the caller checks that the name is a
+  /// service key's.
+  pub fn constructed_shapes(&self, path: &Path, name: &str) -> Vec<(PathBuf, String)> {
+    let start = std::time::Instant::now();
+    let mut out = vec![];
+    for sig in self.signatures(path, name).unwrap_or_default() {
+      let Some(mut ret) = sig.ret else { continue };
+      let mut file = sig.file;
+      for _ in 0..2 {
+        let TSType::TSTypeReference(r) = ret else { break };
+        let Some((rf, local)) = self.name_in(file, &r.type_name, 0) else { break };
+        let idx = self.index(rf);
+        let wrapper = (idx.file == "Effect.d.ts" && local == "Effect")
+          || (idx.file == "Layer.d.ts" && local == "Layer");
+        if !wrapper {
+          let takes_impl = sig.params.iter().any(|(t, _)| {
+            t.is_some_and(|t| {
+              matches!(strip_parens(t), TSType::TSFunctionType(_)) || mentions(t, &local, 0)
+            })
+          });
+          if takes_impl && !sig.tparams.contains(&local) {
+            out.push((idx.dir.join(&idx.file), local));
+          }
+          break;
+        }
+        match r.type_arguments.as_ref().and_then(|a| a.params.first()) {
+          Some(t) => {
+            ret = t;
+            file = sig.file;
+          }
+          None => break,
+        }
+      }
+    }
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    out.sort();
+    out.dedup();
+    out
   }
 
   /// The parameter bounds shared by the callbacks the function exported as `name` takes: for
@@ -869,6 +1238,132 @@ impl Dts {
   }
 }
 
+/// Whether a parameter list takes a value of one of `tp` (bare, or as array elements).
+fn params_store(params: &FormalParameters<'_>, tp: &[String]) -> bool {
+  params.items.iter().filter_map(|p| p.type_annotation.as_ref()).any(|a| {
+    let (mut bare, mut nested) = (vec![], vec![]);
+    tparams_in(&a.type_annotation, tp, true, &mut bare, &mut nested, 0);
+    !bare.is_empty()
+  })
+}
+
+/// Whether an interface member is a method that takes a value of one of `tp`.
+fn member_stores(m: &TSSignature<'_>, tp: &[String]) -> bool {
+  match m {
+    TSSignature::TSMethodSignature(ms) => params_store(&ms.params, tp),
+    TSSignature::TSPropertySignature(ps) => {
+      match ps.type_annotation.as_ref().map(|a| &a.type_annotation) {
+        Some(TSType::TSFunctionType(ft)) => params_store(&ft.params, tp),
+        _ => false,
+      }
+    }
+    _ => false,
+  }
+}
+
+fn strip_parens<'a>(t: &'a TSType<'a>) -> &'a TSType<'a> {
+  match t {
+    TSType::TSParenthesizedType(p) => strip_parens(&p.type_annotation),
+    _ => t,
+  }
+}
+
+/// Whether `t` refers to a type named `name` outside function types (`Omit<FileSystem, …>`).
+fn mentions(t: &TSType<'_>, name: &str, depth: u32) -> bool {
+  if depth > 8 {
+    return false;
+  }
+  let d = depth + 1;
+  match t {
+    TSType::TSTypeReference(r) => {
+      let named = match &r.type_name {
+        TSTypeName::IdentifierReference(id) => id.name.as_str() == name,
+        TSTypeName::QualifiedName(q) => q.right.name.as_str() == name,
+        TSTypeName::ThisExpression(_) => false,
+      };
+      named
+        || r.type_arguments.as_ref().is_some_and(|a| a.params.iter().any(|p| mentions(p, name, d)))
+    }
+    TSType::TSArrayType(a) => mentions(&a.element_type, name, d),
+    TSType::TSTypeOperatorType(o) => mentions(&o.type_annotation, name, d),
+    TSType::TSParenthesizedType(p) => mentions(&p.type_annotation, name, d),
+    TSType::TSUnionType(u) => u.types.iter().any(|m| mentions(m, name, d)),
+    TSType::TSIntersectionType(u) => u.types.iter().any(|m| mentions(m, name, d)),
+    _ => false,
+  }
+}
+
+/// The type parameters `t` mentions: `bare` where a value of the parameter itself (or an element
+/// of an array or iterable of it) sits at the position, `nested` where it is an argument of
+/// another type reference or a property type. Function types are skipped: their parameters are
+/// read, not stored.
+fn tparams_in(
+  t: &TSType<'_>,
+  tp: &[String],
+  bare_ctx: bool,
+  bare: &mut Vec<String>,
+  nested: &mut Vec<String>,
+  depth: u32,
+) {
+  if depth > 8 {
+    return;
+  }
+  let d = depth + 1;
+  match t {
+    TSType::TSTypeReference(r) => {
+      if let TSTypeName::IdentifierReference(id) = &r.type_name {
+        let n = id.name.as_str();
+        if tp.iter().any(|p| p == n) {
+          let list = if bare_ctx { &mut *bare } else { &mut *nested };
+          if !list.iter().any(|p| p == n) {
+            list.push(n.to_string());
+          }
+          return;
+        }
+      }
+      let elems = matches!(&r.type_name, TSTypeName::IdentifierReference(id) if matches!(
+        id.name.as_str(),
+        "Array" | "ReadonlyArray" | "Iterable" | "NonEmptyArray" | "NonEmptyReadonlyArray"
+      ));
+      if let Some(args) = &r.type_arguments {
+        for a in &args.params {
+          tparams_in(a, tp, bare_ctx && elems, bare, nested, d);
+        }
+      }
+    }
+    TSType::TSArrayType(a) => tparams_in(&a.element_type, tp, bare_ctx, bare, nested, d),
+    TSType::TSTypeOperatorType(o) => tparams_in(&o.type_annotation, tp, bare_ctx, bare, nested, d),
+    TSType::TSParenthesizedType(p) => tparams_in(&p.type_annotation, tp, bare_ctx, bare, nested, d),
+    TSType::TSUnionType(u) => {
+      for m in &u.types {
+        tparams_in(m, tp, bare_ctx, bare, nested, d);
+      }
+    }
+    TSType::TSIntersectionType(u) => {
+      for m in &u.types {
+        tparams_in(m, tp, bare_ctx, bare, nested, d);
+      }
+    }
+    TSType::TSTupleType(tt) => {
+      for e in &tt.element_types {
+        if let Some(t) = e.as_ts_type() {
+          tparams_in(t, tp, bare_ctx, bare, nested, d);
+        }
+      }
+    }
+    TSType::TSTypeLiteral(lit) => {
+      for m in &lit.members {
+        if let TSSignature::TSPropertySignature(p) = m {
+          if let Some(a) = &p.type_annotation {
+            tparams_in(&a.type_annotation, tp, false, bare, nested, d);
+          }
+        }
+      }
+    }
+    _ => {}
+  }
+}
+
 fn sig_of<'a>(
   params: &'a FormalParameters<'a>,
   ret: Option<&'a TSType<'a>>,
@@ -891,6 +1386,7 @@ fn sig_of<'a>(
 
 fn index<'a>(program: &'a Program<'a>, dir: PathBuf, file: Option<String>) -> Index<'a> {
   let mut f = Index {
+    source: program.source_text,
     dir,
     file: file.unwrap_or_default(),
     locals: FxHashMap::default(),
