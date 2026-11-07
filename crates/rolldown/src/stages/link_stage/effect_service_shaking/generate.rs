@@ -160,8 +160,6 @@ pub struct Gen<'a, 'l, 's> {
   this_stack: Vec<VarId>,
   /// Enclosing class heritage variables, for `super`.
   class_stack: Vec<Option<VarId>>,
-  /// Classes whose bodies enclose the code being generated (`Analysis::class_bail`).
-  class_objs: Vec<ObjId>,
   /// The lazy top-level statement being generated, if any.
   lazy_owner: Option<FnId>,
   generator_stack: Vec<bool>,
@@ -192,7 +190,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       cur: module_fn,
       this_stack: vec![this],
       class_stack: vec![],
-      class_objs: vec![],
       lazy_owner: None,
       generator_stack: vec![false],
       module_fn,
@@ -250,9 +247,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let v = self.a.var();
     if self.cur != self.module_fn {
       self.a.fns[self.cur].locals.push(v);
-    }
-    if let Some(c) = self.class_objs.last() {
-      self.a.class_vars.push((*c, v));
     }
     v
   }
@@ -896,7 +890,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       (false, false) => kind_hint,
     };
     let id = Self::new_fn(self.a, self.m.module, f.span.start, kind);
-    self.a.fns[id].class = self.class_objs.last().copied();
     let (obj, v) = self.alloc(ObjKind::Closure(id), f.span.start);
     self.a.fns[id].closure = Some(obj);
     // The function's own name binding, for named function expressions.
@@ -937,7 +930,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   fn arrow(&mut self, f: &ArrowFunctionExpression<'_>) -> VarId {
     let kind = if f.r#async { FnKind::Async } else { FnKind::Arrow };
     let id = Self::new_fn(self.a, self.m.module, f.span.start, kind);
-    self.a.fns[id].class = self.class_objs.last().copied();
     let (obj, v) = self.alloc(ObjKind::Closure(id), f.span.start);
     self.a.fns[id].closure = Some(obj);
     // Arrows share `this` with the enclosing function.
@@ -1097,11 +1089,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let class_obj = self
       .a
       .alloc(ObjKind::Class { ctor: None, heritage, prototype }, Some(self.site(c.span.start)));
-    // Everything generated from here to the end of the body is class code.
-    if let Some(outer) = self.class_objs.last() {
-      self.a.class_parent.insert(class_obj, *outer);
-    }
-    self.class_objs.push(class_obj);
     let cv = self.fresh();
     self.seed(cv, class_obj);
     // `C.prototype.constructor` is `C`.
@@ -1194,7 +1181,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
     }
     self.class_stack.pop();
-    self.class_objs.pop();
     cv
   }
 

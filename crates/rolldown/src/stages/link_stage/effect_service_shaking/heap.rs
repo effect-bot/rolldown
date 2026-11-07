@@ -294,10 +294,6 @@ pub struct FnInfo {
   pub enclosing_this: Option<VarId>,
   /// Number of clones made of this function.
   pub clones: u32,
-  /// The innermost class whose body holds the function (its methods, accessors and
-  /// constructor, and functions nested in them or in its field initialisers): class code
-  /// unless every enclosing class is a key class (`Analysis::class_bail`).
-  pub class: Option<ObjId>,
 }
 
 impl FnInfo {
@@ -327,7 +323,6 @@ impl FnInfo {
       cloneable: false,
       enclosing_this: None,
       clones: 0,
-      class: None,
     }
   }
 }
@@ -878,15 +873,6 @@ pub struct Analysis {
   typed_results: FxHashMap<(Site, Option<ObjId>), (ObjId, VarId)>,
   /// (function, slot) pairs `slot_in` has run.
   typed_slot_fns: FxHashSet<(ObjId, VarId)>,
-  /// The class whose body lexically holds each nested class.
-  pub class_parent: FxHashMap<ObjId, ObjId>,
-  /// Variables generated in a class body outside its functions: field initialisers, static
-  /// blocks and computed keys, with their class.
-  pub class_vars: Vec<(ObjId, VarId)>,
-  /// `Reflect.get`/`Reflect.set` with a receiver: (target, receiver).
-  pub reflect_receivers: Vec<(VarId, VarId)>,
-  /// Arguments of `new` on a type-modelled value (a class `effect` exports).
-  typed_new_args: FxHashSet<VarId>,
   /// Per hole class (a class body the pass does not analyse): the one opaque value standing
   /// for everything its code makes, and back.
   pub opaque_of: FxHashMap<ObjId, ObjId>,
@@ -1153,10 +1139,6 @@ impl Analysis {
       typed_backs: FxHashMap::default(),
       typed_receivers: FxHashSet::default(),
       typed_slot_fns: FxHashSet::default(),
-      class_parent: FxHashMap::default(),
-      class_vars: vec![],
-      reflect_receivers: vec![],
-      typed_new_args: FxHashSet::default(),
       opaque_of: FxHashMap::default(),
       opaque_class: FxHashMap::default(),
       class_escaped: FxHashMap::default(),
@@ -2606,7 +2588,6 @@ impl Analysis {
     let own = [info.this, info.ret, info.yielded_fail, info.yielded, info.arguments_elem];
     let locals = info.locals.clone();
     let template = info.pending.clone();
-    let class = info.class;
     let (params, rest, kind, returns_closure_only, closure, module, span_start, enclosing_this) = (
       info.params.clone(),
       info.rest,
@@ -2652,7 +2633,6 @@ impl Analysis {
     clone.returns_closure_only = returns_closure_only;
     clone.closure = closure;
     clone.pending = pending;
-    clone.class = class;
     let id2 = self.fns.push(clone);
     debug_assert_eq!(id, id2);
     self.clone_memo.insert((f, key_site), id);
@@ -3139,7 +3119,6 @@ impl Analysis {
       // A class `effect` exports runs its body on what it is constructed with: class code.
       for a in &call.args {
         let (Arg::Var(v) | Arg::Spread(v)) = a;
-        self.typed_new_args.insert(*v);
         self.constrain(*v, Constraint::ClassEscape(callee, CLASS_TYPED_NEW));
       }
     }
@@ -5550,34 +5529,14 @@ impl Analysis {
   }
 
   /// Tim's class rule (issue, "When a method is kept"): a service that reaches class code, or
-  /// a value holding one, bails its key. Class code is the body of a class that is not a key
-  /// class: its constructor, methods, accessors, field initialisers, static blocks and
-  /// computed keys, the functions nested in them, and their clones. A key class is one whose
-  /// heritage is directly a `Context.Service`/`Context.Reference` key constructor. The check
-  /// runs once on the solved graph; points-to sets only grow, so it sees
-  /// every value class code may hold.
-  ///
-  /// A key bails when one of its services is reachable, through fields, elements, unknown-key
-  /// stores, spread sources and the contents of wraps, type-modelled summaries, effects and
-  /// promises, from:
-  /// - a variable of class code;
-  /// - a slot of a class-related object: a non-key class, its prototype, and any object whose
-  ///   prototype chain reaches that prototype (instances, `Object.create(C.prototype)`, a late
-  ///   `Object.setPrototypeOf`);
-  /// - the receiver of `Reflect.get`/`Reflect.set` on a class-related target, where the
-  ///   class's accessors run with it as `this`;
-  /// - an argument of `new` on a class `effect` exports (direction 2), whose body runs unseen.
-  ///
-  /// The walk enters a type-modelled summary's slot too. That slot is the module's pool, not
-  /// only the value's contents, so it may bail more than the value holds: a service in a class
-  /// field wrapped in `Option.some` must bail, and the pool is the only record of it. Returns
-  /// each bailed key with the class (or reason) it reached.
+  /// a value holding one, bails its key. The class holes enforce it during the solve
+  /// (`class_escape`); this reads what they recorded, marks those keys as never pruned and
+  /// returns each with how its service crossed into which class, for the report.
   pub fn class_bail(&mut self) -> Vec<(ArcStr, String)> {
-    let mut bailed = self.hole_bails();
+    let bailed = self.hole_bails();
     for (k, _) in &bailed {
       self.never_prune.insert(k.clone());
     }
-    bailed.extend(self.class_walk_bail());
     bailed
   }
 
@@ -5622,159 +5581,6 @@ impl Analysis {
       }
     }
     out
-  }
-
-  fn class_walk_bail(&mut self) -> Vec<(ArcStr, String)> {
-    let mut keys_of: FxHashMap<ObjId, Vec<ArcStr>> = FxHashMap::default();
-    for (k, v) in &self.key_values {
-      if self.never_prune.contains(k) {
-        continue;
-      }
-      for o in &self.vars[*v].pts {
-        keys_of.entry(*o).or_default().push(k.clone());
-      }
-    }
-    if keys_of.is_empty() {
-      return vec![];
-    }
-    let non_key = self.non_key_classes();
-    let class_code = |c: Option<ObjId>| -> Option<ObjId> {
-      let mut c = c;
-      while let Some(x) = c {
-        if non_key.contains(&x) {
-          return Some(x);
-        }
-        c = self.class_parent.get(&x).copied();
-      }
-      None
-    };
-    // Class-related objects: the non-key classes, their prototypes and the prototypes' heirs.
-    let mut related: FxHashMap<ObjId, ObjId> = FxHashMap::default();
-    let mut heirs: FxHashMap<ObjId, ObjId> = FxHashMap::default();
-    for c in &non_key {
-      related.insert(*c, *c);
-      if let ObjKind::Class { prototype, .. } = self.objs[*c].kind {
-        for p in &self.vars[prototype].pts {
-          heirs.entry(*p).or_insert(*c);
-        }
-      }
-    }
-    loop {
-      let mut added = vec![];
-      for (id, o) in self.objs.iter_enumerated() {
-        if heirs.contains_key(&id) {
-          continue;
-        }
-        let Some(pv) = o.proto else { continue };
-        if let Some(c) = self.vars[pv].pts.iter().find_map(|p| heirs.get(p)) {
-          added.push((id, *c));
-        }
-      }
-      if added.is_empty() {
-        break;
-      }
-      heirs.extend(added);
-    }
-    related.extend(heirs);
-    // The walk's sources, each with the class (or reason) reported for what it reaches.
-    let mut stack: Vec<(VarId, ObjId)> = vec![];
-    let mut other: Vec<(VarId, &'static str)> = vec![];
-    for f in &self.fns {
-      let Some(c) = class_code(f.class) else { continue };
-      let own = [f.this, f.ret, f.yielded_fail, f.yielded, f.arguments_elem];
-      for v in own.iter().chain(&f.params).chain(f.rest.iter()).chain(&f.locals) {
-        stack.push((*v, c));
-      }
-    }
-    for (c, v) in &self.class_vars {
-      if let Some(c) = class_code(Some(*c)) {
-        stack.push((*v, c));
-      }
-    }
-    for (o, c) in &related {
-      let ob = &self.objs[*o];
-      for v in
-        ob.fields.values().chain(ob.elem.iter()).chain(&ob.spread_from).chain(&ob.unknown_stores)
-      {
-        stack.push((*v, *c));
-      }
-    }
-    for (target, receiver) in &self.reflect_receivers {
-      if let Some(c) = self.vars[*target].pts.iter().find_map(|o| related.get(o)) {
-        stack.push((*receiver, *c));
-      }
-    }
-    for v in &self.typed_new_args {
-      other.push((*v, "is handed to the constructor of a class effect exports"));
-    }
-    let mut seen_vars: FxHashSet<VarId> = FxHashSet::default();
-    let mut seen_objs: FxHashSet<ObjId> = FxHashSet::default();
-    let mut bailed: Vec<(ArcStr, String)> = vec![];
-    let mut walk =
-      |a: &Self, start: VarId, why: &dyn Fn() -> String, bailed: &mut Vec<(ArcStr, String)>| {
-        let mut vars = vec![start];
-        while let Some(v) = vars.pop() {
-          if !seen_vars.insert(v) {
-            continue;
-          }
-          for o in &a.vars[v].pts {
-            if !seen_objs.insert(*o) {
-              continue;
-            }
-            if let Some(keys) = keys_of.get(o) {
-              for k in keys {
-                if !bailed.iter().any(|(b, _)| b == k) {
-                  bailed.push((k.clone(), why()));
-                }
-              }
-            }
-            let ob = &a.objs[*o];
-            vars.extend(
-              ob.fields
-                .values()
-                .chain(ob.elem.iter())
-                .chain(&ob.spread_from)
-                .chain(&ob.unknown_stores),
-            );
-            match ob.kind {
-              ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => vars.push(inner),
-              ObjKind::Effect { success, .. } => vars.push(success),
-              ObjKind::Promise { value } => vars.push(value),
-              _ => {}
-            }
-          }
-        }
-      };
-    for (v, c) in stack {
-      let why = || format!("reaches class code (class at {:?})", self.objs[c].site);
-      walk(self, v, &why, &mut bailed);
-    }
-    for (v, reason) in other {
-      walk(self, v, &|| reason.to_string(), &mut bailed);
-    }
-    for (k, _) in &bailed {
-      self.never_prune.insert(k.clone());
-    }
-    bailed
-  }
-
-  /// The classes that are not key classes. Only a class whose heritage is directly a key
-  /// constructor (`class S extends Context.Service()(...)`) is a key class. A subclass of a key
-  /// class is ordinary class code, and so is a class whose heritage may also be anything else.
-  fn non_key_classes(&self) -> FxHashSet<ObjId> {
-    self
-      .objs
-      .iter_enumerated()
-      .filter(|(_, o)| match o.kind {
-        ObjKind::Class { heritage: Some(h), .. } => {
-          let pts = &self.vars[h].pts;
-          pts.is_empty() || !pts.iter().all(|b| matches!(self.objs[*b].kind, ObjKind::Key { .. }))
-        }
-        ObjKind::Class { heritage: None, .. } => true,
-        _ => false,
-      })
-      .map(|(id, _)| id)
-      .collect()
   }
 
   pub fn bail_everything(&mut self, reason: &str) {

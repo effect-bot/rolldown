@@ -408,7 +408,6 @@ pub fn register(a: &mut Analysis) {
     a.constrain(o, Constraint::Load { key: Key::Var(k), dst: c.ret });
     if c.args.len() > 2 || c.has_spread() {
       let receiver = arg(a, c, 2);
-      a.reflect_receivers.push((o, receiver));
       a.constrain(o, Constraint::ClassReceiver(receiver));
     }
   });
@@ -420,7 +419,6 @@ pub fn register(a: &mut Analysis) {
     a.seed(c.ret, a.prim);
     if c.args.len() > 3 || c.has_spread() {
       let receiver = arg(a, c, 3);
-      a.reflect_receivers.push((o, receiver));
       a.constrain(o, Constraint::ClassReceiver(receiver));
     }
   });
