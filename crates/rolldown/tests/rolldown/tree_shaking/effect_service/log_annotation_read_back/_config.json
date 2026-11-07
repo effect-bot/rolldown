@@ -1,0 +1,10 @@
+{
+  "_comment": "A service set as a log annotation is read back as an unknown value and narrowed before the call: the key/value form through References.CurrentLogAnnotations, the record form by a custom logger through its fiber. Each path calls its own method, which stays; the unread method is removed. Guards a public-type rule for Effect.annotateLogs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

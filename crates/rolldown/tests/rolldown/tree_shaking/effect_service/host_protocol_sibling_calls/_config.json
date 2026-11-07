@@ -1,0 +1,10 @@
+{
+  "_comment": "String(x), JSON.stringify, console.log and util.inspect each call a service's protocol method (toString, toJSON, [inspect.custom]), which calls a sibling method through `this`: each helper stays, so each case fails on its own when the protocol method is kept but never analysed; the unread method of each service is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

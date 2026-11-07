@@ -1,0 +1,10 @@
+{
+  "_comment": "A service failed into a Cause with Cause.fail is read back as the Cause's error, through Effect.catch and through Cause.findError; each path calls its own method, which stays, and the unread method is removed. Guards a public-type rule for Cause.fail.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
