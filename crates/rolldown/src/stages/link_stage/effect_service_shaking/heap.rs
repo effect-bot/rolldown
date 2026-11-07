@@ -5242,8 +5242,8 @@ impl Analysis {
   /// a value holding one, bails its key. Class code is the body of a class that is not a key
   /// class: its constructor, methods, accessors, field initialisers, static blocks and
   /// computed keys, the functions nested in them, and their clones. A key class is one whose
-  /// heritage reaches a `Context.Service`/`Context.Reference` key, directly or through another
-  /// key class. The check runs once on the solved graph; points-to sets only grow, so it sees
+  /// heritage is directly a `Context.Service`/`Context.Reference` key constructor. The check
+  /// runs once on the solved graph; points-to sets only grow, so it sees
   /// every value class code may hold.
   ///
   /// A key bails when one of its services is reachable, through fields, elements, unknown-key
@@ -5393,39 +5393,23 @@ impl Analysis {
     bailed
   }
 
-  /// The classes that are not key classes: a key class's heritage reaches a key, directly or
-  /// through another key class (as `key_heritage` reads it).
+  /// The classes that are not key classes. Only a class whose heritage is directly a key
+  /// constructor (`class S extends Context.Service()(...)`) is a key class. A subclass of a key
+  /// class is ordinary class code, and so is a class whose heritage may also be anything else.
   fn non_key_classes(&self) -> FxHashSet<ObjId> {
-    let mut key: FxHashMap<ObjId, bool> = FxHashMap::default();
-    let classes: Vec<ObjId> = self
+    self
       .objs
       .iter_enumerated()
-      .filter(|(_, o)| matches!(o.kind, ObjKind::Class { .. }))
+      .filter(|(_, o)| match o.kind {
+        ObjKind::Class { heritage: Some(h), .. } => {
+          let pts = &self.vars[h].pts;
+          pts.is_empty() || !pts.iter().all(|b| matches!(self.objs[*b].kind, ObjKind::Key { .. }))
+        }
+        ObjKind::Class { heritage: None, .. } => true,
+        _ => false,
+      })
       .map(|(id, _)| id)
-      .collect();
-    // Heritage chains are short; iterate to a fixpoint (a cycle stays non-key).
-    loop {
-      let mut changed = false;
-      for c in &classes {
-        if key.get(c).copied().unwrap_or(false) {
-          continue;
-        }
-        let ObjKind::Class { heritage: Some(h), .. } = self.objs[*c].kind else { continue };
-        let is_key = self.vars[h].pts.iter().any(|b| match self.objs[*b].kind {
-          ObjKind::Key { .. } => true,
-          ObjKind::Class { .. } => key.get(b).copied().unwrap_or(false),
-          _ => false,
-        });
-        if is_key {
-          key.insert(*c, true);
-          changed = true;
-        }
-      }
-      if !changed {
-        break;
-      }
-    }
-    classes.into_iter().filter(|c| !key.get(c).copied().unwrap_or(false)).collect()
+      .collect()
   }
 
   pub fn bail_everything(&mut self, reason: &str) {
