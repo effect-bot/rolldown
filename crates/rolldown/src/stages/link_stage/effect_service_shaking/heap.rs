@@ -193,6 +193,26 @@ pub const EQUAL_KEY: &str = "~effect/Equal";
 pub const HASH_KEY: &str = "~effect/Hash";
 /// `HttpServerRespondable.symbol`.
 pub const RESPONDABLE_KEY: &str = "~effect/http/HttpServerRespondable";
+/// Host methods a protocol walk need not call (direction 2). Each one calls no function and
+/// coerces nothing, so it runs no program code, and what it returns is a primitive or an
+/// iterator over the receiver's own elements, which the walk visits itself. Its call returns a
+/// primitive. Anything else is called: other host methods dispatch to program code
+/// (`Function.prototype.call` calls its receiver, `Array.prototype.map` its argument,
+/// `Array.prototype.join` the elements' `toString`, `slice` the receiver's species).
+/// `Array.prototype.*` names stand for the same methods of Maps and Sets too.
+const INERT_PROTOCOL_METHODS: &[&str] = &[
+  "String.prototype.toString",
+  "Array.prototype.length",
+  "Array.prototype.size",
+  "Array.prototype.has",
+  "Array.prototype.includes",
+  "Array.prototype.indexOf",
+  "Array.prototype.lastIndexOf",
+  "Array.prototype.values",
+  "Array.prototype.keys",
+  "Array.prototype.entries",
+  "Array.prototype.@@iterator",
+];
 /// Effect's TypeId, the member its `Effect` type requires.
 pub const EFFECT_TYPE_ID: &str = "~effect/Effect";
 
@@ -4232,11 +4252,9 @@ impl Analysis {
       }
       self.seed(call.ret, self.top_ext);
     } else if let ObjKind::Builtin { rule, .. } = self.objs[obj].kind
-      && self.rules[rule as usize].0.contains(".prototype.")
+      && INERT_PROTOCOL_METHODS.contains(&self.rules[rule as usize].0)
     {
-      // A host prototype's own method (`Array.prototype.toString`, `Date.prototype.toISOString`)
-      // runs no program code the walk doesn't already reach: it walks the elements and fields
-      // itself. Its result is a primitive.
+      // A host method that runs no program code: its result is a primitive.
       self.seed(call.ret, self.prim);
     } else {
       self.call(obj, call);
