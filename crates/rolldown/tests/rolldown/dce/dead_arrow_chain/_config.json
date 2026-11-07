@@ -1,0 +1,7 @@
+{
+  "_comment": "Regression test for an oxc_minifier panic, without the Effect pass. Rolldown's dead-code elimination (oxc_minifier 0.157.0 Compressor::run_in_loop) removes one link of a chain of unused const arrow functions per pass. Twelve links keep the loop changing through its 12th pass, where a debug assertion fires: 'Ran loop more than 10 times.' Bundling effect/http/HttpServerResponse hits the same assertion. treeshake is off so the chain reaches chunk minification. With rolldown's own tree-shaking on, the same assertion fires in per-module dead-code elimination, on a tokio worker, and the build hangs instead of failing. Red until the minifier removes such a chain within its pass limit.",
+  "config": {
+    "treeshake": false
+  },
+  "snapshot": false
+}
