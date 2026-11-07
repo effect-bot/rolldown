@@ -1,0 +1,10 @@
+{
+  "_comment": "A service failed with Effect.fail is read back through the Exit's Cause (Effect.exit, Exit.isFailure, Cause.findError, Result.isSuccess). The read-back method calls a sibling through `this`, which stays; the method nothing reads is removed. Guards that a method read back through `Exit.cause` has its body analysed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
