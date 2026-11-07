@@ -1,0 +1,10 @@
+{
+  "_comment": "A method parameter shadows a namespace import, so the method reads plain data and Store prunes its unread method. A second class references the import directly: Second keeps every method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

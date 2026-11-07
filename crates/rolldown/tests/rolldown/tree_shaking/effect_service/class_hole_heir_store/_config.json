@@ -1,0 +1,10 @@
+{
+  "_comment": "Objects inheriting from a class prototype through Object.create and a late Object.setPrototypeOf are given services in fields: both keys keep every method; Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

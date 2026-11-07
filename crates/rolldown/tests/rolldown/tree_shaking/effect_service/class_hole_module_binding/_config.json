@@ -1,0 +1,10 @@
+{
+  "_comment": "A class method calls a method of a module-level implementation literal also provided under Store: the class body references the service, so Store keeps every method. Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

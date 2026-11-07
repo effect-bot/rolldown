@@ -1,0 +1,10 @@
+{
+  "_comment": "A method installed on a class prototype from outside the class, called through an instance: it is not class code, so the method it reads stays, the unread one goes, and Store does not bail.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

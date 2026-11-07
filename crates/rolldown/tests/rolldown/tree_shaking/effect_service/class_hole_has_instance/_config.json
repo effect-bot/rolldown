@@ -1,0 +1,10 @@
+{
+  "_comment": "instanceof calls the class's static [Symbol.hasInstance] with the left operand: an object holding the service is tested, so Store keeps every method. Plain data and Error checks hand nothing over; Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

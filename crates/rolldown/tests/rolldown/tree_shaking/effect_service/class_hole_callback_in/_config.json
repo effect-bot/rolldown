@@ -1,0 +1,10 @@
+{
+  "_comment": "A closure reading the service is handed to a class constructor and called by a method: only the closure enters the class, so the method it reads stays, the unread one goes, and Store does not bail.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

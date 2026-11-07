@@ -1,0 +1,10 @@
+{
+  "_comment": "A class method looks the service up by key string with Context.getOrUndefinedUnsafe: Store keeps every method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

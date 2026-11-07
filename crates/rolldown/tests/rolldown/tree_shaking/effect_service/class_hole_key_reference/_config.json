@@ -1,0 +1,10 @@
+{
+  "_comment": "A class method yields the key itself (yield* Store): the class body fetches the service, so its key keeps every method. Other, never mentioned by a class, prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

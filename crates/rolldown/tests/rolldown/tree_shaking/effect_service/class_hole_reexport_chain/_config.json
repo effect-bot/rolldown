@@ -1,0 +1,10 @@
+{
+  "_comment": "A class method reads one export through export * over export * as sub: only that export reaches class code, so Store keeps every method and Other prunes. A computed namespace read in a class reaches every export: Third keeps every method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

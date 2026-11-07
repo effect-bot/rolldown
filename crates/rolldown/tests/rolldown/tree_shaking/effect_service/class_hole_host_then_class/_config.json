@@ -1,0 +1,10 @@
+{
+  "_comment": "A callback first handed to queueMicrotask is then called by a class constructor with the instance, and registers the service on it: the class method receives the service, so Store keeps every method. Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -1,0 +1,10 @@
+{
+  "_comment": "An object a class method makes is handed a service through its own method: Registered keeps every method, Direct (read only directly) prunes, and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

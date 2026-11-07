@@ -1,0 +1,10 @@
+{
+  "_comment": "A class method is the only caller of HttpBody.file, which reads the FileSystem service's stat: HttpBody's type-modelled code counts as a reader, so the FileSystem key keeps every method.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

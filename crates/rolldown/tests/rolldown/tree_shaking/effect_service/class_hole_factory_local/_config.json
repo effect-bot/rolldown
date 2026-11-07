@@ -1,0 +1,10 @@
+{
+  "_comment": "A factory returns a class whose method reads the factory's parameter, a binding outside the class body: the service reaches class code, so Store keeps every method. Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

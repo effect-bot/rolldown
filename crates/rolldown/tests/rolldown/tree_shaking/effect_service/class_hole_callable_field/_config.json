@@ -1,0 +1,10 @@
+{
+  "_comment": "A function holding the service in its own property is handed to a class method that reads it off: the service reaches class code through the function's field, so Store keeps every method. Other prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
