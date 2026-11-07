@@ -1,0 +1,10 @@
+{
+  "_comment": "A function's own toJSON/toString is a host prototype method that calls it (Function.prototype.call): JSON serialization and string conversion run the function, so the service methods it reads stay, the unread one goes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
