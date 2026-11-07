@@ -1,0 +1,10 @@
+{
+  "_comment": "A service collected by Sink.takeWhile comes back through the Sink's Done signal. No service is ever a Done value (Tim's decision, assumption 4), so the read keeps nothing: both method definitions are removed and the bundle is not run.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
