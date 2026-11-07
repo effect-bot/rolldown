@@ -313,7 +313,10 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
       ("isManagedRuntime", Spec::Rule("effect:prim")),
     ],
   ),
-  ("Scope", &[("Scope", Spec::Key(SCOPE_KEY))]),
+  (
+    "Scope",
+    &[("Scope", Spec::Key(SCOPE_KEY)), ("forkUnsafe", Spec::Rule("effect:Scope.forkUnsafe"))],
+  ),
   (
     "Fiber",
     &[
@@ -369,7 +372,22 @@ pub const LISTED_MODULES: &[(&str, &[(&str, Spec)])] = &[
     ],
   ),
   ("Equal", &[("equals", Spec::Rule("effect:Equal.equals"))]),
-  ("Cause", &[("fail", Spec::Rule("effect:Cause.fail"))]),
+  (
+    "Cause",
+    &[
+      ("fail", Spec::Rule("effect:Cause.fail")),
+      ("fromReasons", Spec::Rule("effect:Cause.fromReasons")),
+      ("isCause", Spec::Rule("effect:Cause.isCause")),
+      ("isReason", Spec::Rule("effect:Cause.isReason")),
+      ("isDone", Spec::Rule("effect:Cause.isDone")),
+      ("isFailReason", Spec::Rule("effect:Cause.isTagged")),
+      ("isDieReason", Spec::Rule("effect:Cause.isTagged")),
+      ("isInterruptReason", Spec::Rule("effect:Cause.isTagged")),
+      ("hasFails", Spec::Rule("effect:Cause.hasTagged")),
+      ("hasDies", Spec::Rule("effect:Cause.hasTagged")),
+      ("hasInterrupts", Spec::Rule("effect:Cause.hasTagged")),
+    ],
+  ),
   ("Logger", &[("make", Spec::Rule("effect:Logger.make"))]),
   ("Hash", &[("hash", Spec::Rule("effect:Hash.hash"))]),
 ];
@@ -562,6 +580,13 @@ fn run_loggers(a: &mut Analysis, messages: &[VarId]) {
   for m in messages {
     a.copy(*m, pool);
   }
+}
+
+/// A predicate that reads `key` on its argument and returns a boolean.
+fn presence_check(a: &mut Analysis, c: &Call, key: &str) {
+  let value = arg(a, c, 0);
+  a.constrain(value, Constraint::Demand(ArcStr::from(key)));
+  a.seed(c.ret, a.prim);
 }
 
 /// The record behind `References.CurrentLogAnnotations`, and a variable holding it.
@@ -2019,6 +2044,36 @@ pub fn register(a: &mut Analysis) {
 
   // == Read-back of values Effect stores for the program
 
+  // Cause's stable predicates read one property and call nothing: the brand checks test the
+  // presence of a key on an unknown value, the reason checks read `_tag`, and `hasFails` and
+  // friends read `_tag` on each reason. Each returns a boolean.
+  a.rule("effect:Cause.isCause", |a, c| presence_check(a, c, "~effect/Cause"));
+  a.rule("effect:Cause.isReason", |a, c| presence_check(a, c, "~effect/Cause/Reason"));
+  a.rule("effect:Cause.isDone", |a, c| presence_check(a, c, "~effect/Cause/Done"));
+  a.rule("effect:Cause.isTagged", |a, c| presence_check(a, c, "_tag"));
+  a.rule("effect:Cause.hasTagged", |a, c| {
+    let cause = arg(a, c, 0);
+    let reasons = load(a, cause, "reasons");
+    let reason = elem_of(a, reasons);
+    a.constrain(reason, Constraint::Demand(ArcStr::from("_tag")));
+    a.seed(c.ret, a.prim);
+  });
+  a.rule("effect:Cause.fromReasons", |a, c| {
+    // `fromReasons(reasons)`: a Cause of those reasons. A reason the model reads back through a
+    // Cause is its error itself (`cause_of`), so an element may be an error as well as a reason
+    // object: the new Cause's errors are the elements and their `error` and `defect` members.
+    let reasons = arg(a, c, 0);
+    let element = elem_of(a, reasons);
+    let inner = a.var();
+    a.copy(element, inner);
+    for member in ["error", "defect"] {
+      let v = load(a, element, member);
+      a.copy(v, inner);
+    }
+    let cause = a.cause_of(inner, c.site);
+    a.copy(cause, c.ret);
+  });
+
   a.rule("effect:Cause.fail", |a, c| {
     // `Cause.fail(error)`: a Cause of the error (`cause_of`), as `Exit.cause` is. The
     // error is read back through the Cause (`Cause.findError`, `Effect.catch` of
@@ -2074,6 +2129,14 @@ pub fn register(a: &mut Analysis) {
         annotated(a, c.site, effect, c.ret);
       }
     }
+  });
+
+  a.rule("effect:Scope.forkUnsafe", |a, c| {
+    // `forkUnsafe(scope, strategy?)`: a child scope of `scope`. Its finalizers run when it closes,
+    // or when the parent does; the model takes the parent itself, which runs them on either close.
+    // Nothing else flows from the arguments.
+    let scope = arg(a, c, 0);
+    a.copy(scope, c.ret);
   });
 
   a.rule("effect:Effect.log", |a, c| {
