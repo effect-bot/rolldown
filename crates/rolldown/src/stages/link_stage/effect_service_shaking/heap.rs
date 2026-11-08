@@ -498,6 +498,8 @@ pub enum Constraint {
   /// Every key named by these strings keeps all its methods (a key handed to type-modelled
   /// code, which may provide or read it).
   BailKeys,
+  /// On a key's names: a key handed across a boundary (`Analysis::hand_name`).
+  HandName,
   /// The value crosses into the body of a class (`ObjId`), which the pass does not analyse
   /// (`Analysis::class_escape`); the `u8` is how, for the report (`CLASS_HOW`).
   ClassEscape(ObjId, u8),
@@ -614,6 +616,7 @@ impl Constraint {
         C::CallFn(Box::new(c))
       }
       C::BailKeys => C::BailKeys,
+      C::HandName => C::HandName,
       C::ClassReceiver(r) => C::ClassReceiver(v(*r)),
       C::HasInstance(x, site) => C::HasInstance(v(*x), s(*site)),
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
@@ -912,6 +915,12 @@ pub struct Analysis {
   /// Objects escaped into effect's code, and into code the pass can't see (`escape`).
   effect_escaped: FxHashSet<ObjId>,
   genuine_escaped: FxHashSet<ObjId>,
+  /// Keys handed across a boundary (`hand_key`): the objects handed, the key names they carry,
+  /// whether one names every key, and the lookups through keys from a boundary.
+  handed: FxHashSet<ObjId>,
+  handed_names: FxHashSet<ArcStr>,
+  handed_all: bool,
+  handed_lookups: FxHashSet<VarId>,
   /// Widening (`widen`): the set size past which a variable is widened, the boundary, the
   /// number of variables widened, and how many variables the analysis starts with.
   pub widen_limit: usize,
@@ -1198,6 +1207,10 @@ impl Analysis {
       hole_related: FxHashMap::default(),
       effect_escaped: FxHashSet::default(),
       genuine_escaped: FxHashSet::default(),
+      handed: FxHashSet::default(),
+      handed_names: FxHashSet::default(),
+      handed_all: false,
+      handed_lookups: FxHashSet::default(),
       widen_limit: std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_WIDEN")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1408,7 +1421,74 @@ impl Analysis {
     if self.effect_keys.contains(key) {
       self.copy(v, self.effect_key_values);
     }
+    if self.handed_names.contains(key) {
+      for dst in self.handed_lookups.clone() {
+        self.copy(v, dst);
+      }
+    }
     v
+  }
+
+  /// A value crossed a boundary (unseen code, effect's code, a host builtin, class code or a
+  /// widened set): if it is a key or a key's name, a key from that boundary may be it, since
+  /// code there may hand back what it was given. Values inside it cross on their own (fields,
+  /// heritage), so only keys and strings are read here. Runs once per object, whatever the
+  /// flavour or the order of escapes.
+  fn hand_key(&mut self, obj: ObjId) {
+    if !matches!(self.objs[obj].kind, ObjKind::Str(_) | ObjKind::Key { .. })
+      || !self.handed.insert(obj)
+    {
+      return;
+    }
+    match self.objs[obj].kind.clone() {
+      ObjKind::Str(_) => self.hand_name(obj),
+      ObjKind::Key { strings, .. } => self.constrain(strings, Constraint::HandName),
+      _ => {}
+    }
+  }
+
+  /// A handed key's name (`hand_key`): lookups through a key from a boundary see what is
+  /// provided under it. A name the pass can't read (a primitive or host value) may be any key.
+  fn hand_name(&mut self, obj: ObjId) {
+    match self.objs[obj].kind.clone() {
+      ObjKind::Str(name) => {
+        if !self.handed_names.insert(name.clone()) {
+          return;
+        }
+        if let Some(v) = self.key_values.get(&name).copied() {
+          for dst in self.handed_lookups.clone() {
+            self.copy(v, dst);
+          }
+        }
+      }
+      ObjKind::AllKeys if obj == self.all_keys => self.hand_all(),
+      ObjKind::Num(_) | ObjKind::Prim | ObjKind::Top(Flavour::Host) => self.hand_all(),
+      _ => {}
+    }
+  }
+
+  fn hand_all(&mut self) {
+    if std::mem::replace(&mut self.handed_all, true) {
+      return;
+    }
+    for dst in self.handed_lookups.clone() {
+      self.copy(self.all_values, dst);
+    }
+  }
+
+  /// A lookup through a key from a boundary (`unseen_keys`) sees every key handed across one.
+  fn handed_lookup(&mut self, dst: VarId) {
+    if !self.handed_lookups.insert(dst) {
+      return;
+    }
+    if self.handed_all {
+      self.copy(self.all_values, dst);
+    }
+    let vars: Vec<VarId> =
+      self.handed_names.iter().filter_map(|n| self.key_values.get(n).copied()).collect();
+    for v in vars {
+      self.copy(v, dst);
+    }
   }
 
   /// Registers a key declared inside the `effect` package.
@@ -1590,8 +1670,9 @@ impl Analysis {
   }
 
   /// A value made by code the pass does not analyse but that runs in this runtime: a class
-  /// hole's or a widened set's opaque value. It is never a key (`keeps_identity`, and
-  /// `class_escape` bails every key when class code holds a key constructor).
+  /// hole's or a widened set's opaque value. In a key position it is a key made there or one
+  /// handed to it (`hand_key`); a key constructor class code holds bails every key
+  /// (`class_escape`).
   fn is_opaque(&self, obj: ObjId) -> bool {
     self.opaque_class.contains_key(&obj)
   }
@@ -2165,6 +2246,7 @@ impl Analysis {
         self.typed_nested(obj, *slot, *back, *site, *mask);
       }
       Constraint::BailKeys => self.bail_keys(obj),
+      Constraint::HandName => self.hand_name(obj),
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
       Constraint::LookupNameIn { key, dst } => {
         if matches!(
@@ -5266,6 +5348,7 @@ impl Analysis {
         KeyUse::Lookup(dst) => {
           self.copy(self.unknown_key_values, *dst);
           self.copy(self.effect_key_values, *dst);
+          self.handed_lookup(*dst);
         }
         KeyUse::Provide(src) => {
           self.provide_sources.insert(*src);
@@ -5293,9 +5376,7 @@ impl Analysis {
       // unknown here, and it is read as a key made where the pass can't see. What is provided
       // through it is kept whole.
       // (Read by the last arm, with `top_effect`.)
-      // Values class code or a widened set made are never keys (`is_opaque`); a default-modelled
-      // export names one of effect's keys.
-      ObjKind::External { .. } if self.is_opaque(obj) => {}
+      // A default-modelled export names one of effect's keys.
       ObjKind::Builtin { .. } if self.is_default(obj) => {
         self.constrain(self.effect_key_strings, Constraint::KeyUse(use_.clone()));
       }
@@ -5312,10 +5393,10 @@ impl Analysis {
       | ObjKind::MemoMap
       | ObjKind::Builtin { .. }
       | ObjKind::Num(_)
-      | ObjKind::Prim
-      | ObjKind::Top(Flavour::Host) => {}
-      // A value from code the pass can't see in a key position, or a key effect's code made:
-      // a key made where the pass can't see.
+      | ObjKind::Prim => {}
+      // A value from a boundary in a key position (code the pass can't see, effect's code, a
+      // host builtin, class code or a widened set): a key made there, or one handed to it
+      // (`hand_key`).
       ObjKind::Typed { .. } | ObjKind::Top(_) | ObjKind::External { .. } => {
         let unseen = self.unseen_keys;
         self.key_use(unseen, use_);
@@ -5352,8 +5433,6 @@ impl Analysis {
         let unseen = self.unseen_keys;
         self.key_use(unseen, use_);
       }
-      // Nor is a value class code or a widened set made (`is_opaque`).
-      ObjKind::External { .. } if self.is_opaque(base) => {}
       ObjKind::Top(_) | ObjKind::Wrap(_)
         if base == self.top_effect || matches!(self.objs[base].kind, ObjKind::Wrap(_)) =>
       {
@@ -5386,7 +5465,6 @@ impl Analysis {
         self.constrain(h, Constraint::SubclassHeritage(use_.clone()));
         false
       }
-      ObjKind::External { .. } if self.is_opaque(base) => false,
       ObjKind::Typed { .. } => {
         let unseen = self.unseen_keys;
         self.key_use(unseen, use_);
@@ -5439,7 +5517,6 @@ impl Analysis {
         let all = self.all_keys;
         self.key_use(all, use_);
       }
-      ObjKind::External { .. } if self.is_opaque(obj) => {}
       ObjKind::Top(_) | ObjKind::External { .. } => {
         let unseen = self.unseen_keys;
         self.key_use(unseen, use_);
@@ -5792,6 +5869,7 @@ impl Analysis {
   /// it holds runs with its opaque value as arguments and `this`, and an Effect it holds runs.
   /// Each object crosses once, whatever other flavour it escaped with before.
   pub fn class_escape(&mut self, obj: ObjId, class: ObjId, how: u8) {
+    self.hand_key(obj);
     if self.class_escaped.contains_key(&obj) {
       return;
     }
@@ -6043,6 +6121,7 @@ impl Analysis {
 
   /// A value handed to code the pass cannot see.
   pub fn escape(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>) {
+    self.hand_key(obj);
     // An escape into effect's code runs once; one into code the pass can't see runs once too,
     // even after the first (it hands over more: values from unseen code may be anything).
     let into_effect = flavour == Flavour::Ext && site == Some(EFFECT_ESCAPE);
