@@ -5,7 +5,10 @@
 #![expect(clippy::print_stderr, reason = "stderr is the opt-in debug report")]
 
 use arcstr::ArcStr;
-use oxc::ast::ast::{IdentifierReference, ObjectExpression, Program};
+use oxc::ast::ast::{
+  BindingPattern, Expression, IdentifierReference, ObjectExpression, ObjectPropertyKind, Program,
+  Statement,
+};
 use oxc::ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc::span::{GetSpan, Span};
 use rolldown_common::{ModuleIdx, StmtInfoIdx, SymbolOrMemberExprRef};
@@ -355,22 +358,72 @@ fn initializer_is_safe(a: &Analysis, sh: &Shared<'_>, info: &LiteralInfo, prop: 
 struct Pruner<'s> {
   properties: &'s FxHashSet<u32>,
   removed: Vec<Span>,
+  scoping: &'s oxc::semantic::Scoping,
+  /// The bindings removed properties named as their value (`{ m }`, `{ m: m }`).
+  value_bindings: FxHashSet<oxc::semantic::SymbolId>,
 }
 
 impl<'a> VisitMut<'a> for Pruner<'_> {
   fn visit_object_expression(&mut self, it: &mut ObjectExpression<'a>) {
     let mut removed = vec![];
+    let mut bindings = vec![];
     it.properties.retain(|p| {
       let span = p.span();
       if self.properties.contains(&span.start) {
         removed.push(span);
+        if let ObjectPropertyKind::ObjectProperty(prop) = p {
+          if let Expression::Identifier(id) = &prop.value {
+            if let Some(sym) =
+              id.reference_id.get().and_then(|r| self.scoping.get_reference(r).symbol_id())
+            {
+              bindings.push(sym);
+            }
+          }
+        }
         false
       } else {
         true
       }
     });
     self.removed.extend(removed);
+    self.value_bindings.extend(bindings);
     walk_mut::walk_object_expression(self, it);
+  }
+}
+
+/// A removed method's own binding (`const m = () => ...; return Store.of({ m })`) goes with
+/// it once nothing references it: its initialiser is a function expression, so dropping it
+/// has no effect, and what only it referenced can then be dropped by the bundler too.
+struct BindingPruner<'s> {
+  unused: &'s FxHashSet<oxc::semantic::SymbolId>,
+}
+
+impl<'a> VisitMut<'a> for BindingPruner<'_> {
+  fn visit_program(&mut self, it: &mut Program<'a>) {
+    // Only bindings inside functions: another module may reference a top-level one.
+    for stmt in &mut it.body {
+      self.visit_statement(stmt);
+    }
+  }
+
+  fn visit_statements(&mut self, it: &mut oxc::allocator::Vec<'a, Statement<'a>>) {
+    for stmt in it.iter_mut() {
+      if let Statement::VariableDeclaration(d) = stmt {
+        d.declarations.retain(|decl| {
+          let BindingPattern::BindingIdentifier(id) = &decl.id else { return true };
+          let Some(sym) = id.symbol_id.get() else { return true };
+          let pure_fn = matches!(
+            decl.init,
+            Some(Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_))
+          );
+          !(pure_fn && self.unused.contains(&sym))
+        });
+      }
+    }
+    it.retain(
+      |stmt| !matches!(stmt, Statement::VariableDeclaration(d) if d.declarations.is_empty()),
+    );
+    walk_mut::walk_statements(self, it);
   }
 }
 
@@ -421,11 +474,26 @@ pub fn apply(
 ) {
   let before = stmt_refs(scoping, ast.program());
   let mut removed_spans = vec![];
+  let mut value_bindings = FxHashSet::default();
   ast.program.with_mut(|fields| {
-    let mut pruner = Pruner { properties, removed: vec![] };
+    let mut pruner =
+      Pruner { properties, removed: vec![], scoping, value_bindings: FxHashSet::default() };
     pruner.visit_program(fields.program);
     removed_spans = pruner.removed;
+    value_bindings = pruner.value_bindings;
   });
+  if !value_bindings.is_empty() {
+    // Bindings removed properties named, that nothing references any more.
+    let mut c = RefCollector { scoping, refs: Refs::default() };
+    c.visit_program(ast.program());
+    let unused: FxHashSet<_> =
+      value_bindings.into_iter().filter(|s| !c.refs.symbols.contains(s)).collect();
+    if !unused.is_empty() {
+      ast.program.with_mut(|fields| {
+        BindingPruner { unused: &unused }.visit_program(fields.program);
+      });
+    }
+  }
   let after = stmt_refs(scoping, ast.program());
   for (i, (b, af)) in before.iter().zip(after.iter()).enumerate() {
     let gone: FxHashSet<_> = b.difference(af).copied().collect();

@@ -178,8 +178,11 @@ fn descriptor_accessors(a: &mut Analysis, desc: ObjId, values: VarId, site: Site
   let get = a.field(desc, &ArcStr::from("get"));
   let wrapped = a.wrap_of(values, site);
   a.copy(wrapped, get);
+  // A setter run through `set` is program code the pass does not follow: what it is handed
+  // crosses into that boundary (`Analysis::unfollowed`).
   let set = a.field(desc, &ArcStr::from("set"));
-  a.seed(set, a.top_ext);
+  let unfollowed = a.unfollowed();
+  a.seed(set, unfollowed);
 }
 
 /// The values an enumeration of the objects in `o` hands out: every field, through the
@@ -1273,7 +1276,26 @@ fn global_object(a: &mut Analysis, name: &str) -> ObjId {
       a.seed(elem, a.top_host);
       obj
     }
-    "require" | "module" | "exports" | "__dirname" | "__filename" | "Function" | "eval" => {
+    "Function" => {
+      // Calling `Function` compiles code the pass can't see; `Function.prototype` is the host
+      // prototype of every function, whose `call`, `apply` and `bind` have rules.
+      let obj =
+        a.alloc(ObjKind::External { flavour: Flavour::Ext, name: ArcStr::from(name) }, None);
+      let proto = a.alloc(ObjKind::Object, None);
+      a.objs[proto].builtin_proto = true;
+      for m in ["call", "apply", "bind"] {
+        let id = a.rule_id(&format!("Function.prototype.{m}")).expect("registered");
+        let b = a.builtin(id, None, None);
+        let f = a.field(proto, &ArcStr::from(m));
+        a.seed(f, b);
+      }
+      let elem = a.elem(proto);
+      a.seed(elem, a.top_host);
+      let f = a.field(obj, &ArcStr::from("prototype"));
+      a.seed(f, proto);
+      obj
+    }
+    "require" | "module" | "exports" | "__dirname" | "__filename" | "eval" => {
       a.alloc(ObjKind::External { flavour: Flavour::Ext, name: ArcStr::from(name) }, None)
     }
     "process" => {

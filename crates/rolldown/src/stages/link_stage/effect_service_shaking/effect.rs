@@ -887,8 +887,12 @@ pub fn register(a: &mut Analysis) {
     a.copy(r, c.ret);
   });
   a.rule("effect:Context.getOrUndefinedUnsafe", |a, c| {
-    let v = lookup_in_context(a, c);
-    a.copy(v, c.ret);
+    // Keyed by the key's name string, not a key object.
+    let ctx = arg(a, c, 0);
+    let key = arg(a, c, 1);
+    let dst = a.var();
+    a.constrain(ctx, Constraint::LookupNameIn { key, dst });
+    a.copy(dst, c.ret);
   });
   a.rule("effect:Context.makeUnsafe", |a, c| {
     let map = arg(a, c, 0);
@@ -2642,20 +2646,18 @@ pub fn register(a: &mut Analysis) {
     // its functions an unknown number of times, so its step loops on its own result.
     let mut acc = this_of(a, c);
     for x in args_from(a, c, 0) {
-      let next = a.var();
-      match x {
-        Arg::Var(f) => {
-          let r = invoke(a, c.site, f, None, vec![acc]);
-          a.copy(r, next);
-        }
+      acc = match x {
+        // The step's own result is the next step's input: no relay variable between them.
+        Arg::Var(f) => invoke(a, c.site, f, None, vec![acc]),
         Arg::Spread(v) => {
+          let next = a.var();
           let f = elem_of(a, v);
           a.copy(acc, next);
           let r = invoke(a, c.site, f, None, vec![next]);
           a.copy(r, next);
+          next
         }
-      }
-      acc = next;
+      };
     }
     a.copy(acc, c.ret);
   });
@@ -2867,7 +2869,8 @@ pub fn declared_key(a: &mut Analysis, name: Option<&str>, reference: bool) -> Ob
         a.never_prune.insert(ArcStr::from(n));
       }
     }
-    None => a.seed(strings, a.top_host),
+    // A name the declaration computes: still one of effect's own keys.
+    None => a.copy(a.effect_key_strings, strings),
   }
   a.alloc(ObjKind::Key { strings, reference }, None)
 }

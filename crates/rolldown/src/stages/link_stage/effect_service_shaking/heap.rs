@@ -213,16 +213,25 @@ const INERT_PROTOCOL_METHODS: &[&str] = &[
   "Array.prototype.entries",
   "Array.prototype.@@iterator",
 ];
+/// The site of an escape into type-modelled `effect` code (admission, callbacks, summaries'
+/// receivers): what that code writes back or passes on is a value effect's code made
+/// (`Analysis::top_effect`), not an arbitrary unknown.
+pub const EFFECT_ESCAPE: Site =
+  Site { module: ModuleIdx::from_raw_unchecked(0), start: u32::MAX - 99, sub: 0 };
 /// How a value crossed into class code (`Constraint::ClassEscape`), for the report.
 pub const CLASS_HANDED: u8 = 0;
 pub const CLASS_STORED: u8 = 1;
 pub const CLASS_REFERENCED: u8 = 2;
 pub const CLASS_TYPED_NEW: u8 = 3;
-pub const CLASS_HOW: [&str; 4] = [
+pub const CLASS_WIDENED: u8 = 4;
+pub const CLASS_UNFOLLOWED: u8 = 5;
+pub const CLASS_HOW: [&str; 6] = [
   "is handed to class code",
   "is stored in a class, its prototype or an instance",
   "is referenced from a class body",
   "is handed to the constructor of a class effect exports",
+  "is in a set of values too large to track one by one",
+  "is handed to program code the pass does not follow (a hand-written thenable)",
 ];
 /// Effect's TypeId, the member its `Effect` type requires.
 pub const EFFECT_TYPE_ID: &str = "~effect/Effect";
@@ -376,6 +385,16 @@ pub enum Constraint {
   SuccessOf(VarId),
   FailureOf(VarId),
   KeyUse(KeyUse),
+  /// On a key's name: its `key` strings, or the `key` field of a key-shaped value
+  /// (`Analysis::key_name_use`).
+  KeyNameUse(KeyUse),
+  /// On a container's keys, for an API without a model (`Analysis::contents_of`).
+  ContentsLookup(VarId),
+  /// On a Context: the service whose key *name* the variable holds (`getOrUndefinedUnsafe`).
+  LookupNameIn {
+    key: VarId,
+    dst: VarId,
+  },
   /// On a class's heritage variable: the class (`ObjId`) is a service key only when what it
   /// directly extends is a key object (`Analysis::key_heritage`).
   KeyHeritage(ObjId, KeyUse),
@@ -547,6 +566,9 @@ impl Constraint {
       C::SuccessOf(x) => C::SuccessOf(v(*x)),
       C::FailureOf(x) => C::FailureOf(v(*x)),
       C::KeyUse(u) => C::KeyUse(u.remap(v)),
+      C::KeyNameUse(u) => C::KeyNameUse(u.remap(v)),
+      C::ContentsLookup(d) => C::ContentsLookup(v(*d)),
+      C::LookupNameIn { key, dst } => C::LookupNameIn { key: v(*key), dst: v(*dst) },
       C::KeyHeritage(class, u) => C::KeyHeritage(*class, u.remap(v)),
       C::SubclassHeritage(u) => C::SubclassHeritage(u.remap(v)),
       C::ContextKeys(x) => C::ContextKeys(v(*x)),
@@ -793,6 +815,8 @@ pub struct Obj {
   /// The prototype object of a host builtin (`Map.prototype`): writing to it changes what the
   /// models assume.
   pub builtin_proto: bool,
+  /// For an array: what is stored under a key that may not be an index (`named_elem`).
+  pub named_elem: Option<VarId>,
 }
 
 #[derive(Default)]
@@ -805,6 +829,8 @@ pub struct Var {
   constraint_set: FxHashSet<Constraint>,
   delta: Vec<ObjId>,
   queued: bool,
+  /// Widened (`Analysis::widen`): it holds an opaque value instead of what flows in.
+  widened: bool,
 }
 
 #[expect(clippy::struct_excessive_bools, reason = "independent switches of the analysis")]
@@ -883,6 +909,20 @@ pub struct Analysis {
   pending_receivers: FxHashMap<ObjId, Vec<VarId>>,
   /// Class-related objects of each hole class: the class, its prototype, and their heirs.
   pub hole_related: FxHashMap<ObjId, ObjId>,
+  /// Objects escaped into effect's code, and into code the pass can't see (`escape`).
+  effect_escaped: FxHashSet<ObjId>,
+  genuine_escaped: FxHashSet<ObjId>,
+  /// Widening (`widen`): the set size past which a variable is widened, the boundary, the
+  /// number of variables widened, and how many variables the analysis starts with.
+  pub widen_limit: usize,
+  widened_class: Option<ObjId>,
+  pub widened_vars: usize,
+  init_vars: usize,
+  /// Diagnostic: what created each variable (`var_tag` at the time).
+  pub var_origin: Vec<&'static str>,
+  pub var_tag: &'static str,
+  tag_names: FxHashMap<std::mem::Discriminant<Constraint>, &'static str>,
+  clone_tags: FxHashMap<(ModuleIdx, u32), &'static str>,
   /// (result, receiver) pairs of method calls already joined (`typed_call`).
   typed_receivers: FxHashSet<(ObjId, ObjId)>,
   /// Each call's handed-values variable, translated for slots (`slot_in`).
@@ -1002,9 +1042,18 @@ pub struct Analysis {
   rule_memo: FxHashMap<(Site, ObjId), Call>,
   pub debug: bool,
   pub top_ext: ObjId,
+  /// A value type-modelled `effect` code made (direction 2's slot filler). It is `top_ext` in
+  /// every respect but one: in a key position it names only keys `effect` declares, since
+  /// effect's code never names a user key (`effect_keys`).
+  pub top_effect: ObjId,
   pub top_host: ObjId,
   pub prim: ObjId,
   pub all_keys: ObjId,
+  /// A key of unknown name that code the pass can't see made: lookups and provides through it
+  /// are as conservative as through `all_keys`, but handing it to type-modelled code bails
+  /// nothing, since unseen code does not reach services through the runtime (issue, "Code the
+  /// pass can't see").
+  pub unseen_keys: ObjId,
   pub ambient_context: ObjId,
   pub key_values: FxHashMap<ArcStr, VarId>,
   pub unknown_key_values: VarId,
@@ -1057,9 +1106,11 @@ impl Analysis {
     let mut objs: IndexVec<ObjId, Obj> = IndexVec::new();
     let mut alloc = |kind: ObjKind| objs.push(Obj::new(kind, None));
     let top_ext = alloc(ObjKind::Top(Flavour::Ext));
+    let top_effect = alloc(ObjKind::Top(Flavour::Ext));
     let top_host = alloc(ObjKind::Top(Flavour::Host));
     let prim = alloc(ObjKind::Prim);
     let all_keys = alloc(ObjKind::AllKeys);
+    let unseen_keys = alloc(ObjKind::AllKeys);
     let ambient_keys = vars.push(Var::default());
     let ambient_context = alloc(ObjKind::Context { keys: ambient_keys });
     let unknown_key_values = vars.push(Var::default());
@@ -1068,6 +1119,7 @@ impl Analysis {
     let done_values = vars.push(Var::default());
     let effect_key_values = vars.push(Var::default());
     let effect_key_strings = vars.push(Var::default());
+    let init_vars = vars.len();
     let mut this = Self {
       vars,
       objs,
@@ -1144,6 +1196,19 @@ impl Analysis {
       class_escaped: FxHashMap::default(),
       pending_receivers: FxHashMap::default(),
       hole_related: FxHashMap::default(),
+      effect_escaped: FxHashSet::default(),
+      genuine_escaped: FxHashSet::default(),
+      widen_limit: std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_WIDEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400),
+      widened_class: None,
+      widened_vars: 0,
+      init_vars,
+      var_origin: vec!["init"; init_vars],
+      var_tag: "gen",
+      tag_names: FxHashMap::default(),
+      clone_tags: FxHashMap::default(),
       prim_ty: None,
       hash_pool: None,
       json_pool: None,
@@ -1157,15 +1222,18 @@ impl Analysis {
       rule_memo: FxHashMap::default(),
       spread_any: FxHashMap::default(),
       clone_memo: FxHashMap::default(),
+
       clone_site_ids: FxHashMap::default(),
       clone_sites: vec![],
       rest_arrays: FxHashMap::default(),
       loads_by_name: FxHashMap::default(),
       debug: std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_DEBUG").is_some(),
       top_ext,
+      top_effect,
       top_host,
       prim,
       all_keys,
+      unseen_keys,
       ambient_context,
       key_values: FxHashMap::default(),
       unknown_key_values,
@@ -1198,6 +1266,7 @@ impl Analysis {
   // == construction
 
   pub fn var(&mut self) -> VarId {
+    self.var_origin.push(self.var_tag);
     self.vars.push(Var::default())
   }
 
@@ -1369,9 +1438,13 @@ impl Analysis {
     for dst in loads {
       self.copy(v, dst);
     }
-    let stores = self.objs[obj].unknown_stores.clone();
-    for src in stores {
-      self.copy(src, v);
+    // A store under an unknown key never writes one of effect's own members (`~effect/...`):
+    // only code naming that member does (`is_effect_member`).
+    if !is_effect_member(name) {
+      let stores = self.objs[obj].unknown_stores.clone();
+      for src in stores {
+        self.copy(src, v);
+      }
     }
     // Named loads that saw this object before the field existed.
     if let Some(waiting) = self.loads_by_name.get(name) {
@@ -1393,6 +1466,17 @@ impl Analysis {
     if let Some(f) = self.objs[obj].fields.get(name).copied() {
       self.copy(f, dst);
     }
+  }
+
+  /// An array's slot for stores under a key that may not be an index: a named read sees these,
+  /// not the elements (`arr.then` can only be set by a store that may name `then`).
+  pub fn named_elem(&mut self, obj: ObjId) -> VarId {
+    if let Some(v) = self.objs[obj].named_elem {
+      return v;
+    }
+    let v = self.var();
+    self.objs[obj].named_elem = Some(v);
+    v
   }
 
   pub fn elem(&mut self, obj: ObjId) -> VarId {
@@ -1471,11 +1555,95 @@ impl Analysis {
   // == edges and seeds
 
   pub fn seed(&mut self, var: VarId, obj: ObjId) {
+    if self.vars[var].widened && !self.opaque_class.contains_key(&obj) && !self.keeps_identity(obj)
+    {
+      let class = self.widen_class();
+      self.class_escape(obj, class, CLASS_WIDENED);
+      return;
+    }
     if self.vars[var].pts.insert(obj) {
       self.total_pts += 1;
       self.vars[var].delta.push(obj);
       self.enqueue(var);
+      if self.vars[var].pts.len() > self.widen_limit {
+        self.widen(var);
+      }
     }
+  }
+
+  /// Values a widened variable still holds as themselves: keys, classes and effect's key
+  /// constructors. There are few, and each may be or make a key: a lookup through one, a class
+  /// extending one, or a call of a key constructor must see what it is, so the opaque value
+  /// never stands for a key.
+  fn keeps_identity(&self, obj: ObjId) -> bool {
+    match self.objs[obj].kind {
+      ObjKind::Key { .. } | ObjKind::Class { .. } => true,
+      ObjKind::Builtin { rule, .. } => self.key_constructor(rule),
+      _ => false,
+    }
+  }
+
+  fn key_constructor(&self, rule: u16) -> bool {
+    ["effect:Context.Service", "effect:Context.Reference"]
+      .iter()
+      .any(|r| self.rule_id(r) == Some(rule))
+  }
+
+  /// A value made by code the pass does not analyse but that runs in this runtime: a class
+  /// hole's or a widened set's opaque value. It is never a key (`keeps_identity`, and
+  /// `class_escape` bails every key when class code holds a key constructor).
+  fn is_opaque(&self, obj: ObjId) -> bool {
+    self.opaque_class.contains_key(&obj)
+  }
+
+  /// The value of program code the pass does not follow (a hand-written thenable's settlement,
+  /// a property setter): the widening boundary's opaque value.
+  pub fn unfollowed(&mut self) -> ObjId {
+    let class = self.widen_class();
+    self.opaque(class)
+  }
+
+  /// The boundary widened values cross into (`widen`): an opaque value, as for a class hole.
+  fn widen_class(&mut self) -> ObjId {
+    if let Some(c) = self.widened_class {
+      return c;
+    }
+    let c = self.alloc(ObjKind::Object, None);
+    self.widened_class = Some(c);
+    self.opaque(c);
+    c
+  }
+
+  /// A variable whose set has grown past `widen_limit` stops tracking its values one by one.
+  /// They cross into an opaque boundary (`class_escape`, as values handed to code that runs in
+  /// this runtime but is not analysed): a service among them keeps every method, a key bails,
+  /// an Effect's success, a function's returns and an object's fields cross too, and functions
+  /// run with opaque arguments. The variable holds the boundary's opaque value instead, and
+  /// what arrives later crosses as it arrives. Reads, calls and stores through the opaque value
+  /// hand over what they are given and yield it again, so whatever consumes the variable stays
+  /// sound. The sets pruning reads after the solve (each key's providers, the analysis's own
+  /// roots) are never widened.
+  fn widen(&mut self, var: VarId) {
+    if var.index() < self.init_vars || self.key_values.values().any(|v| *v == var) {
+      return;
+    }
+    self.vars[var].widened = true;
+    self.widened_vars += 1;
+    let class = self.widen_class();
+    let (kept, objs): (FxHashSet<ObjId>, FxHashSet<ObjId>) =
+      std::mem::take(&mut self.vars[var].pts).into_iter().partition(|o| self.keeps_identity(*o));
+    self.total_pts -= objs.len() as u64;
+    self.vars[var].pts = kept;
+    let op = self.opaque(class);
+    for o in objs {
+      if o != op {
+        self.class_escape(o, class, CLASS_WIDENED);
+      }
+    }
+    self.vars[var].pts.insert(op);
+    self.total_pts += 1;
+    self.vars[var].delta.push(op);
+    self.enqueue(var);
   }
 
   pub fn copy(&mut self, src: VarId, dst: VarId) {
@@ -1745,6 +1913,27 @@ impl Analysis {
   }
 
   fn apply(&mut self, var: VarId, obj: ObjId, c: &Constraint) {
+    let saved = self.var_tag;
+    self.var_tag = self.constraint_tag(c);
+    self.apply_inner(var, obj, c);
+    self.var_tag = saved;
+  }
+
+  /// Diagnostic: the constraint kind, as a tag for the variables its handler creates.
+  fn constraint_tag(&mut self, c: &Constraint) -> &'static str {
+    let d = std::mem::discriminant(c);
+    if let Some(t) = self.tag_names.get(&d) {
+      return t;
+    }
+    let name = format!("{c:?}");
+    let name = name.split([' ', '(', '{']).next().unwrap_or("").to_string();
+    let t: &'static str = Box::leak(name.into_boxed_str());
+    self.tag_names.insert(d, t);
+    t
+  }
+
+  #[expect(clippy::too_many_lines, reason = "one dispatch over every constraint kind")]
+  fn apply_inner(&mut self, var: VarId, obj: ObjId, c: &Constraint) {
     if !self.stand_ins.is_empty() && self.stand_in_use(obj, c) {
       return;
     }
@@ -1752,20 +1941,31 @@ impl Analysis {
       Constraint::Load { key, dst } => self.load(obj, key, *dst),
       Constraint::Store { key, src } => self.store(obj, key, *src),
       Constraint::LoadThrough { base, dst } => self.load_through(obj, *base, *dst),
-      Constraint::StoreThrough { base, src } => self.store_through(obj, *base, *src),
+      Constraint::StoreThrough { base, src } => self.store_through(var, obj, *base, *src),
       Constraint::Call(call) => self.call(obj, call),
       Constraint::SuccessOf(dst) => self.success_of(obj, *dst),
       Constraint::FailureOf(dst) => self.failure_of(obj, *dst),
       Constraint::KeyUse(use_) => self.key_use(obj, use_),
+      Constraint::KeyNameUse(use_) => self.key_name_use(obj, use_),
+      Constraint::ContentsLookup(dst) => {
+        if matches!(self.objs[obj].kind, ObjKind::AllKeys) {
+          self.copy(self.effect_key_values, *dst);
+          self.copy(self.unknown_key_values, *dst);
+        } else {
+          self.key_use(obj, &KeyUse::Lookup(*dst));
+        }
+      }
       Constraint::KeyHeritage(class, use_) => self.key_heritage(obj, *class, use_),
       Constraint::SubclassHeritage(use_) => self.subclass_heritage(obj, use_),
       Constraint::ContextKeys(dst) => match self.objs[obj].kind {
         ObjKind::Context { keys } | ObjKind::Layer { keys } | ObjKind::Runtime { keys } => {
           self.copy(keys, *dst);
         }
-        ObjKind::Top(_) | ObjKind::Wrap(_) | ObjKind::Typed { .. } => {
-          self.seed(*dst, self.all_keys);
-        }
+        // A Context effect's code made holds effect's keys; one from unseen code, keys it made.
+        ObjKind::Wrap(_) | ObjKind::Typed { .. } => self.copy(self.effect_key_strings, *dst),
+        ObjKind::Top(_) if obj == self.top_effect => self.copy(self.effect_key_strings, *dst),
+        ObjKind::Top(Flavour::Host) => self.seed(*dst, self.all_keys),
+        ObjKind::Top(_) => self.seed(*dst, self.unseen_keys),
         ObjKind::Builtin { .. } if self.is_default(obj) => self.copy(self.effect_key_strings, *dst),
         _ => {}
       },
@@ -1887,9 +2087,13 @@ impl Analysis {
       },
       Constraint::MapKeys(dst) => match self.objs[obj].kind {
         ObjKind::Str(_) => self.seed(*dst, obj),
-        ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) | ObjKind::Typed { .. } => {
+        ObjKind::Wrap(_) | ObjKind::Typed { .. } => self.copy(self.effect_key_strings, *dst),
+        ObjKind::Top(_) if obj == self.top_effect => self.copy(self.effect_key_strings, *dst),
+        ObjKind::External { .. } if self.is_opaque(obj) => {}
+        ObjKind::Top(Flavour::Host) | ObjKind::External { flavour: Flavour::Host, .. } => {
           self.seed(*dst, self.all_keys);
         }
+        ObjKind::Top(_) | ObjKind::External { .. } => self.seed(*dst, self.unseen_keys),
         _ => {}
       },
       Constraint::Inherits(heir) => self.inherit(*heir, obj),
@@ -1911,14 +2115,37 @@ impl Analysis {
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
       Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
       Constraint::ServiceFree(dst) => self.service_free(obj, *dst),
+      // A thenable's `then` runs whoever made it: the thenable goes to that code, and the await
+      // settles with what it makes. Class code or a widened set (`opaque_class`) keeps it in its
+      // boundary, effect's code (`top_effect`, a summary) in effect's, anything else is code the
+      // pass can't see.
       Constraint::ThenableBail(thenable) => {
         if Self::callable_kind(&self.objs[obj].kind) && self.thenables_bailed.insert(*thenable) {
-          self.escape(*thenable, Flavour::Ext, None);
+          if let Some(&class) = self.opaque_class.get(&obj) {
+            self.class_escape(*thenable, class, CLASS_HANDED);
+          } else if obj == self.top_effect || matches!(self.objs[obj].kind, ObjKind::Typed { .. }) {
+            self.escape(*thenable, Flavour::Ext, Some(EFFECT_ESCAPE));
+          } else if matches!(self.objs[obj].kind, ObjKind::Top(_) | ObjKind::External { .. }) {
+            self.escape(*thenable, Flavour::Ext, None);
+          } else {
+            // A hand-written `then`: program code the pass does not follow.
+            let class = self.widen_class();
+            self.class_escape(*thenable, class, CLASS_UNFOLLOWED);
+          }
         }
       }
       Constraint::ThenableAwait(dst) => {
         if Self::callable_kind(&self.objs[obj].kind) {
-          self.seed(*dst, self.top_ext);
+          let t = if self.opaque_class.contains_key(&obj) {
+            obj
+          } else if obj == self.top_effect || matches!(self.objs[obj].kind, ObjKind::Typed { .. }) {
+            self.top_effect
+          } else if matches!(self.objs[obj].kind, ObjKind::Top(_) | ObjKind::External { .. }) {
+            self.top_ext
+          } else {
+            self.unfollowed()
+          };
+          self.seed(*dst, t);
         }
       }
       Constraint::TypedArg(slot, back, site, mask) => {
@@ -1932,13 +2159,25 @@ impl Analysis {
       Constraint::EscapeOut => match self.objs[obj].kind {
         ObjKind::Effect { success, .. } => self.constrain(success, Constraint::EscapeOut),
         ObjKind::Promise { value } => self.constrain(value, Constraint::EscapeOut),
-        _ => self.escape(obj, Flavour::Ext, None),
+        _ => self.escape(obj, Flavour::Ext, Some(EFFECT_ESCAPE)),
       },
       Constraint::TypedNested(slot, back, site, mask) => {
         self.typed_nested(obj, *slot, *back, *site, *mask);
       }
       Constraint::BailKeys => self.bail_keys(obj),
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
+      Constraint::LookupNameIn { key, dst } => {
+        if matches!(
+          self.objs[obj].kind,
+          ObjKind::Context { .. }
+            | ObjKind::Top(_)
+            | ObjKind::External { .. }
+            | ObjKind::Wrap(_)
+            | ObjKind::Typed { .. }
+        ) {
+          self.constrain(*key, Constraint::KeyNameUse(KeyUse::Lookup(*dst)));
+        }
+      }
       Constraint::EscapeReceiver(flavour, site, name) => {
         self.escape_receiver(obj, *flavour, *site, name);
       }
@@ -2020,18 +2259,41 @@ impl Analysis {
     }
   }
 
-  fn store_through(&mut self, key: ObjId, base: VarId, src: VarId) {
+  /// `obj[k] = v` for one value of `k`.
+  fn store_through(&mut self, key_var: VarId, key: ObjId, base: VarId, src: VarId) {
     let bases: Vec<ObjId> = self.vars[base].pts.iter().copied().collect();
     match self.objs[key].kind.clone() {
+      // A key computed from data never writes one of effect's members (`is_effect_member`):
+      // only a key that is exactly that member (a constant naming it) does.
+      ObjKind::Str(name) if is_effect_member(&name) && self.vars[key_var].pts.len() > 1 => {}
       ObjKind::Str(name) => {
+        let saved = std::mem::replace(&mut self.var_tag, "storethrough named");
         for b in bases {
           self.store_name(b, &name, src);
         }
+        self.var_tag = saved;
+      }
+      // A number indexes an array: its elements, not a name.
+      ObjKind::Num(_) => {
+        for b in bases {
+          if matches!(self.objs[b].kind, ObjKind::Array)
+            && self.objs[b].escaped.is_none()
+            && !self.class_escaped.contains_key(&b)
+            && !self.objs[b].builtin_proto
+          {
+            let elem = self.elem(b);
+            self.copy(src, elem);
+          } else {
+            self.store_unknown(b, src);
+          }
+        }
       }
       _ => {
+        let saved = std::mem::replace(&mut self.var_tag, "storethrough unknown");
         for b in bases {
           self.store_unknown(b, src);
         }
+        self.var_tag = saved;
       }
     }
   }
@@ -2065,7 +2327,13 @@ impl Analysis {
           }
         }
         self.read_field(obj, name, dst);
-        if let Some(elem) = self.objs[obj].elem {
+        if is_effect_member(name) {
+          // Only a store naming it writes one of effect's members (`is_effect_member`).
+        } else if matches!(self.objs[obj].kind, ObjKind::Array) && !is_index(name) {
+          // A named read on an array sees stores that may name it, not the elements.
+          let named = self.named_elem(obj);
+          self.copy(named, dst);
+        } else if let Some(elem) = self.objs[obj].elem {
           self.copy(elem, dst);
         }
         let sources = self.objs[obj].spread_from.clone();
@@ -2092,8 +2360,8 @@ impl Analysis {
         self.seed(dst, obj);
       }
       ObjKind::Typed { slot, .. } => self.typed_member(obj, slot, dst, Some(name)),
-      ObjKind::Top(flavour) => {
-        let t = if flavour == Flavour::Ext { self.top_ext } else { self.top_host };
+      ObjKind::Top(_) => {
+        let t = self.top_of(obj);
         self.seed(dst, t);
       }
       ObjKind::External { flavour, name: ref module } => {
@@ -2285,7 +2553,8 @@ impl Analysis {
           // reads through `prototype` see it.
         }
         if let Some(Flavour::Ext) = self.objs[obj].escaped {
-          self.constrain(src, Constraint::Escape(Flavour::Ext, None));
+          let site = (!self.genuine_escaped.contains(&obj)).then_some(EFFECT_ESCAPE);
+          self.constrain(src, Constraint::Escape(Flavour::Ext, site));
         }
         if let Some(&(class, _)) = self.class_escaped.get(&obj) {
           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
@@ -2339,7 +2608,8 @@ impl Analysis {
       | ObjKind::Namespace
       | ObjKind::Builtin { .. } => {
         if let Some(Flavour::Ext) = self.objs[obj].escaped {
-          self.constrain(src, Constraint::Escape(Flavour::Ext, None));
+          let site = (!self.genuine_escaped.contains(&obj)).then_some(EFFECT_ESCAPE);
+          self.constrain(src, Constraint::Escape(Flavour::Ext, site));
         }
         if let Some(&(class, _)) = self.class_escaped.get(&obj) {
           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
@@ -2349,11 +2619,20 @@ impl Analysis {
         let src = if self.admission { self.admitted_store(src) } else { src };
         let elem = self.elem(obj);
         self.copy(src, elem);
+        if matches!(self.objs[obj].kind, ObjKind::Array) {
+          let named = self.named_elem(obj);
+          self.copy(src, named);
+        }
         if !self.objs[obj].unknown_stores.contains(&src) {
           self.objs[obj].unknown_stores.push(src);
           self.recheck_tree(obj);
         }
-        let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
+        let fields: Vec<VarId> = self.objs[obj]
+          .fields
+          .iter()
+          .filter(|(n, _)| !is_effect_member(n))
+          .map(|(_, v)| *v)
+          .collect();
         for f in fields {
           self.copy(src, f);
         }
@@ -2467,6 +2746,8 @@ impl Analysis {
         }
         *self.rule_calls.entry(rule).or_default() += 1;
         let r = self.rules[rule as usize].1;
+        let saved_tag = self.var_tag;
+        self.var_tag = self.rules[rule as usize].0;
         // Fresh variables per position: later calls merge into them, never into the callers'
         // own variables (which may be shared literals).
         let this = this.map(|t| {
@@ -2500,6 +2781,18 @@ impl Analysis {
         };
         self.rule_memo.insert((call.site, callee), merged.clone());
         r(self, &merged);
+        self.var_tag = saved_tag;
+      }
+      // A function effect's code made runs effect's code: what it is handed goes there.
+      ObjKind::Top(_) if callee == self.top_effect => {
+        for a in &call.args {
+          let (Arg::Var(v) | Arg::Spread(v)) = a;
+          self.constrain(*v, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
+        }
+        if let Some(this) = call.this {
+          self.constrain(this, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
+        }
+        self.seed(call.ret, callee);
       }
       ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
         self.escape_args(call, flavour);
@@ -2599,12 +2892,23 @@ impl Analysis {
       info.enclosing_this,
     );
     let mut map: FxHashMap<VarId, VarId> = FxHashMap::default();
+    let tag = match self.clone_tags.get(&(module, span_start)) {
+      Some(t) => *t,
+      None => {
+        let t: &'static str =
+          Box::leak(format!("clone fn({}, {span_start})", module.raw()).into_boxed_str());
+        self.clone_tags.insert((module, span_start), t);
+        t
+      }
+    };
+    let saved_tag = std::mem::replace(&mut self.var_tag, tag);
     for v in own.iter().chain(&locals).chain(&params).chain(rest.iter()) {
       if !map.contains_key(v) {
         let nv = self.var();
         map.insert(*v, nv);
       }
     }
+    self.var_tag = saved_tag;
     let m = |v: VarId| *map.get(&v).unwrap_or(&v);
     let id = self.fns.next_idx();
     let mut tag = |site: Site| -> Site {
@@ -3109,7 +3413,7 @@ impl Analysis {
       self.seed(call.ret, self.top_host);
       return;
     }
-    let stand_in = self.top_ext;
+    let stand_in = self.top_effect;
     if self.debug {
       let e = self.typed_call_counts.entry((call.site.module.raw(), call.site.start)).or_default();
       e.0 += 1;
@@ -3146,7 +3450,7 @@ impl Analysis {
         let back = self.var();
         self.constrain(handed, Constraint::SlotIn(back, stand_in));
         // What the call hands back may be any service-free value it was handed (`admit_typed`).
-        self.seed(slot, self.top_ext);
+        self.seed(slot, self.top_effect);
         let r = self.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, Some(call.site));
         self.typed_results.insert(key, (r, handed));
         self.typed_backs.insert(handed, back);
@@ -3186,8 +3490,8 @@ impl Analysis {
     // A call the summary can't resolve (a method, or a value with no known signature) bails
     // the services it reaches: what it holds and is handed goes to unseen code.
     if sig.is_none() && !call.is_new {
-      self.constrain(slot, Constraint::Escape(Flavour::Ext, None));
-      self.constrain(handed, Constraint::Escape(Flavour::Ext, None));
+      self.constrain(slot, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
+      self.constrain(handed, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
     }
     // The module's container pool, used by calls whose declared shape may store into or read a
     // container. Calling a value an export returned (a data-last form) has that export's shape;
@@ -3216,7 +3520,7 @@ impl Analysis {
       let (stores, reads) = match shape {
         Some(s) => s,
         None => {
-          self.constrain(handed, Constraint::Escape(Flavour::Ext, None));
+          self.constrain(handed, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
           (false, true)
         }
       };
@@ -3632,13 +3936,17 @@ impl Analysis {
     }
     self.admission_stats.1 += 1;
     match self.objs[obj].kind {
-      ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
-        self.escape(obj, Flavour::Ext, None);
-      }
       // A summary, Effect or promise that holds no prunable service yet may come to hold one
       // (its slot, success or value grows): what it holds goes to unseen code as it arrives, so
       // a service reaching it later bails.
-      ObjKind::Typed { .. } | ObjKind::Wrap(_) => self.escape(obj, Flavour::Ext, None),
+      ObjKind::Object
+      | ObjKind::Array
+      | ObjKind::Closure(_)
+      | ObjKind::Builtin { .. }
+      | ObjKind::Typed { .. }
+      | ObjKind::Wrap(_) => {
+        self.escape(obj, Flavour::Ext, Some(EFFECT_ESCAPE));
+      }
       ObjKind::Effect { success, .. } => self.constrain(success, Constraint::EscapeOut),
       ObjKind::Promise { value } => self.constrain(value, Constraint::EscapeOut),
       _ => {}
@@ -3690,7 +3998,7 @@ impl Analysis {
     }
     let v = self.var();
     self.unknown_store_filters.insert(src, v);
-    self.seed(v, self.top_ext);
+    self.seed(v, self.top_effect);
     self.constrain(src, Constraint::AdmitTyped(v));
     v
   }
@@ -3728,6 +4036,42 @@ impl Analysis {
     keep.append(&mut self.deferred);
     self.deferred = keep;
     ran || tainted_any
+  }
+
+  /// Diagnostic: entries by what created the variables holding them, overall and for the
+  /// constraint-free one-copy relays and no-copy sinks.
+  pub fn origin_census(&self) -> String {
+    let mut all: FxHashMap<&str, (usize, usize)> = FxHashMap::default();
+    let mut relays: FxHashMap<&str, (usize, usize)> = FxHashMap::default();
+    let mut sinks: FxHashMap<&str, (usize, usize)> = FxHashMap::default();
+    for (v, var) in self.vars.iter_enumerated() {
+      let tag = self.var_origin.get(v.index()).copied().unwrap_or("?");
+      let n = var.pts.len();
+      let e = all.entry(tag).or_default();
+      e.0 += n;
+      e.1 += 1;
+      if var.constraints.is_empty() {
+        let m = match var.copies.len() {
+          0 => &mut sinks,
+          1 => &mut relays,
+          _ => continue,
+        };
+        let e = m.entry(tag).or_default();
+        e.0 += n;
+        e.1 += 1;
+      }
+    }
+    let top = |m: FxHashMap<&str, (usize, usize)>| -> Vec<String> {
+      let mut v: Vec<_> = m.into_iter().collect();
+      v.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+      v.iter().take(25).map(|(k, (n, c))| format!("{n} in {c} vars: {k}")).collect()
+    };
+    format!(
+      "by origin {:#?}; relays by origin {:#?}; sinks by origin {:#?}",
+      top(all),
+      top(relays),
+      top(sinks)
+    )
   }
 
   /// Debug census of the type model: pool sizes by module, the largest slots and what fills
@@ -4076,7 +4420,7 @@ impl Analysis {
     if !self.typed_args_seen.insert((obj, slot)) {
       return;
     }
-    let top = self.top_ext;
+    let top = self.top_effect;
     match self.objs[obj].kind.clone() {
       // What a call stores into a container goes to its module's pool (`typed_call`).
       ObjKind::Typed { .. } if self.is_stand_in(obj) => self.seed(slot, obj),
@@ -4227,9 +4571,9 @@ impl Analysis {
     }
     if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_TRACKED_CALLBACKS").is_none() {
       if mask != 0 {
-        self.constrain(slot, Constraint::Escape(Flavour::Ext, None));
+        self.constrain(slot, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
       }
-      self.escape(f, Flavour::Ext, None);
+      self.escape(f, Flavour::Ext, Some(EFFECT_ESCAPE));
       // What it returns may come back out of the call wrapped in an Effect or a promise (a
       // `decode` succeeding with a service): what those succeed with goes to unseen code too.
       if let ObjKind::Closure(fid) = self.objs[f].kind {
@@ -4321,6 +4665,7 @@ impl Analysis {
         let name = name.clone();
         self.never_prune.insert(name);
       }
+      ObjKind::AllKeys if obj == self.unseen_keys => {}
       ObjKind::AllKeys | ObjKind::Top(_) | ObjKind::External { .. } => {
         self.bail_everything("a key of unknown name is handed to type-modelled effect code");
       }
@@ -4338,9 +4683,9 @@ impl Analysis {
         self.typed_called_modules.insert(m);
       }
       if let Some(this) = call.this {
-        self.constrain(this, Constraint::Escape(Flavour::Ext, None));
+        self.constrain(this, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
       }
-      self.seed(call.ret, self.top_ext);
+      self.seed(call.ret, self.top_effect);
     } else if let ObjKind::Builtin { rule, .. } = self.objs[obj].kind
       && INERT_PROTOCOL_METHODS.contains(&self.rules[rule as usize].0)
     {
@@ -4769,7 +5114,7 @@ impl Analysis {
   }
 
   pub fn top_of(&self, obj: ObjId) -> ObjId {
-    if self.opaque_class.contains_key(&obj) {
+    if self.opaque_class.contains_key(&obj) || obj == self.top_effect {
       return obj;
     }
     match self.objs[obj].kind {
@@ -4894,7 +5239,7 @@ impl Analysis {
 
   pub fn key_use(&mut self, obj: ObjId, use_: &KeyUse) {
     match self.objs[obj].kind.clone() {
-      ObjKind::Key { strings, .. } => self.constrain(strings, Constraint::KeyUse(use_.clone())),
+      ObjKind::Key { strings, .. } => self.constrain(strings, Constraint::KeyNameUse(use_.clone())),
       ObjKind::Class { heritage, .. } => {
         // A class is a key only through its heritage (`key_heritage`): a plain class with a
         // `key` field names no service.
@@ -4914,6 +5259,20 @@ impl Analysis {
         }
         KeyUse::Strings(dst) => self.seed(*dst, obj),
       },
+      // A key unseen code made names no key the program named (unseen code does not reach the
+      // program's services through the runtime): a lookup through it finds what was provided
+      // under keys of unknown name, or under effect's own keys.
+      ObjKind::AllKeys if obj == self.unseen_keys => match use_ {
+        KeyUse::Lookup(dst) => {
+          self.copy(self.unknown_key_values, *dst);
+          self.copy(self.effect_key_values, *dst);
+        }
+        KeyUse::Provide(src) => {
+          self.provide_sources.insert(*src);
+          self.copy(*src, self.unknown_key_values);
+        }
+        KeyUse::Strings(dst) => self.seed(*dst, obj),
+      },
       ObjKind::AllKeys => match use_ {
         KeyUse::Lookup(dst) => self.copy(self.all_values, *dst),
         KeyUse::Provide(src) => {
@@ -4922,22 +5281,44 @@ impl Analysis {
         }
         KeyUse::Strings(dst) => self.seed(*dst, obj),
       },
-      ObjKind::Object => {
-        // A key-shaped literal (`{ key: "x" }`): its `key` field names the key.
-        let field = self.field(obj, &ArcStr::from("key"));
-        self.constrain(field, Constraint::KeyUse(use_.clone()));
-        // Without a known `key` field the lookup is unknown.
-        if self.vars[field].pts.is_empty() {
-          self.key_use(self.all_keys, use_);
-        }
+      // A key is read through its `key` property (a hand-made `{ key: "..." }` works at run
+      // time): a record, array or function names the keys its `key` field holds.
+      ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Namespace => {
+        let key = self.field(obj, &ArcStr::from("key"));
+        self.constrain(key, Constraint::KeyNameUse(use_.clone()));
       }
       ObjKind::Wrap(inner) => self.constrain(inner, Constraint::KeyUse(use_.clone())),
-      // A type-modelled value used as a key: which key is unknown.
-      ObjKind::Typed { .. } => self.key_use(self.all_keys, use_),
-      _ => {
-        // Anything else in a key position: an unknown key.
-        let all = self.all_keys;
-        self.key_use(all, use_);
+      // A key effect's code made (a summary, or `top_effect`): a key factory such as
+      // `HttpApiMiddleware.Service()("id")` takes its name from the program, so the name is
+      // unknown here, and it is read as a key made where the pass can't see. What is provided
+      // through it is kept whole.
+      // (Read by the last arm, with `top_effect`.)
+      // Values class code or a widened set made are never keys (`is_opaque`); a default-modelled
+      // export names one of effect's keys.
+      ObjKind::External { .. } if self.is_opaque(obj) => {}
+      ObjKind::Builtin { .. } if self.is_default(obj) => {
+        self.constrain(self.effect_key_strings, Constraint::KeyUse(use_.clone()));
+      }
+      // Effects, promises, containers, builtins and primitives have no `key` of their own: a
+      // key is an object (by the public types). A primitive as a key's *name* is an unknown
+      // name (`key_name_use`).
+      ObjKind::Effect { .. }
+      | ObjKind::Promise { .. }
+      | ObjKind::Iterator(_)
+      | ObjKind::Context { .. }
+      | ObjKind::Layer { .. }
+      | ObjKind::Runtime { .. }
+      | ObjKind::Fiber
+      | ObjKind::MemoMap
+      | ObjKind::Builtin { .. }
+      | ObjKind::Num(_)
+      | ObjKind::Prim
+      | ObjKind::Top(Flavour::Host) => {}
+      // A value from code the pass can't see in a key position, or a key effect's code made:
+      // a key made where the pass can't see.
+      ObjKind::Typed { .. } | ObjKind::Top(_) | ObjKind::External { .. } => {
+        let unseen = self.unseen_keys;
+        self.key_use(unseen, use_);
       }
     }
   }
@@ -4958,13 +5339,28 @@ impl Analysis {
   fn key_heritage(&mut self, base: ObjId, class: ObjId, use_: &KeyUse) {
     match self.objs[base].kind.clone() {
       ObjKind::Key { strings, .. } => {
-        self.constrain(strings, Constraint::KeyUse(use_.clone()));
+        self.constrain(strings, Constraint::KeyNameUse(use_.clone()));
         self.own_key_use(class, use_);
       }
       ObjKind::Class { heritage: Some(h), .. } => {
         self.constrain(h, Constraint::SubclassHeritage(use_.clone()));
       }
-      ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) | ObjKind::Typed { .. } => {
+      // A class extending a type-modelled value may extend a key effect's code made from a
+      // name the program passed (`HttpApiMiddleware.Service()("id")`): a key of unknown name,
+      // read as one made where the pass can't see.
+      ObjKind::Typed { .. } => {
+        let unseen = self.unseen_keys;
+        self.key_use(unseen, use_);
+      }
+      // Nor is a value class code or a widened set made (`is_opaque`).
+      ObjKind::External { .. } if self.is_opaque(base) => {}
+      ObjKind::Top(_) | ObjKind::Wrap(_)
+        if base == self.top_effect || matches!(self.objs[base].kind, ObjKind::Wrap(_)) =>
+      {
+        let unseen = self.unseen_keys;
+        self.key_use(unseen, use_);
+      }
+      ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => {
         self.key_use(base, use_);
         self.own_key_use(class, use_);
       }
@@ -4990,20 +5386,66 @@ impl Analysis {
         self.constrain(h, Constraint::SubclassHeritage(use_.clone()));
         false
       }
-      ObjKind::Key { .. } | ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => true,
+      ObjKind::External { .. } if self.is_opaque(base) => false,
+      ObjKind::Typed { .. } => {
+        let unseen = self.unseen_keys;
+        self.key_use(unseen, use_);
+        false
+      }
+      // A class extending a value effect's code or a default-modelled export made may share one
+      // of effect's keys (effect's code never names a user key).
+      ObjKind::Top(_) | ObjKind::Wrap(_)
+        if base == self.top_effect || matches!(self.objs[base].kind, ObjKind::Wrap(_)) =>
+      {
+        let unseen = self.unseen_keys;
+        self.key_use(unseen, use_);
+        false
+      }
+      // A subclass of a key class shares that key (the key is inherited): it names that key, not
+      // every key.
+      ObjKind::Key { .. } => {
+        self.key_use(base, use_);
+        false
+      }
+      ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => true,
       ObjKind::Builtin { .. } => self.is_default(base),
       _ => false,
     };
     if possible_key {
-      let all = self.all_keys;
-      self.key_use(all, use_);
+      // Heritage from code the pass can't see: a key that code may have made.
+      let unseen = self.unseen_keys;
+      self.key_use(unseen, use_);
     }
   }
 
   /// A key class's own `key` field (`static key = "..."`) names its key.
   fn own_key_use(&mut self, class: ObjId, use_: &KeyUse) {
     let own = self.field(class, &ArcStr::from("key"));
-    self.constrain(own, Constraint::KeyUse(use_.clone()));
+    self.constrain(own, Constraint::KeyNameUse(use_.clone()));
+  }
+
+  /// A key's name (`Constraint::KeyNameUse`): a string names that key; a primitive or host
+  /// value a key the program named at run time (any key); a value from code the pass can't see,
+  /// a key that code made (`unseen_keys`); one effect's code made, one of effect's keys. Any
+  /// other value is no name: effect's maps are keyed by the name string, which a record, array,
+  /// function or opaque value never equals.
+  fn key_name_use(&mut self, obj: ObjId, use_: &KeyUse) {
+    match self.objs[obj].kind {
+      ObjKind::Str(_) | ObjKind::AllKeys => self.key_use(obj, use_),
+      ObjKind::Top(_) if obj == self.top_effect => {
+        self.constrain(self.effect_key_strings, Constraint::KeyUse(use_.clone()));
+      }
+      ObjKind::Num(_) | ObjKind::Prim | ObjKind::Top(Flavour::Host) => {
+        let all = self.all_keys;
+        self.key_use(all, use_);
+      }
+      ObjKind::External { .. } if self.is_opaque(obj) => {}
+      ObjKind::Top(_) | ObjKind::External { .. } => {
+        let unseen = self.unseen_keys;
+        self.key_use(unseen, use_);
+      }
+      _ => {}
+    }
   }
 
   /// Iteration: array elements, or the unknown-key slot of a record used as an iterable.
@@ -5057,9 +5499,11 @@ impl Analysis {
         self.seed(dst, t);
       }
       // A container handed to an API without a model: what it may hand back are the services
-      // of its keys. Reads on them are then recorded as demand, like any lookup.
+      // of its keys. Reads on them are then recorded as demand, like any lookup. That code is
+      // effect's, which names no user key: through keys it does not know (the ambient
+      // Context's), it reaches effect's keys and those provided under names unknown to the pass.
       ObjKind::Context { keys } | ObjKind::Layer { keys } | ObjKind::Runtime { keys } => {
-        self.constrain(keys, Constraint::KeyUse(KeyUse::Lookup(dst)));
+        self.constrain(keys, Constraint::ContentsLookup(dst));
       }
       _ => {}
     }
@@ -5109,7 +5553,9 @@ impl Analysis {
         if let Some(proto) = self.objs[obj].proto {
           self.constrain(proto, again);
         }
+        let saved = std::mem::replace(&mut self.var_tag, "walk holder");
         let this = self.holder(obj);
+        self.var_tag = saved;
         // The protocol walk passes each method what the host or Effect passes it: the current
         // Context to Redactable, Node's inspector arguments to `[util.inspect.custom]`, and a
         // primitive to the rest.
@@ -5171,14 +5617,16 @@ impl Analysis {
     site: Site,
     ret: VarId,
   ) -> VarId {
+    let saved = std::mem::replace(&mut self.var_tag, "walk method");
     let method = self.var();
     self.constrain(this, Constraint::Load { key: Key::Name(ArcStr::from(name)), dst: method });
-    let result = self.var();
+    self.var_tag = saved;
+    // The result goes straight to `ret`: a variable of its own would only relay it there.
     let call = Call {
       site: site.sub(method),
       this: Some(this),
       args: vec![Arg::Var(arg); arity],
-      ret: result,
+      ret,
       is_new: false,
       builtin: None,
     };
@@ -5187,7 +5635,6 @@ impl Analysis {
     } else {
       self.constrain(method, Constraint::Call(Box::new(call)));
     }
-    self.copy(result, ret);
     method
   }
 
@@ -5394,6 +5841,10 @@ impl Analysis {
       }
       // Class code can yield a key it holds: the key bails.
       ObjKind::Key { strings, .. } => self.constrain(strings, Constraint::BailKeys),
+      // Class code holding effect's key constructor can make keys of any name.
+      ObjKind::Builtin { rule, .. } if self.key_constructor(rule) => {
+        self.bail_everything("class code holds a key constructor, which can make keys of any name");
+      }
       ObjKind::Effect { success, .. } => self.constrain(success, esc),
       ObjKind::Promise { value } | ObjKind::Wrap(value) => self.constrain(value, esc),
       ObjKind::Typed { slot, export } => {
@@ -5592,8 +6043,23 @@ impl Analysis {
 
   /// A value handed to code the pass cannot see.
   pub fn escape(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>) {
-    if self.objs[obj].escaped.is_some() {
+    // An escape into effect's code runs once; one into code the pass can't see runs once too,
+    // even after the first (it hands over more: values from unseen code may be anything).
+    let into_effect = flavour == Flavour::Ext && site == Some(EFFECT_ESCAPE);
+    if into_effect {
+      if self.objs[obj].escaped.is_some() || !self.effect_escaped.insert(obj) {
+        return;
+      }
+    } else if self.objs[obj].escaped.is_some()
+      && !(flavour == Flavour::Ext
+        && self.effect_escaped.contains(&obj)
+        && self.objs[obj].escaped == Some(Flavour::Ext)
+        && self.genuine_escaped.insert(obj))
+    {
       return;
+    }
+    if !into_effect && flavour == Flavour::Ext {
+      self.genuine_escaped.insert(obj);
     }
     self.objs[obj].escaped = Some(flavour);
     self.recheck_tree(obj);
@@ -5620,8 +6086,9 @@ impl Analysis {
         let elem = self.elem(obj);
         self.constrain(elem, Constraint::Escape(flavour, site));
         if external {
-          // Fields written from outside may hold anything.
-          self.seed(elem, self.top_ext);
+          // Fields written from outside may hold anything (what effect's code made, for it).
+          let top = if into_effect { self.top_effect } else { self.top_ext };
+          self.seed(elem, top);
           if !self.objs[obj].unknown_stores.contains(&elem) {
             self.objs[obj].unknown_stores.push(elem);
             self.recheck_tree(obj);
@@ -5687,7 +6154,11 @@ impl Analysis {
       let i = &self.fns[f];
       (i.params.clone(), i.rest, i.this, i.ret)
     };
-    let t = if flavour == Flavour::Ext { self.top_ext } else { self.top_host };
+    let t = match flavour {
+      Flavour::Ext if site == Some(EFFECT_ESCAPE) => self.top_effect,
+      Flavour::Ext => self.top_ext,
+      Flavour::Host => self.top_host,
+    };
     for p in params {
       self.seed(p, t);
     }
@@ -5728,6 +6199,7 @@ impl Obj {
       site,
       protocols: 0,
       builtin_proto: false,
+      named_elem: None,
     }
   }
 }
@@ -5761,4 +6233,18 @@ fn function_prototype_rule(a: &Analysis, name: &str) -> Option<u16> {
 /// A call site no source position has, for the protocol calls of host formatting.
 fn protocol_site(n: u32) -> Site {
   Site { module: ModuleIdx::from_raw(0), start: u32::MAX - 16 - n, sub: 0 }
+}
+
+/// A canonical array index (`"0"`, `"12"`): a read by this name reads an element.
+fn is_index(name: &str) -> bool {
+  !name.is_empty()
+    && name.bytes().all(|b| b.is_ascii_digit())
+    && (name == "0" || !name.starts_with('0'))
+}
+
+/// One of effect's own members (`~effect/Context/Service` and the other type ids): written
+/// only by code that names it, never by a store under a key computed from data. Effect's type
+/// ids are internal names; program data and code the pass can't see do not produce them.
+fn is_effect_member(name: &str) -> bool {
+  name.starts_with("~effect/")
 }

@@ -658,6 +658,12 @@ impl LinkStage<'_> {
 
     let solved = start.elapsed();
     phase!("solved: {}", a.histogram());
+    if report_enabled || debug {
+      eprintln!(
+        "[effect-service-shaking] widened {} variables past {} values",
+        a.widened_vars, a.widen_limit
+      );
+    }
     // Tim's class rule: a service that reaches class code keeps every method.
     if !a.bail_all {
       let bailed = a.class_bail();
@@ -780,6 +786,7 @@ impl LinkStage<'_> {
           id.rsplit_once("/dist/").map_or(id, |(_, f)| f).to_string()
         };
         eprintln!("[effect-service-shaking] type census: {}", a.typed_census(&names));
+        eprintln!("[effect-service-shaking] origin census: {}", a.origin_census());
       }
       for (file, name, key) in &constructors {
         eprintln!("[effect-service-shaking] service constructor {file}#{name} -> {key}");
