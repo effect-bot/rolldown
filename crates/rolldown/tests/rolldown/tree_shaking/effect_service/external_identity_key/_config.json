@@ -1,0 +1,13 @@
+{
+  "_comment": "A key handed to an external module comes back as the module's return value and is used for a lookup: unseen code may return the key it was handed, so the lookup reaches Store's implementation and its read counts. Store's unread method and Other's still prune.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": [
+      "./late.js"
+    ]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

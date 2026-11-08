@@ -1,0 +1,10 @@
+{
+  "_comment": "A key-shaped object among more values than the pass tracks one by one is widened to the opaque boundary; a lookup through it still reaches Store's implementation, so its read counts. Other's unread method prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
