@@ -214,6 +214,41 @@ impl LinkStage<'_> {
       ));
       return;
     }
+    // == declarations: `effect`'s modules are modelled from the `.d.ts` next to each (design
+    // principle 11). Without them there is nothing to model `effect` by, so one warning says
+    // which declaration is missing or unreadable and every method is kept. Nothing else reads
+    // `effect`'s bodies instead.
+    let is_effect_module = |idx: ModuleIdx| match &self.module_table.modules[idx] {
+      Module::Normal(normal) => normal
+        .originative_resolved_id
+        .package_json
+        .as_ref()
+        .is_some_and(|pkg| pkg.name() == Some("effect")),
+      Module::External(_) => false,
+    };
+    let declarations = |idx: ModuleIdx| {
+      self.module_table[idx]
+        .id()
+        .as_str()
+        .strip_suffix(".js")
+        .map(|js| std::path::PathBuf::from(format!("{js}.d.ts")))
+    };
+    for module in order.iter().copied().filter(|m| is_effect_module(*m)) {
+      let id = self.module_table[module].id().as_str();
+      let problem = match declarations(module) {
+        None => Some(format!("`{id}` has no `.d.ts` declarations")),
+        Some(dts) if !dts.is_file() => Some(format!("`{}` is missing", dts.display())),
+        Some(dts) => std::fs::read_to_string(&dts)
+          .err()
+          .map(|err| format!("`{}` can't be read ({err})", dts.display())),
+      };
+      if let Some(problem) = problem {
+        self.warn_effect_service_shaking(format!(
+          "`effect`'s declarations are needed to model it, and {problem}; every method is kept"
+        ));
+        return;
+      }
+    }
     let mut modelled: FxHashSet<ModuleIdx> = public_modules.iter().map(|(m, _)| *m).collect();
     for (module, specs) in &public_modules {
       for (name, export) in &self.metas[*module].resolved_exports {
@@ -227,93 +262,71 @@ impl LinkStage<'_> {
     // == type-modelled library modules (design section 11): every other module of the `effect`
     // package, the listed modules' unlisted exports included, is modelled from its `.d.ts`
     // instead of its body. Its exports are `ObjKind::Typed` values; its body is not generated.
-    // Opt-in while the engine is incomplete: `ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL=1`.
     let mut typed_modules: FxHashSet<ModuleIdx> = FxHashSet::default();
-    let type_model = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL").is_some();
-    let is_effect_module = |idx: ModuleIdx| match &self.module_table.modules[idx] {
-      Module::Normal(normal) => normal
-        .originative_resolved_id
-        .package_json
-        .as_ref()
-        .is_some_and(|pkg| pkg.name() == Some("effect")),
-      Module::External(_) => false,
-    };
     // Service constructors (Tim's decision on NodeFileSystem, option (b)): exports whose `.d.ts`
     // takes an implementation and returns the shape of a key declared in `effect`, or an Effect
     // or Layer of it, found by type (`Dts::constructed_shapes`). Their modules are analysed as
     // ordinary code, so the default methods they build count as reads, together with the
     // internal modules they import (helpers with no public types to summarise, such as
     // `internal/glob.js` behind `FileSystem.make`). Everything else they reach is type-modelled.
-    a.admission = type_model;
     let mut constructors: Vec<(String, ArcStr, String)> = vec![];
     let mut constructor_keys: Vec<(ArcStr, ModuleIdx)> = vec![];
     let mut analysed: FxHashSet<ModuleIdx> = FxHashSet::default();
-    if type_model {
-      for module in order.iter().copied().filter(|m| is_effect_module(*m) && !modelled.contains(m))
-      {
-        let Some(js) = self.module_table[module].id().as_str().strip_suffix(".js") else {
-          continue;
-        };
-        let dts = std::path::PathBuf::from(format!("{js}.d.ts"));
-        if !dts.exists() {
-          continue;
-        }
-        for (name, _) in self.sorted_exports(module) {
-          for (iface, local) in a.dts.constructed_shapes(&dts, name.as_str()) {
-            let Some(target) = iface
-              .to_str()
-              .and_then(|p| p.strip_suffix(".d.ts"))
-              .map(|p| format!("{p}.js"))
-              .and_then(|p| {
-                order.iter().copied().find(|m| self.module_table[*m].id().as_str() == p)
-              })
-            else {
-              continue;
-            };
-            let Some(export) = self.metas[target].resolved_exports.get(local.as_str()) else {
-              continue;
-            };
-            let key = self
-              .alias_chain(export.symbol_ref)
-              .into_iter()
-              .find_map(|sym| self.key_declaration_of(sym).map(|k| (k, sym.owner)));
-            let Some(((Some(key_name), _), owner)) = key else { continue };
-            if !is_effect_module(owner) {
-              continue;
-            }
-            let file = self.module_table[module].id().as_str();
-            let file = file.rsplit_once("/dist/").map_or(file, |(_, f)| f).to_string();
-            // Diagnostic only: leave matching constructor modules type-modelled.
-            if std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_SKIP_CONSTRUCTOR")
-              .is_ok_and(|v| !v.is_empty() && file.contains(v.as_str()))
-            {
-              continue;
-            }
-            constructors.push((file, name.clone(), key_name.clone()));
-            if !constructor_keys.iter().any(|(k, _)| k.as_str() == key_name) {
-              constructor_keys.push((ArcStr::from(key_name.as_str()), owner));
-            }
-            analysed.insert(module);
-            analysed.insert(owner);
+    for module in order.iter().copied().filter(|m| is_effect_module(*m) && !modelled.contains(m)) {
+      let dts = declarations(module).expect("checked with the declarations");
+      for (name, _) in self.sorted_exports(module) {
+        for (iface, local) in a.dts.constructed_shapes(&dts, name.as_str()) {
+          let Some(target) = iface
+            .to_str()
+            .and_then(|p| p.strip_suffix(".d.ts"))
+            .map(|p| format!("{p}.js"))
+            .and_then(|p| order.iter().copied().find(|m| self.module_table[*m].id().as_str() == p))
+          else {
+            continue;
+          };
+          let Some(export) = self.metas[target].resolved_exports.get(local.as_str()) else {
+            continue;
+          };
+          let key = self
+            .alias_chain(export.symbol_ref)
+            .into_iter()
+            .find_map(|sym| self.key_declaration_of(sym).map(|k| (k, sym.owner)));
+          let Some(((Some(key_name), _), owner)) = key else { continue };
+          if !is_effect_module(owner) {
+            continue;
           }
+          let file = self.module_table[module].id().as_str();
+          let file = file.rsplit_once("/dist/").map_or(file, |(_, f)| f).to_string();
+          // Diagnostic only: leave matching constructor modules type-modelled.
+          if std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_SKIP_CONSTRUCTOR")
+            .is_ok_and(|v| !v.is_empty() && file.contains(v.as_str()))
+          {
+            continue;
+          }
+          constructors.push((file, name.clone(), key_name.clone()));
+          if !constructor_keys.iter().any(|(k, _)| k.as_str() == key_name) {
+            constructor_keys.push((ArcStr::from(key_name.as_str()), owner));
+          }
+          analysed.insert(module);
+          analysed.insert(owner);
         }
       }
-      let helpers: Vec<ModuleIdx> = analysed
-        .iter()
-        .filter_map(|m| match &self.module_table.modules[*m] {
-          Module::Normal(n) => Some(n),
-          Module::External(_) => None,
-        })
-        .flat_map(|n| n.ecma_view.import_records.iter().filter_map(|r| r.resolved_module))
-        .filter(|t| {
-          is_effect_module(*t)
-            && !modelled.contains(t)
-            && self.module_table[*t].id().as_str().contains("/internal/")
-        })
-        .collect();
-      analysed.extend(helpers);
     }
-    for module in order.iter().copied().filter(|_| type_model) {
+    let helpers: Vec<ModuleIdx> = analysed
+      .iter()
+      .filter_map(|m| match &self.module_table.modules[*m] {
+        Module::Normal(n) => Some(n),
+        Module::External(_) => None,
+      })
+      .flat_map(|n| n.ecma_view.import_records.iter().filter_map(|r| r.resolved_module))
+      .filter(|t| {
+        is_effect_module(*t)
+          && !modelled.contains(t)
+          && self.module_table[*t].id().as_str().contains("/internal/")
+      })
+      .collect();
+    analysed.extend(helpers);
+    for module in order.iter().copied() {
       if is_effect_module(module) && !modelled.contains(&module) && !analysed.contains(&module) {
         typed_modules.insert(module);
         modelled.insert(module);
@@ -357,12 +370,7 @@ impl LinkStage<'_> {
                   continue;
                 }
                 if typed_modules.contains(&module) {
-                  let dts = self.module_table[module]
-                    .id()
-                    .as_str()
-                    .strip_suffix(".js")
-                    .map(|js| std::path::PathBuf::from(format!("{js}.d.ts")))
-                    .filter(|p| p.exists());
+                  let dts = declarations(module).expect("checked with the declarations");
                   let obj = a.typed_export(dts, name.clone(), module);
                   for (i, sym) in chain.into_iter().enumerate() {
                     let claim = match bind_rank.get(&sym) {

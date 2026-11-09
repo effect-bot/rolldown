@@ -250,9 +250,8 @@ async fn check(name: &str) {
 /// 1. The real `NodeFileSystem` with only `readFile` used, reached through
 /// `yield*`, `Effect.map`/`flatMap`, `Context.get` and `Effect.service`.
 /// The 31 unused property names are pinned in `expect.json`, including names
-/// that survive elsewhere in the bundle. Run this same test in a separate
-/// process with `ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL=1` to guard that
-/// type-modelled Effect modules preserve the constructor's pruning.
+/// that survive elsewhere in the bundle. Type-modelled Effect modules must
+/// preserve the constructor's pruning.
 #[tokio::test]
 async fn node_file_system() {
   check("node_file_system").await;

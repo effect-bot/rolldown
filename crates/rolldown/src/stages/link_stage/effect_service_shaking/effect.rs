@@ -9,8 +9,10 @@
 //! `effect:default`, which is sound by construction: callbacks receive every
 //! argument-derived value, and the result yields the same. It never hands out a
 //! Fiber or Context: only the rules of the stable APIs that do produce them.
-//! Every other module, inside `effect` or not, is analysed as ordinary code
-//! (design section 3).
+//! Every other module of `effect` is modelled from its `.d.ts` (design
+//! principle 11), except the service constructors' modules and their internal
+//! helpers. Those, and every module outside `effect`, are analysed as ordinary
+//! code (design section 3).
 
 #![expect(clippy::many_single_char_names, reason = "rules are small closures over `a` and `c`")]
 

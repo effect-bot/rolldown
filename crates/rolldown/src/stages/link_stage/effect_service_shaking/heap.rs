@@ -75,7 +75,7 @@ pub const NO_EXPORT: u32 = u32::MAX;
 
 /// An export of a type-modelled `effect` module: its `.d.ts` (if any), export name and module.
 pub struct TypedExport {
-  pub dts: Option<std::path::PathBuf>,
+  pub dts: std::path::PathBuf,
   pub name: ArcStr,
   pub module: ModuleIdx,
 }
@@ -1000,9 +1000,6 @@ pub struct Analysis {
   live_code: FxHashSet<ObjId>,
   /// Admission counters for the report: admitted, held back, tainted stand-ins.
   pub admission_stats: (u64, u64, u64),
-  /// Direction 2's admission lever on the protocol walks, host adoption and unknown-key stores.
-  /// On with the type model (`ROLLDOWN_EFFECT_SERVICE_SHAKING_TYPEMODEL=1`), which is opt-in.
-  pub admission: bool,
   /// What awaiting each summary gives (`AwaitOf` on a `Wrap`).
   awaited_wraps: FxHashMap<ObjId, VarId>,
   /// Each adopted object's `then` (`adopt`).
@@ -1201,7 +1198,6 @@ impl Analysis {
       live_code: FxHashSet::default(),
       live_never_prune: 0,
       admission_stats: (0, 0, 0),
-      admission: false,
       typed_args_seen: FxHashSet::default(),
       typed_backs: FxHashMap::default(),
       typed_receivers: FxHashSet::default(),
@@ -2122,7 +2118,7 @@ impl Analysis {
           // bails (`adopt`). An object that can't reach a callable has no callable `then`, so
           // its adoption waits until it may (direction 2's admission lever).
           self.seed(*dst, obj);
-          if !self.admission || self.reaches_code(obj) {
+          if self.reaches_code(obj) {
             self.adopt(obj, *dst);
           } else {
             self.deferred.push(Deferred::Adopt(obj, *dst));
@@ -2693,10 +2689,10 @@ impl Analysis {
         self.taint_by(obj, &format!("store {name}"));
       }
       // A value written onto a summary joins what it holds through the admission filter.
-      ObjKind::Typed { slot: inner, .. } if self.admission => {
+      ObjKind::Typed { slot: inner, .. } => {
         self.constrain(src, Constraint::AdmitTyped(inner));
       }
-      ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => self.copy(src, inner),
+      ObjKind::Wrap(inner) => self.copy(src, inner),
       // The only writable public member of a container is `ManagedRuntime.cachedContext`: the
       // Context written there provides its services. Other writes don't type check, so they
       // store nothing.
@@ -2737,7 +2733,7 @@ impl Analysis {
         }
         // Direction 2's admission lever: a value stored under an unknown name reaches every
         // field, so only what may hold a service flows as itself; the rest is stood for.
-        let src = if self.admission { self.admitted_store(src) } else { src };
+        let src = self.admitted_values(src);
         let elem = self.elem(obj);
         self.copy(src, elem);
         if matches!(self.objs[obj].kind, ObjKind::Array) {
@@ -2766,10 +2762,10 @@ impl Analysis {
       }
       ObjKind::Typed { .. } if self.is_stand_in(obj) => self.taint_by(obj, "unknown store"),
       // A value written onto a summary joins what it holds through the admission filter.
-      ObjKind::Typed { slot: inner, .. } if self.admission => {
+      ObjKind::Typed { slot: inner, .. } => {
         self.constrain(src, Constraint::AdmitTyped(inner));
       }
-      ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => self.copy(src, inner),
+      ObjKind::Wrap(inner) => self.copy(src, inner),
       ObjKind::Context { .. }
       | ObjKind::Layer { .. }
       | ObjKind::Runtime { .. }
@@ -3338,7 +3334,7 @@ impl Analysis {
   /// analysed; calls take their flow from its `.d.ts` signature (`typed_call`).
   pub fn typed_export(
     &mut self,
-    dts: Option<std::path::PathBuf>,
+    dts: std::path::PathBuf,
     name: ArcStr,
     module: ModuleIdx,
   ) -> ObjId {
@@ -3357,9 +3353,9 @@ impl Analysis {
     }
     let outer = self.typed_sig(origin.0, origin.1);
     let e = &self.typed_exports[origin.0 as usize];
-    let sig = match (&e.dts, outer) {
-      (Some(dts), Some(outer)) => {
-        let (dts, name) = (dts.clone(), e.name.clone());
+    let sig = match outer {
+      Some(outer) => {
+        let (dts, name) = (e.dts.clone(), e.name.clone());
         self.dts.returned_call(&dts, &name, origin.1, nargs).map(
           |(b, ret, (generic, rest_generic), masks)| {
             let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
@@ -3377,7 +3373,7 @@ impl Analysis {
           },
         )
       }
-      _ => None,
+      None => None,
     };
     self.returned_sigs.insert((origin, nargs), sig.clone());
     sig
@@ -3391,31 +3387,16 @@ impl Analysis {
       return Some(sig.clone());
     }
     let e = &self.typed_exports[export as usize];
-    let sig = match &e.dts {
-      Some(dts) => {
-        let (dts, name) = (dts.clone(), e.name.clone());
-        let b = self.dts.bounds(&dts, &name, nargs);
-        let ret = self.dts.ret_shape(&dts, &name, nargs);
-        let (stores, reads) = self.dts.container_shape(&dts, &name, nargs);
-        let (generic, rest_generic) =
-          self.dts.generic_positions(&dts, &name, nargs).unwrap_or((vec![true; nargs], true));
-        let masks =
-          self.dts.callback_masks(&dts, &name, nargs).unwrap_or_else(|| vec![0xFF; nargs]);
-        let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
-        let rest = b.rest.map(|t| self.intern_ty(t));
-        TypedSig { params, rest, ret, stores, reads, generic, rest_generic, masks }
-      }
-      None => TypedSig {
-        params: vec![],
-        rest: None,
-        ret: super::dts::RetShape { unknown: true, ..Default::default() },
-        stores: true,
-        reads: true,
-        generic: vec![true; nargs],
-        rest_generic: true,
-        masks: vec![0xFF; nargs],
-      },
-    };
+    let (dts, name) = (e.dts.clone(), e.name.clone());
+    let b = self.dts.bounds(&dts, &name, nargs);
+    let ret = self.dts.ret_shape(&dts, &name, nargs);
+    let (stores, reads) = self.dts.container_shape(&dts, &name, nargs);
+    let (generic, rest_generic) =
+      self.dts.generic_positions(&dts, &name, nargs).unwrap_or((vec![true; nargs], true));
+    let masks = self.dts.callback_masks(&dts, &name, nargs).unwrap_or_else(|| vec![0xFF; nargs]);
+    let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
+    let rest = b.rest.map(|t| self.intern_ty(t));
+    let sig = TypedSig { params, rest, ret, stores, reads, generic, rest_generic, masks };
     self.typed_sigs.insert((export, nargs), sig.clone());
     Some(sig)
   }
@@ -3470,8 +3451,7 @@ impl Analysis {
         let names = match self.method_only.get(&m) {
           Some(s) => std::rc::Rc::clone(s),
           None => {
-            let path =
-              self.typed_exports.iter().find(|e| e.module == m).and_then(|e| e.dts.clone());
+            let path = self.typed_exports.iter().find(|e| e.module == m).map(|e| e.dts.clone());
             let set =
               std::rc::Rc::new(path.map(|p| self.dts.method_only_names(&p)).unwrap_or_default());
             self.method_only.insert(m, std::rc::Rc::clone(&set));
@@ -4030,7 +4010,7 @@ impl Analysis {
     if let Some(b) = self.methods_store.get(&m) {
       return *b;
     }
-    let path = self.typed_exports.iter().find(|e| e.module == m).and_then(|e| e.dts.clone());
+    let path = self.typed_exports.iter().find(|e| e.module == m).map(|e| e.dts.clone());
     let b = path.is_none_or(|p| self.dts.methods_store(&p));
     self.methods_store.insert(m, b);
     b
@@ -4105,15 +4085,8 @@ impl Analysis {
   /// every field, so only what may hold a prunable service flows as itself; anything else goes
   /// to unseen code (`admit_typed`), and the fields hold `top_ext` for it: reading one back is
   /// reading a value from unseen code, and a service written into it later bails.
-  /// What a host builtin that copies structure hands out from `src` (direction 2's lever on
-  /// builtin copies, with the type model on): the values that may hold a prunable service as
-  /// themselves, the rest sent to unseen code and stood for by `top_ext` (`admitted_store`).
-  /// Without the type model, `src` itself.
+  /// Host builtins that copy structure hand out values through the same filter.
   pub fn admitted_values(&mut self, src: VarId) -> VarId {
-    if self.admission { self.admitted_store(src) } else { src }
-  }
-
-  fn admitted_store(&mut self, src: VarId) -> VarId {
     if let Some(v) = self.unknown_store_filters.get(&src) {
       return *v;
     }
@@ -5633,8 +5606,7 @@ impl Analysis {
   fn walk(&mut self, obj: ObjId, walk: Walk, pool: VarId, arg: VarId, site: Site) {
     // Direction 2's admission lever: a value that reaches no callable has no protocol method to
     // call and holds no service, so walking it reads nothing. Its walk waits until it may.
-    if self.admission
-      && matches!(self.objs[obj].kind, ObjKind::Object | ObjKind::Array)
+    if matches!(self.objs[obj].kind, ObjKind::Object | ObjKind::Array)
       && !self.walked.contains(&(pool, obj))
       && !self.reaches_code(obj)
     {
@@ -5746,11 +5718,7 @@ impl Analysis {
       is_new: false,
       builtin: None,
     };
-    if self.admission {
-      self.constrain(method, Constraint::ProtocolCall(Box::new(call)));
-    } else {
-      self.constrain(method, Constraint::Call(Box::new(call)));
-    }
+    self.constrain(method, Constraint::ProtocolCall(Box::new(call)));
     method
   }
 
@@ -6071,10 +6039,7 @@ impl Analysis {
       return true;
     }
     let e = &self.typed_exports[export as usize];
-    match &e.dts {
-      Some(dts) => self.dts.generic_positions(dts, &e.name, 0).is_some(),
-      None => true,
-    }
+    self.dts.generic_positions(&e.dts, &e.name, 0).is_some()
   }
 
   /// `Constraint::ClassRef`: a class body references the binding holding `obj`, through `path`.

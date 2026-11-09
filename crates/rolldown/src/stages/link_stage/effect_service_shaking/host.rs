@@ -186,7 +186,7 @@ fn descriptor_accessors(a: &mut Analysis, desc: ObjId, values: VarId, site: Site
 }
 
 /// The values an enumeration of the objects in `o` hands out: every field, through the
-/// admission filter with the type model on (`Analysis::admitted_values`).
+/// admission filter (`Analysis::admitted_values`).
 fn enumerated(a: &mut Analysis, o: VarId) -> VarId {
   a.constrain(o, Constraint::Enumerate);
   let values = a.var();
