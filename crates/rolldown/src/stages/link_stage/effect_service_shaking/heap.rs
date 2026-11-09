@@ -6418,4 +6418,57 @@ mod tests {
     assert!(widened_lookup(keyed, true, false), "object before widening");
     assert!(widened_lookup(keyed, false, false), "object after widening");
   }
+
+  /// An object crosses into program code the pass does not follow first, then joins a set that
+  /// widens past a limit of two values. Its `key` is a runtime name, either from the start or
+  /// written through the original alias after widening (the field is new then). Each step is
+  /// solved before the next, so the widening finds the object already crossed.
+  fn crossed_then_widened(late_write: bool) -> bool {
+    let mut a = Analysis::new();
+    a.widen_limit = 2;
+    let provided = a.alloc(ObjKind::Object, None);
+    let store = a.key_value_var(&ArcStr::from("test/Store"));
+    a.seed(store, provided);
+    let obj = a.alloc(ObjKind::Object, None);
+    if !late_write {
+      let key = a.field(obj, &ArcStr::from("key"));
+      a.seed(key, a.top_host);
+    }
+    let alias = a.var();
+    a.seed(alias, obj);
+    let class = a.unfollowed_class();
+    a.constrain(alias, Constraint::ClassEscape(class, CLASS_UNFOLLOWED));
+    a.solve();
+    let set = a.var();
+    a.seed(set, obj);
+    for i in 0..3 {
+      let name = a.str(&format!("test/Other{i}"));
+      a.seed(set, name);
+    }
+    a.solve();
+    assert!(a.vars[set].widened, "the set widens");
+    if late_write {
+      let src = a.var();
+      a.seed(src, a.top_host);
+      a.constrain(alias, Constraint::Store { key: Key::Name(ArcStr::from("key")), src });
+      a.solve();
+    }
+    let dst = a.var();
+    a.constrain(set, Constraint::KeyUse(KeyUse::Lookup(dst)));
+    a.solve();
+    a.pts(dst).contains(&provided)
+  }
+
+  /// Widening reads a runtime name as any key's even in an object that crossed another class
+  /// boundary first: the name it already holds.
+  #[test]
+  fn crossed_then_widened_held_runtime_name_names_any_key() {
+    assert!(crossed_then_widened(false));
+  }
+
+  /// The same, for a runtime name written through the original alias after widening.
+  #[test]
+  fn crossed_then_widened_late_runtime_name_names_any_key() {
+    assert!(crossed_then_widened(true));
+  }
 }
