@@ -12,9 +12,22 @@
 //! fixture: every build and the run of its `_test.mjs`. The limit is
 //! `ROLLDOWN_TEST_EFFECT_FIXTURE_TIME_LIMIT_MS` in milliseconds,
 //! [`DEFAULT_TIME_LIMIT_MS`] when unset. `0` disables it. The slowest fixture
-//! takes about 0.6 s in a parallel run of the suite on a 16-core host.
+//! takes about 0.7 s in a parallel run of the suite on a 16-core host.
+//!
+//! The limit is a deadline, not a measurement taken afterwards. A hung
+//! analysis blocks its thread and a hung `_test.mjs` blocks the wait for
+//! Node, so nothing inside the test's own process can stop them. Instead the
+//! test runs the fixture again in a child process, the same test binary
+//! filtered to the same test ([`run_in_child`]). The child is the leader of
+//! a new process group, which Node and anything it starts join, and the
+//! parent kills the whole group at the deadline.
 
-use std::time::Duration;
+use std::{
+  fs::File,
+  process::{Command, ExitStatus, Stdio},
+  sync::atomic::{AtomicU64, Ordering},
+  time::{Duration, Instant},
+};
 
 /// Entries budget (points-to and copy entries) for a fixture's analysis.
 pub const MAX_ENTRIES: u64 = 100_000;
@@ -23,6 +36,9 @@ pub const MAX_ENTRIES: u64 = 100_000;
 pub const DEFAULT_TIME_LIMIT_MS: u64 = 2_000;
 
 const TIME_LIMIT_ENV: &str = "ROLLDOWN_TEST_EFFECT_FIXTURE_TIME_LIMIT_MS";
+
+/// Set in the child process that runs one fixture for its parent.
+const CHILD_ENV: &str = "ROLLDOWN_TEST_EFFECT_FIXTURE_CHILD";
 
 /// The time limit from the environment, `None` when disabled.
 pub fn time_limit() -> Option<Duration> {
@@ -35,31 +51,68 @@ pub fn time_limit() -> Option<Duration> {
   (ms > 0).then(|| Duration::from_millis(ms))
 }
 
-/// Why the fixture `name` failed its time limit, if it did.
-pub fn over_time_limit(name: &str, elapsed: Duration, limit: Option<Duration>) -> Option<String> {
-  let limit = limit?;
-  (elapsed > limit).then(|| {
-    format!(
-      "{name} took {:.2} s, over the {:.2} s limit for an Effect service fixture ({TIME_LIMIT_ENV})",
-      elapsed.as_secs_f64(),
-      limit.as_secs_f64()
-    )
-  })
+/// Whether this process is the child that runs one fixture ([`run_in_child`]).
+pub fn is_child() -> bool {
+  std::env::var_os(CHILD_ENV).is_some()
 }
 
-#[cfg(test)]
-mod tests {
-  use std::time::Duration;
+/// Runs the fixture `name` by running the libtest test `test` of this binary in a
+/// child process, and panics with the child's output if the test fails or is still running at
+/// `limit`. At the deadline the child and every process it started are killed first.
+pub fn run_in_child(name: &str, test: &str, limit: Duration) {
+  static NEXT: AtomicU64 = AtomicU64::new(0);
+  let log_path = std::env::temp_dir().join(format!(
+    "rolldown-effect-fixture-{}-{}.log",
+    std::process::id(),
+    NEXT.fetch_add(1, Ordering::Relaxed)
+  ));
+  let log = File::create(&log_path).expect("failed to create the fixture's log file");
+  let mut command = Command::new(std::env::current_exe().expect("no path to the test binary"));
+  command
+    .args([test, "--exact", "--test-threads=1"])
+    .env(CHILD_ENV, "1")
+    .stdin(Stdio::null())
+    .stdout(log.try_clone().expect("failed to share the fixture's log file"))
+    .stderr(log);
+  let started = Instant::now();
+  let status = run_with_deadline(command, limit);
+  let output = std::fs::read_to_string(&log_path).unwrap_or_default();
+  let _ = std::fs::remove_file(&log_path);
+  match status {
+    Some(status) if status.success() && output.contains(" 1 passed;") => {}
+    Some(status) => panic!("{name} failed in its child process ({status}):\n{output}"),
+    None => panic!(
+      "{name} did not finish within the {:.2} s time limit for an Effect service fixture \
+       ({TIME_LIMIT_ENV}); stopped it and its child processes after {:.2} s. Its output:\n{output}",
+      limit.as_secs_f64(),
+      started.elapsed().as_secs_f64(),
+    ),
+  }
+}
 
-  use super::over_time_limit;
-
-  #[test]
-  fn fails_only_past_the_limit() {
-    let limit = Some(Duration::from_secs(2));
-    assert_eq!(over_time_limit("f", Duration::from_millis(1_999), limit), None);
-    assert_eq!(over_time_limit("f", Duration::from_secs(2), limit), None);
-    let message = over_time_limit("f", Duration::from_millis(2_500), limit).unwrap();
-    assert!(message.starts_with("f took 2.50 s, over the 2.00 s limit"), "{message}");
-    assert_eq!(over_time_limit("f", Duration::from_secs(60), None), None);
+/// Runs `command` as the leader of a new process group and waits for it until `limit`
+/// has passed. Returns its exit status, or `None` when the deadline came first; then the
+/// whole group has been killed.
+pub fn run_with_deadline(mut command: Command, limit: Duration) -> Option<ExitStatus> {
+  #[cfg(unix)]
+  std::os::unix::process::CommandExt::process_group(&mut command, 0);
+  let mut child = command.spawn().expect("failed to start the fixture's process");
+  let deadline = Instant::now() + limit;
+  loop {
+    if let Some(status) = child.try_wait().expect("failed to wait for the fixture's process") {
+      return Some(status);
+    }
+    if Instant::now() >= deadline {
+      // The group's id is the leader's pid; a negative pid signals the whole group.
+      #[cfg(unix)]
+      let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stderr(Stdio::null())
+        .status();
+      let _ = child.kill();
+      let _ = child.wait();
+      return None;
+    }
+    std::thread::sleep(Duration::from_millis(5));
   }
 }

@@ -84,9 +84,7 @@ impl Fixture {
     }))
     .collect::<Vec<_>>();
 
-    // The Effect service analysis runs in this process; cap its memory so a
-    // runaway fails the run instead of exhausting the host. See `memory_guard`.
-    // It also has a time limit (`effect_fixture`).
+    // Fixtures that run the Effect service analysis get a time limit and a memory cap.
     let effect_fixture = configs
       .iter()
       .any(|config| {
@@ -101,17 +99,23 @@ impl Fixture {
         let name = self.fixture_path.strip_prefix(workspace).unwrap_or(&self.fixture_path);
         name.to_string_lossy().into_owned()
       });
-    let _memory_guard = effect_fixture.clone().map(memory_guard::guard);
-
-    let started = std::time::Instant::now();
-    IntegrationTest::new(meta, self.fixture_path.clone()).run_multiple(configs, plugins).await;
-    if let Some(name) = effect_fixture {
-      if let Some(failure) =
-        effect_fixture::over_time_limit(&name, started.elapsed(), effect_fixture::time_limit())
+    // The time limit is enforced from outside: the fixture runs in a child process that is
+    // killed at the deadline (`effect_fixture::run_in_child`). libtest names each test's thread
+    // after the test, which is how the child finds this test again.
+    if let Some(name) = &effect_fixture {
+      let test = std::thread::current().name().map(ToString::to_string);
+      if let (false, Some(limit), Some(test)) =
+        (effect_fixture::is_child(), effect_fixture::time_limit(), test)
       {
-        panic!("{failure}");
+        effect_fixture::run_in_child(name, &test, limit);
+        return;
       }
     }
+    // The analysis runs in this process; cap its memory so a runaway fails the run instead of
+    // exhausting the host. See `memory_guard`.
+    let _memory_guard = effect_fixture.map(memory_guard::guard);
+
+    IntegrationTest::new(meta, self.fixture_path.clone()).run_multiple(configs, plugins).await;
   }
 
   fn apply_extended_tests(
@@ -217,7 +221,9 @@ mod tests {
     match rx.recv_timeout(bound) {
       Ok(Some(message)) => message,
       Ok(None) => panic!("the hung fixture passed"),
-      Err(_) => panic!("the hung fixture was still running {} s after it started", bound.as_secs()),
+      Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+        panic!("the hung fixture was still running {} s after it started", bound.as_secs())
+      }
     }
   }
 
