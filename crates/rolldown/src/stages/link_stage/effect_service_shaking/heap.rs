@@ -925,6 +925,8 @@ pub struct Analysis {
   /// number of variables widened, and how many variables the analysis starts with.
   pub widen_limit: usize,
   widened_class: Option<ObjId>,
+  /// The boundary of program code the pass does not follow (`unfollowed`).
+  unfollowed_class: Option<ObjId>,
   pub widened_vars: usize,
   init_vars: usize,
   /// Diagnostic: what created each variable (`var_tag` at the time).
@@ -1216,6 +1218,7 @@ impl Analysis {
         .and_then(|v| v.parse().ok())
         .unwrap_or(400),
       widened_class: None,
+      unfollowed_class: None,
       widened_vars: 0,
       init_vars,
       var_origin: vec!["init"; init_vars],
@@ -1432,17 +1435,22 @@ impl Analysis {
   /// A value crossed a boundary (unseen code, effect's code, a host builtin, class code or a
   /// widened set): if it is a key or a key's name, a key from that boundary may be it, since
   /// code there may hand back what it was given. Values inside it cross on their own (fields,
-  /// heritage), so only keys and strings are read here. Runs once per object, whatever the
-  /// flavour or the order of escapes.
-  fn hand_key(&mut self, obj: ObjId) {
-    if !matches!(self.objs[obj].kind, ObjKind::Str(_) | ObjKind::Key { .. })
-      || !self.handed.insert(obj)
-    {
-      return;
-    }
+  /// prototype, heritage), so only keys and names are read here; each is recorded once, whatever
+  /// the flavour or the order of escapes.
+  ///
+  /// A host value may be a string only known at run time (`process.env.X`), which may name any
+  /// key. `any_name` is set for the widening boundary: the widened set holds that value, and a
+  /// lookup by its opaque element must still see every key. Code the pass can't see or doesn't
+  /// follow may produce any string itself, so a host value handed there is not read as a name:
+  /// keys come back from it only as the keys and names it was handed. A host value that is a
+  /// number or another primitive never equals a key's name (effect's maps are keyed by the name).
+  fn hand_key(&mut self, obj: ObjId, any_name: bool) {
     match self.objs[obj].kind.clone() {
-      ObjKind::Str(_) => self.hand_name(obj),
-      ObjKind::Key { strings, .. } => self.constrain(strings, Constraint::HandName),
+      ObjKind::Top(Flavour::Host) if any_name => self.hand_all(),
+      ObjKind::Str(_) if self.handed.insert(obj) => self.hand_name(obj),
+      ObjKind::Key { strings, .. } if self.handed.insert(obj) => {
+        self.constrain(strings, Constraint::HandName);
+      }
       _ => {}
     }
   }
@@ -1651,13 +1659,17 @@ impl Analysis {
     }
   }
 
-  /// Values a widened variable still holds as themselves: keys, classes and effect's key
-  /// constructors. There are few, and each may be or make a key: a lookup through one, a class
+  /// Values a widened variable still holds as themselves: keys, classes, effect's key
+  /// constructors and names that may be any key's (a host value, `process.env.X`, or every key
+  /// name). There are few, and each may be or make or name a key: a lookup through one, a class
   /// extending one, or a call of a key constructor must see what it is, so the opaque value
-  /// never stands for a key.
+  /// never stands for a key or an unknown name.
   fn keeps_identity(&self, obj: ObjId) -> bool {
     match self.objs[obj].kind {
-      ObjKind::Key { .. } | ObjKind::Class { .. } => true,
+      ObjKind::Key { .. }
+      | ObjKind::Class { .. }
+      | ObjKind::Top(Flavour::Host)
+      | ObjKind::AllKeys => true,
       ObjKind::Builtin { rule, .. } => self.key_constructor(rule),
       _ => false,
     }
@@ -1678,10 +1690,23 @@ impl Analysis {
   }
 
   /// The value of program code the pass does not follow (a hand-written thenable's settlement,
-  /// a property setter): the widening boundary's opaque value.
+  /// a property setter): an opaque value, as for a class hole.
   pub fn unfollowed(&mut self) -> ObjId {
-    let class = self.widen_class();
+    let class = self.unfollowed_class();
     self.opaque(class)
+  }
+
+  /// The boundary of program code the pass does not follow. It is apart from the widening
+  /// boundary, which alone reads a host value handed to it as a name that may be any key's
+  /// (`hand_key`).
+  fn unfollowed_class(&mut self) -> ObjId {
+    if let Some(c) = self.unfollowed_class {
+      return c;
+    }
+    let c = self.alloc(ObjKind::Object, None);
+    self.unfollowed_class = Some(c);
+    self.opaque(c);
+    c
   }
 
   /// The boundary widened values cross into (`widen`): an opaque value, as for a class hole.
@@ -2210,7 +2235,7 @@ impl Analysis {
             self.escape(*thenable, Flavour::Ext, None);
           } else {
             // A hand-written `then`: program code the pass does not follow.
-            let class = self.widen_class();
+            let class = self.unfollowed_class();
             self.class_escape(*thenable, class, CLASS_UNFOLLOWED);
           }
         }
@@ -5869,7 +5894,7 @@ impl Analysis {
   /// it holds runs with its opaque value as arguments and `this`, and an Effect it holds runs.
   /// Each object crosses once, whatever other flavour it escaped with before.
   pub fn class_escape(&mut self, obj: ObjId, class: ObjId, how: u8) {
-    self.hand_key(obj);
+    self.hand_key(obj, Some(class) == self.widened_class);
     if self.class_escaped.contains_key(&obj) {
       return;
     }
@@ -6124,10 +6149,10 @@ impl Analysis {
 
   /// A value handed to code the pass cannot see.
   pub fn escape(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>) {
-    self.hand_key(obj);
     // An escape into effect's code runs once; one into code the pass can't see runs once too,
     // even after the first (it hands over more: values from unseen code may be anything).
     let into_effect = flavour == Flavour::Ext && site == Some(EFFECT_ESCAPE);
+    self.hand_key(obj, false);
     if into_effect {
       if self.objs[obj].escaped.is_some() || !self.effect_escaped.insert(obj) {
         return;
