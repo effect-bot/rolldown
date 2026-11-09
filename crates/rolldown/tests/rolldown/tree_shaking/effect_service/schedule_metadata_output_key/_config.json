@@ -1,0 +1,10 @@
+{
+  "_comment": "Schedule.CurrentMetadata's output, read by the next attempt of Effect.repeat, is a string naming a method of a service the program holds. The service is never a Schedule input or output, only the scalar is: the named method stays and the bundle runs. The Schedule's output is not tracked (assumption 4), so it is an unknown scalar and the computed read keeps every method of the key. Guards that untracked Schedule metadata keeps scalar keys.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
