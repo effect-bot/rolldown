@@ -1,0 +1,11 @@
+{
+  "_comment": "Structural keys ({ key } records) whose names are only known at run time (process.env) are handed to an external module and handed back: one holds its name when handed over, one is given its key after the handover. The returned value is the program's own key object, so each lookup should reach the service's implementation and the read method should stay; a literal-named structural key is the control (green). Red, pending Tim's decision: a runtime name in a structural key's key field is excluded like a bare runtime name string today, and covering it makes the Stripe gate 0% smaller. Handing keys over bails nothing, so the unread methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./late.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
