@@ -1,5 +1,5 @@
 {
-  "_comment": "Values a public parameter type admits must reach the parameter whatever shape the analysis sees: a service passed as Option.match's handlers object, a handlers object whose `onSome` comes from its prototype, a handlers object whose `onSome` is replaced by a store in a function that runs earlier at run time but later in the analysis, and an Effect passed where Deferred.complete expects an Effect. Each read method stays; each service's unread method is removed. Guards a type-bound filter.",
+  "_comment": "Values a public parameter type admits must reach the parameter whatever shape the analysis sees: a service passed as Option.match's handlers object, a handlers object whose `onSome` comes from its prototype, a handlers object whose `onSome` is replaced by a store in a function that runs earlier at run time but later in the analysis, and an Effect passed where Deferred.complete expects an Effect. Each read method stays; each service's unread method is removed, except the Handlers service's, which is handed as Option.match's options object and so has every member read (the options-object rule), and Inherited's (the class rule). Guards a type-bound filter.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

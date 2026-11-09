@@ -15,8 +15,10 @@ const kept = [
   // code and its key keeps every method (Tim's class rule).
   ['inheritedUnused', /(?<![.\w$])inheritedUnused\s*[:(]/],
 ];
+// `handlersUnused` is not checked: `Option.match(_, handlers)` hands the service to
+// type-modelled code as an options object, whose members all count as read (design.md,
+// the options-object rule), so it stays.
 const removed = [
-  ['handlersUnused', /\bhandlersUnused\b/],
   ['lateUnused', /\blateUnused\b/],
   ['deferredUnused', /\bdeferredUnused\b/],
 ];

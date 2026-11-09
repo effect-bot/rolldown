@@ -1,5 +1,5 @@
 {
-  "_comment": "Two records from two once-only top-level literals in one array; the program provides boxes[0] as an unrelated Config service and passes boxes[1], holding only a string, to a Schedule whose callback calls the method of a captured service the string names. Array reads merge the elements, so each record may be the provided one, but only boxes[0] is: the named method stays, the unread one is removed and the bundle runs. Guards that the Schedule input filter drops only definite services.",
+  "_comment": "Two records from two once-only top-level literals in one array; the program provides boxes[0] as an unrelated Config service and passes boxes[1], holding only a string, to a Schedule whose callback calls the method of a captured service the string names. The named method stays and the bundle runs. Guards that a record that may be a provided value still names a method. The unread one is not checked: Schedule.fromStep's step is a callback handed to type-modelled code and runs with unknown arguments, so the computed read through its input is an unknown key and keeps every method (accepted imprecision; the pass no longer steps a Schedule). (Before the deletion it guarded that the Schedule input filter dropped only definite services; that filter is gone.)",
   "config": {
     "experimental": {
       "effectServiceShaking": true

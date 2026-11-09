@@ -5,7 +5,9 @@ import * as Effect from 'effect/Effect';
 import * as Layer from 'effect/Layer';
 import * as Schedule from 'effect/Schedule';
 // Each record has a distinct, once-only top-level allocation site.
-// Only boxes[0] is provided; boxes[1] is a service-free Schedule input.
+// Only boxes[0] is provided; boxes[1] is a service-free Schedule input. The
+// method its string names stays and the bundle runs. The other may stay: the
+// step runs with an unknown input, so the read is an unknown key.
 const Config = Context.Service('test/ArrayProvidedConfig');
 const Store = Context.Service('test/ArrayProvidedStore');
 const boxes = [{ key: 'config' }, { key: 'arrayUsed' }];

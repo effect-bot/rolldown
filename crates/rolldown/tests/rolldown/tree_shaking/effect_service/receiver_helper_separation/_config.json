@@ -1,5 +1,5 @@
 {
-  "_comment": "One method that closes over `this` passes it to a helper and returns a field; it returns the Table service on one receiver, which is compared structurally (every method stays), and the Store service on the other, which reads one method: that method stays, the unread one is removed.",
+  "_comment": "One method that closes over `this` passes it to a helper and returns a field; it returns the Table service on one receiver, which is compared structurally, and the Store service on the other, which reads one method: that method stays, the unread one is removed. Structural equality demands nothing (design principle 9), so the comparison's result is not checked and the Table's methods are not required to stay.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

@@ -8,8 +8,9 @@ import * as Schedule from 'effect/Schedule';
 // first is provided as an unrelated Config service; the second, holding only
 // a string, is the Schedule's input, and its callback calls the method of a
 // captured service that the string names. Only the first record is a
-// service, so the second may enter the Schedule: the named method stays and
-// the other is removed.
+// service, so the second may enter the Schedule: the named method stays. The
+// other may stay: the step runs with an unknown input, so the read is an
+// unknown key.
 const Config = Context.Service('test/SharedAllocationConfig');
 const Store = Context.Service('test/SharedAllocationStore');
 const boxes = ['config', 'sharedUsed'].map((key) => ({ key }));

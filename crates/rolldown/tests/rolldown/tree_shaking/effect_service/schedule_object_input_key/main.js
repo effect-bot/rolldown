@@ -6,8 +6,9 @@ import * as Layer from 'effect/Layer';
 import * as Schedule from 'effect/Schedule';
 // A Schedule's only input is a plain object holding a string, and its callback
 // calls the method of a captured service that the string names. The object
-// holds no service, so the Schedule may receive it: the named method stays and
-// the other is removed.
+// holds no service, so the Schedule may receive it: the named method stays. The
+// other may stay: the step runs with an unknown input, so the read is an
+// unknown key.
 const Store = Context.Service('test/ScheduleObjectInputStore');
 const calls = [];
 const program = Effect.gen(function* () {

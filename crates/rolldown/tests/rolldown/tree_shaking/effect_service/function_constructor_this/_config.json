@@ -1,5 +1,5 @@
 {
-  "_comment": "`new` on a function constructor returns the object its body writes through `this` (a user `function Box`, and `Option.some`, which is built that way); the methods read through them stay, the unread one is removed.",
+  "_comment": "`new` on a function constructor returns the object its body writes through `this` (a user `function Box`, and `Option.some`, which is built that way); the methods read through them stay and the unread Box method is removed. The Option.some service's unread method is not checked: a record handed to type-modelled code at a type parameter's position has every member read (the options-object rule), so it stays.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

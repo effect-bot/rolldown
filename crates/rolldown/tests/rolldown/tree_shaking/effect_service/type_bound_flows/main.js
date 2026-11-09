@@ -11,7 +11,9 @@ import * as Option from 'effect/Option';
 // Effect passed where Deferred.complete expects an Effect. Each read method
 // stays; each service's unread method is removed, except Inherited's: the class
 // whose prototype supplies `onSome` closes over that service, so it reaches class
-// code and its key keeps every method.
+// code and its key keeps every method. Handlers' unread method may stay too: the
+// service is the handlers object, and an options object's members all count as
+// read.
 const Handlers = Context.Service('test/BoundHandlers');
 const Inherited = Context.Service('test/BoundInherited');
 const Late = Context.Service('test/BoundLate');

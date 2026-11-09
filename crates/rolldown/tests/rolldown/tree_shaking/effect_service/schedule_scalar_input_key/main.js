@@ -7,7 +7,8 @@ import * as Schedule from 'effect/Schedule';
 // The Schedule's only input is the string "used", and its callback uses that
 // string as the name of a method on the service it closes over. The service is
 // never a Schedule input, output or Done value: only the scalar is. So the
-// method the string names is read and stays; the other is removed.
+// method the string names is read and stays. The other may stay: the step runs
+// with an unknown input, so the read is an unknown key.
 const Store = Context.Service('test/ScheduleScalarInputStore');
 const calls = [];
 const program = Effect.gen(function* () {
