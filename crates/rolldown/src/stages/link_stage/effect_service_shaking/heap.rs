@@ -5899,6 +5899,9 @@ impl Analysis {
         for src in self.objs[obj].spread_from.clone() {
           self.constrain(src, esc.clone());
         }
+        // What it inherits crosses with it, including a prototype installed later.
+        let proto = self.proto_var(obj);
+        self.constrain(proto, esc.clone());
         if let ObjKind::Class { prototype, ctor, heritage } = self.objs[obj].kind {
           self.constrain(prototype, esc.clone());
           if let Some(f) = ctor {
@@ -6177,6 +6180,10 @@ impl Analysis {
         for src in sources {
           self.constrain(src, Constraint::Escape(flavour, site));
         }
+        // What it inherits crosses with it (`box.inner` read through `Object.create`), including
+        // a prototype installed after the handover.
+        let proto = self.proto_var(obj);
+        self.constrain(proto, Constraint::Escape(flavour, site));
         if let ObjKind::Class { prototype, ctor, heritage } = self.objs[obj].kind {
           self.constrain(prototype, Constraint::Escape(flavour, site));
           if let Some(f) = ctor {
