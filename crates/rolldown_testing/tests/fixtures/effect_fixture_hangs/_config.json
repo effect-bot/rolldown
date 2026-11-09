@@ -1,0 +1,10 @@
+{
+  "_comment": "Not a suite fixture: `fixture::tests` runs it to check that the harness stops a hung Effect service fixture and its child processes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
