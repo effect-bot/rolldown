@@ -1,0 +1,11 @@
+{
+  "_comment": "A runtime key name (process.env) is handed to an external module that returns it unchanged, and the service is looked up by what comes back. The lookup reaches the service's implementation, so the read method must stay; the unread one is removed. Red: a host value handed to unseen code is not read as a name that may be any key's. Unresolved, pending Tim's decision on whether to exclude this case (covering it collapses the Stripe gate to 0% smaller).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./late.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
