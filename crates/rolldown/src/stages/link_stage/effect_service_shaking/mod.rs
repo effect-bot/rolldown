@@ -62,6 +62,9 @@ impl LinkStage<'_> {
     if let Some(limit) = self.options.experimental.effect_service_shaking_widen {
       a.widen_limit = limit as usize;
     }
+    if let Some(max) = self.options.experimental.effect_service_shaking_max_entries {
+      a.max_entries = max;
+    }
     host::register(&mut a);
     effect::register(&mut a);
 

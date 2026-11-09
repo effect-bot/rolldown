@@ -1089,6 +1089,15 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "effectServiceShakingMaxEntries": {
+          "description": "Test knob for `effectServiceShaking`: the analysis's budget of points-to and copy entries,\nbeyond which it stops and keeps every method (32M by default). The fixture harness sets a\nsmall one; the `ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_ENTRIES` variable overrides it for\nevery build in a process.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": false

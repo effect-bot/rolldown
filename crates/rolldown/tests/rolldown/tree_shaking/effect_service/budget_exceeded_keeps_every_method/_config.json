@@ -1,0 +1,11 @@
+{
+  "_comment": "The dedicated budget test: with the entries budget at 1000, far below what this program's solve needs, the analysis stops and every method stays, the unread one included, and the bundle runs. Every other fixture runs under the harness's small default budget.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true,
+      "effectServiceShakingMaxEntries": 1000
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

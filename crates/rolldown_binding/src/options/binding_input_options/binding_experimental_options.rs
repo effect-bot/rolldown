@@ -43,6 +43,7 @@ impl TryFrom<BindingExperimentalOptions> for rolldown_common::ExperimentalOption
       import_attributes: value.import_attributes,
       effect_service_shaking: value.effect_service_shaking,
       effect_service_shaking_widen: None,
+      effect_service_shaking_max_entries: None,
     })
   }
 }

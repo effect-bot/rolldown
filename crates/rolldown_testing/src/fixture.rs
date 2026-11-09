@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+  effect_fixture,
   integration_test::{IntegrationTest, NamedBundlerOptions},
   memory_guard,
   test_config::read_test_config,
@@ -58,6 +59,11 @@ impl Fixture {
       options.cwd = Some(self.fixture_path.clone());
     }
 
+    // Small programs get a small budget; see `effect_fixture`.
+    if let Some(experimental) = options.experimental.as_mut() {
+      experimental.effect_service_shaking_max_entries.get_or_insert(effect_fixture::MAX_ENTRIES);
+    }
+
     if needs_extended_tests() {
       Self::apply_extended_tests(&meta, &options, &mut config_variants);
     }
@@ -80,7 +86,8 @@ impl Fixture {
 
     // The Effect service analysis runs in this process; cap its memory so a
     // runaway fails the run instead of exhausting the host. See `memory_guard`.
-    let _memory_guard = configs
+    // It also has a time limit (`effect_fixture`).
+    let effect_fixture = configs
       .iter()
       .any(|config| {
         config
@@ -92,10 +99,19 @@ impl Fixture {
       .then(|| {
         let workspace = Path::new(env!("WORKSPACE_DIR"));
         let name = self.fixture_path.strip_prefix(workspace).unwrap_or(&self.fixture_path);
-        memory_guard::guard(name.to_string_lossy().into_owned())
+        name.to_string_lossy().into_owned()
       });
+    let _memory_guard = effect_fixture.clone().map(memory_guard::guard);
 
+    let started = std::time::Instant::now();
     IntegrationTest::new(meta, self.fixture_path.clone()).run_multiple(configs, plugins).await;
+    if let Some(name) = effect_fixture {
+      if let Some(failure) =
+        effect_fixture::over_time_limit(&name, started.elapsed(), effect_fixture::time_limit())
+      {
+        panic!("{failure}");
+      }
+    }
   }
 
   fn apply_extended_tests(

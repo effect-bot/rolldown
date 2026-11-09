@@ -89,6 +89,12 @@ pub struct ExperimentalOptions {
   /// every build in a process.
   #[doc(hidden)]
   pub effect_service_shaking_widen: Option<u32>,
+  /// Test knob for `effectServiceShaking`: the analysis's budget of points-to and copy entries,
+  /// beyond which it stops and keeps every method (32M by default). The fixture harness sets a
+  /// small one; the `ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_ENTRIES` variable overrides it for
+  /// every build in a process.
+  #[doc(hidden)]
+  pub effect_service_shaking_max_entries: Option<u64>,
 }
 
 impl ExperimentalOptions {

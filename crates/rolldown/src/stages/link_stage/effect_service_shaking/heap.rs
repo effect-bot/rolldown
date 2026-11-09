@@ -924,6 +924,8 @@ pub struct Analysis {
   /// Widening (`widen`): the set size past which a variable is widened, the boundary, the
   /// number of variables widened, and how many variables the analysis starts with.
   pub widen_limit: usize,
+  /// The entries budget (`MAX_ENTRIES` unless the build sets one).
+  pub max_entries: u64,
   widened_class: Option<ObjId>,
   /// The boundary of program code the pass does not follow (`unfollowed`).
   unfollowed_class: Option<ObjId>,
@@ -1213,6 +1215,7 @@ impl Analysis {
       handed_names: FxHashSet::default(),
       handed_all: false,
       handed_lookups: FxHashSet::default(),
+      max_entries: Self::MAX_ENTRIES,
       widen_limit: std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_WIDEN")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1823,7 +1826,7 @@ impl Analysis {
         > std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_ENTRIES")
           .ok()
           .and_then(|s| s.parse().ok())
-          .unwrap_or(Self::MAX_ENTRIES)
+          .unwrap_or(self.max_entries)
   }
 
   fn max_objects(&self) -> usize {

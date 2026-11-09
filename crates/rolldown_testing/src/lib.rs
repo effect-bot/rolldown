@@ -1,3 +1,4 @@
+pub mod effect_fixture;
 pub mod fixture;
 mod hidden_module_markers;
 mod hmr_files;
