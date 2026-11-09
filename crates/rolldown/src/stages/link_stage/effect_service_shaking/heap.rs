@@ -500,6 +500,9 @@ pub enum Constraint {
   BailKeys,
   /// On a key's names: a key handed across a boundary (`Analysis::hand_name`).
   HandName,
+  /// The value is in a widened set after it crossed into another class boundary first: a runtime
+  /// name it holds may name any key (`Analysis::widen_name`).
+  WidenName,
   /// The value crosses into the body of a class (`ObjId`), which the pass does not analyse
   /// (`Analysis::class_escape`); the `u8` is how, for the report (`CLASS_HOW`).
   ClassEscape(ObjId, u8),
@@ -617,6 +620,7 @@ impl Constraint {
       }
       C::BailKeys => C::BailKeys,
       C::HandName => C::HandName,
+      C::WidenName => C::WidenName,
       C::ClassReceiver(r) => C::ClassReceiver(v(*r)),
       C::HasInstance(x, site) => C::HasInstance(v(*x), s(*site)),
       C::LookupIn { key, dst } => C::LookupIn { key: v(*key), dst: v(*dst) },
@@ -927,6 +931,10 @@ pub struct Analysis {
   widened_class: Option<ObjId>,
   /// The boundary of program code the pass does not follow (`unfollowed`).
   unfollowed_class: Option<ObjId>,
+  /// Objects that reached a widened set after crossing another class boundary first
+  /// (`widen_name`): what they hold, and what is written into them later, is walked for
+  /// runtime names.
+  widen_named: FxHashSet<ObjId>,
   pub widened_vars: usize,
   init_vars: usize,
   /// Diagnostic: what created each variable (`var_tag` at the time).
@@ -1219,6 +1227,7 @@ impl Analysis {
         .unwrap_or(400),
       widened_class: None,
       unfollowed_class: None,
+      widen_named: FxHashSet::default(),
       widened_vars: 0,
       init_vars,
       var_origin: vec!["init"; init_vars],
@@ -1440,9 +1449,11 @@ impl Analysis {
   ///
   /// A host value may be a string only known at run time (`process.env.X`), which may name any
   /// key. `any_name` is set for the widening boundary: the widened set holds that value, and a
-  /// lookup by its opaque element must still see every key. Code the pass can't see or doesn't
-  /// follow may produce any string itself, so a host value handed there is not read as a name:
-  /// keys come back from it only as the keys and names it was handed. A host value that is a
+  /// lookup by its opaque element must still see every key; an object that crossed another
+  /// class boundary before it reached the widened set is walked for such values (`widen_name`).
+  /// A host value handed to code the pass can't see or doesn't follow is not read as a name
+  /// today, so a runtime name handed back by that code misses its key: unresolved, pending
+  /// Tim's decision (fixture `external_returned_runtime_name`, red). A host value that is a
   /// number or another primitive never equals a key's name (effect's maps are keyed by the name).
   fn hand_key(&mut self, obj: ObjId, any_name: bool) {
     match self.objs[obj].kind.clone() {
@@ -1451,6 +1462,55 @@ impl Analysis {
       ObjKind::Key { strings, .. } if self.handed.insert(obj) => {
         self.constrain(strings, Constraint::HandName);
       }
+      _ => {}
+    }
+  }
+
+  /// `obj` reached the widening boundary after it crossed another class boundary first, so
+  /// `class_escape` did not walk it with the widening's reading of names: a host value it holds
+  /// (`{ key: process.env.X }`), through its fields, elements, spread sources, prototype or
+  /// contents, now or written later (`store`), may name any key (`hand_all`). An object the
+  /// widening boundary walked itself is skipped: its own crossing reads them so.
+  fn widen_name(&mut self, obj: ObjId) {
+    if matches!(self.objs[obj].kind, ObjKind::Top(Flavour::Host)) {
+      self.hand_all();
+      return;
+    }
+    if self.handed_all
+      || self.class_escaped.get(&obj).is_some_and(|&(c, _)| Some(c) == self.widened_class)
+      || !self.widen_named.insert(obj)
+    {
+      return;
+    }
+    let walk = Constraint::WidenName;
+    match self.objs[obj].kind.clone() {
+      ObjKind::Object
+      | ObjKind::Array
+      | ObjKind::Class { .. }
+      | ObjKind::Closure(_)
+      | ObjKind::Namespace => {
+        let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
+        for f in fields {
+          self.constrain(f, walk.clone());
+        }
+        let elem = self.elem(obj);
+        self.constrain(elem, walk.clone());
+        for src in self.objs[obj].spread_from.clone() {
+          self.constrain(src, walk.clone());
+        }
+        let proto = self.proto_var(obj);
+        self.constrain(proto, walk.clone());
+        if let ObjKind::Class { prototype, heritage, .. } = self.objs[obj].kind {
+          self.constrain(prototype, walk.clone());
+          if let Some(h) = heritage {
+            self.constrain(h, walk);
+          }
+        }
+      }
+      ObjKind::Effect { success: v, .. }
+      | ObjKind::Promise { value: v }
+      | ObjKind::Wrap(v)
+      | ObjKind::Typed { slot: v, .. } => self.constrain(v, walk),
       _ => {}
     }
   }
@@ -2272,6 +2332,7 @@ impl Analysis {
       }
       Constraint::BailKeys => self.bail_keys(obj),
       Constraint::HandName => self.hand_name(obj),
+      Constraint::WidenName => self.widen_name(obj),
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
       Constraint::LookupNameIn { key, dst } => {
         if matches!(
@@ -2666,6 +2727,9 @@ impl Analysis {
         if let Some(&(class, _)) = self.class_escaped.get(&obj) {
           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
         }
+        if self.widen_named.contains(&obj) {
+          self.constrain(src, Constraint::WidenName);
+        }
         let field = self.field(obj, name);
         self.copy(src, field);
       }
@@ -2720,6 +2784,9 @@ impl Analysis {
         }
         if let Some(&(class, _)) = self.class_escaped.get(&obj) {
           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
+        }
+        if self.widen_named.contains(&obj) {
+          self.constrain(src, Constraint::WidenName);
         }
         // Direction 2's admission lever: a value stored under an unknown name reaches every
         // field, so only what may hold a service flows as itself; the rest is stood for.
@@ -5894,8 +5961,14 @@ impl Analysis {
   /// it holds runs with its opaque value as arguments and `this`, and an Effect it holds runs.
   /// Each object crosses once, whatever other flavour it escaped with before.
   pub fn class_escape(&mut self, obj: ObjId, class: ObjId, how: u8) {
-    self.hand_key(obj, Some(class) == self.widened_class);
-    if self.class_escaped.contains_key(&obj) {
+    let widening = Some(class) == self.widened_class;
+    self.hand_key(obj, widening);
+    if let Some(&(first, _)) = self.class_escaped.get(&obj) {
+      // An object that crossed another boundary first still reaches the widened set: the
+      // widening boundary reads runtime names it holds as any key's (`widen_name`).
+      if widening && Some(first) != self.widened_class {
+        self.widen_name(obj);
+      }
       return;
     }
     self.class_escaped.insert(obj, (class, how));
