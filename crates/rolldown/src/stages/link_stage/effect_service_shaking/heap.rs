@@ -1449,9 +1449,15 @@ impl Analysis {
   /// class boundary before it reached the widened set crosses again (`class_escape`).
   /// A host value handed to code the pass can't see or doesn't follow is not read as a name:
   /// that code may make any string itself, and a runtime name string it hands back is treated
-  /// the same (Tim's decision, 2026-11-09; fixture `external_returned_runtime_name`). Keys and
-  /// literal names it is handed are recorded above and do come back. A host value that is a
-  /// number or another primitive never equals a key's name (effect's maps are keyed by the name).
+  /// the same (Tim's decision, 2026-11-09; fixture `external_returned_runtime_name`).
+  /// Canonical keys and literal names it is handed are recorded above and do come back. A
+  /// structural key (a `{ key }` record) is read only through the values its fields hold, so a
+  /// runtime name in its `key` field is not tracked either, though the object handed back is the
+  /// program's own (Tim's decision, 2026-11-09; fixture `external_returned_structural_key`).
+  /// That exclusion rests on rarity alone: reading the `key` field of every record handed over
+  /// makes Stripe 0% smaller. A literal-named structural key is still covered (its literal is
+  /// handed as a `Str`). A host value that is a number or another primitive never equals a
+  /// key's name (effect's maps are keyed by the name).
   fn hand_key(&mut self, obj: ObjId, any_name: bool) {
     match self.objs[obj].kind.clone() {
       ObjKind::Top(Flavour::Host) if any_name => self.hand_all(),
