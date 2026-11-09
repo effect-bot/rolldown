@@ -501,6 +501,9 @@ fn step_schedule(a: &mut Analysis, site: Site, schedule: VarId, input: VarId) ->
     a.copy(pf, failure);
     let done = load(a, pf, "value");
     a.primitives_of(done, output);
+    // A type-modelled Schedule ends with a `Done` the pass never sees built: its final output
+    // is one of the outputs its steps decide, so those count too.
+    a.copy(decided, output);
     let ef = failure_of(a, eff);
     a.copy(ef, failure);
   } else {
