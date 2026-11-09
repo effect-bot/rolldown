@@ -285,6 +285,102 @@ async fn mixed_library_bundled_effect_external() {
   check("mixed_library_bundled_effect_external").await;
 }
 
+/// What the copy of `effect` in `declarations` has beside each module.
+#[derive(Clone, Copy)]
+enum Declarations {
+  /// No `.d.ts` files.
+  Missing,
+  /// `.d.ts` files that are not UTF-8, so they can't be read.
+  Unreadable,
+}
+
+/// The installed `effect` package, found as Node finds it from the programs.
+fn installed_effect() -> PathBuf {
+  Path::new(PROGRAMS)
+    .ancestors()
+    .map(|dir| dir.join("node_modules/effect"))
+    .find(|dir| dir.join("package.json").is_file())
+    .and_then(|dir| dir.canonicalize().ok())
+    .expect("the repository should install effect")
+}
+
+/// Copies `effect`'s `package.json` and every `.js` module of `src` into `dst`,
+/// with the declarations each module gets.
+fn copy_effect(src: &Path, dst: &Path, declarations: Declarations) {
+  std::fs::create_dir_all(dst).unwrap();
+  for entry in std::fs::read_dir(src).unwrap() {
+    let path = entry.unwrap().path();
+    let target = dst.join(path.file_name().unwrap());
+    if path.is_dir() {
+      copy_effect(&path, &target, declarations);
+    } else if path.extension().is_some_and(|e| e == "js") {
+      if std::fs::hard_link(&path, &target).is_err() {
+        std::fs::copy(&path, &target).unwrap();
+      }
+      if let Declarations::Unreadable = declarations {
+        std::fs::write(target.with_extension("d.ts"), b"export declare const \xff\xfe: never;\n")
+          .unwrap();
+      }
+    }
+  }
+}
+
+/// `effect`'s declarations can't be found or read: the pass keeps every method
+/// and says why, rather than analysing `effect`'s modules some other way
+/// (issue, "Analysis model"). The program is built in a temporary directory
+/// whose `node_modules/effect` is a copy of the installed package's
+/// `package.json` and `.js` modules.
+async fn check_declarations(name: &str, declarations: Declarations) {
+  let _memory_guard =
+    rolldown_testing::memory_guard::guard(format!("effect_service_acceptance::{name}"));
+  let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("effect_service_acceptance").join(name);
+  let _ = std::fs::remove_dir_all(&dir);
+  let effect = installed_effect();
+  let copy = dir.join("node_modules/effect");
+  std::fs::create_dir_all(&copy).unwrap();
+  std::fs::copy(effect.join("package.json"), copy.join("package.json")).unwrap();
+  copy_effect(&effect.join("dist"), &copy.join("dist"), declarations);
+  std::fs::write(dir.join("package.json"), "{ \"type\": \"module\" }\n").unwrap();
+  std::fs::copy(PathBuf::from(PROGRAMS).join("declarations/main.js"), dir.join("main.js")).unwrap();
+
+  let expect = Expect::default();
+  let off = build(&dir, &expect, false, "off").await;
+  let on = build(&dir, &expect, true, "on").await;
+  let mut failures = vec![];
+  let (off_status, off_stdout, off_stderr) = run(&dir, &off.bundle);
+  let (on_status, on_stdout, on_stderr) = run(&dir, &on.bundle);
+  if off_status != 0 || on_status != 0 || off_stdout != on_stdout {
+    failures.push(format!(
+      "both builds should run alike: off exit {off_status} {off_stdout}{off_stderr}, on exit {on_status} {on_stdout}{on_stderr}"
+    ));
+  }
+  let code = without_comments(&std::fs::read_to_string(&on.bundle).unwrap());
+  for method in ["declarationsUsed", "declarationsUnused"] {
+    if !regex::Regex::new(&format!(r"\b{method}\s*:")).unwrap().is_match(&code) {
+      failures.push(format!("the definition of `{method}` should be kept"));
+    }
+  }
+  if !on.warnings.iter().any(|w| w.starts_with("EFFECT_SERVICE_SHAKING") && w.contains(".d.ts")) {
+    failures.push(format!(
+      "an EFFECT_SERVICE_SHAKING warning should name the declarations, got: {:#?}",
+      on.warnings
+    ));
+  }
+  assert!(failures.is_empty(), "{name}:\n- {}", failures.join("\n- "));
+}
+
+/// `effect` installed without its `.d.ts` files.
+#[tokio::test]
+async fn missing_declarations() {
+  check_declarations("missing_declarations", Declarations::Missing).await;
+}
+
+/// `effect` installed with `.d.ts` files that can't be read.
+#[tokio::test]
+async fn unreadable_declarations() {
+  check_declarations("unreadable_declarations", Declarations::Unreadable).await;
+}
+
 /// The fields of the pass's `effect service shaking` debug event, except the
 /// timings: what the solve produced (`vars`, `objs`, `steps`, `removed`).
 type Report = Vec<(String, String)>;
