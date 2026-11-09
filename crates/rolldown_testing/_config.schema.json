@@ -1080,6 +1080,15 @@
             "boolean",
             "null"
           ]
+        },
+        "effectServiceShakingWiden": {
+          "description": "Test knob for `effectServiceShaking`: how many values a variable may hold before the\nanalysis widens it to the opaque boundary (400 by default). Fixtures set it low to exercise\nwidening on small programs; the `ROLLDOWN_EFFECT_SERVICE_SHAKING_WIDEN` variable sets it for\nevery build in a process.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
         }
       },
       "additionalProperties": false

@@ -59,6 +59,9 @@ impl LinkStage<'_> {
       };
     }
     let mut a = Analysis::new();
+    if let Some(limit) = self.options.experimental.effect_service_shaking_widen {
+      a.widen_limit = limit as usize;
+    }
     host::register(&mut a);
     effect::register(&mut a);
 

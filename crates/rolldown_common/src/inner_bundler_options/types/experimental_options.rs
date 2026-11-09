@@ -83,6 +83,12 @@ pub struct ExperimentalOptions {
   pub import_attributes: Option<bool>,
   /// Remove methods of Effect services that nothing in the bundle can read (experimental, off by default).
   pub effect_service_shaking: Option<bool>,
+  /// Test knob for `effectServiceShaking`: how many values a variable may hold before the
+  /// analysis widens it to the opaque boundary (400 by default). Fixtures set it low to exercise
+  /// widening on small programs; the `ROLLDOWN_EFFECT_SERVICE_SHAKING_WIDEN` variable sets it for
+  /// every build in a process.
+  #[doc(hidden)]
+  pub effect_service_shaking_widen: Option<u32>,
 }
 
 impl ExperimentalOptions {
