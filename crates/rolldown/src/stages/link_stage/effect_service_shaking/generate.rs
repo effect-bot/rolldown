@@ -175,9 +175,6 @@ pub struct Gen<'a, 'l, 's> {
   next_case: u32,
   /// Values thrown inside the enclosing inert `try` blocks (see `inert_statement`).
   try_throws: Vec<VarId>,
-  /// Enclosing constructs that may run their code more than once without a function call:
-  /// loops, and class bodies (field initializers run per instance). See `alloc`.
-  repeat_depth: u32,
 }
 
 impl<'a, 'l, 's> Gen<'a, 'l, 's> {
@@ -201,7 +198,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       case_stack: vec![],
       next_case: 0,
       try_throws: vec![],
-      repeat_depth: 0,
     }
   }
 
@@ -264,15 +260,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   fn alloc(&mut self, kind: ObjKind, start: u32) -> (ObjId, VarId) {
     let obj = self.a.alloc(kind, Some(self.site(start)));
-    // Provably allocated at most once (`Analysis::once_allocated`): the expression is in the
-    // module's own top-level code (a lazy top-level statement included: it is generated here
-    // and activated, never called), outside every loop and class body. A module body runs once
-    // (ESM, and a bundled CommonJS module behind its cached wrapper), the model never clones it,
-    // and any function, getter, accessor or callback has its own body (`cur` differs). Anything
-    // else may stand for many runtime objects.
-    if self.cur == self.module_fn && self.repeat_depth == 0 {
-      self.a.once_allocated.insert(obj);
-    }
     let v = self.fresh();
     // Seeded now, not when the enclosing function is reached: the generator reads these sets
     // (class members, accessors) and a fresh variable holding an allocation has no effect on
@@ -409,20 +396,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn statement(&mut self, stmt: &Statement<'_>) {
-    let repeats = matches!(
-      stmt,
-      Statement::DoWhileStatement(_)
-        | Statement::ForInStatement(_)
-        | Statement::ForOfStatement(_)
-        | Statement::ForStatement(_)
-        | Statement::WhileStatement(_)
-    );
-    self.repeat_depth += u32::from(repeats);
-    self.statement_kind(stmt);
-    self.repeat_depth -= u32::from(repeats);
-  }
-
-  fn statement_kind(&mut self, stmt: &Statement<'_>) {
     match stmt {
       Statement::BlockStatement(b) => self.statements(&b.body),
       Statement::DoWhileStatement(s) => {
@@ -997,13 +970,6 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     self.tdz_until = saved;
   }
 
-  fn class(&mut self, c: &Class<'_>) -> VarId {
-    self.repeat_depth += 1;
-    let v = self.class_body(c);
-    self.repeat_depth -= 1;
-    v
-  }
-
   /// Whether a class's heritage is directly a key constructor: a call of effect's own
   /// `Context.Service`/`Context.Reference` (`Context.Service<..>()("id")`), or a binding a `const`
   /// declares as one. Both are resolved by symbol, never by spelling. Such a key class is
@@ -1101,7 +1067,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     cv
   }
 
-  fn class_body(&mut self, c: &Class<'_>) -> VarId {
+  fn class(&mut self, c: &Class<'_>) -> VarId {
     if !self.key_heritage(c) {
       return self.class_hole(c);
     }

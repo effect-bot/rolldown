@@ -142,7 +142,6 @@ impl LinkStage<'_> {
     let mut unsupported_version: Option<String> = None;
     let mut public_modules: Vec<(ModuleIdx, &'static [(&'static str, effect::Spec)])> = vec![];
     let mut listed_modules: Vec<(ModuleIdx, &'static [(&'static str, effect::Spec)])> = vec![];
-    let mut schedule_module: Option<ModuleIdx> = None;
     for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       match module {
         Module::Normal(normal) => {
@@ -157,9 +156,6 @@ impl LinkStage<'_> {
             }
           }
           let path = normal.id.as_ref().replace('\\', "/");
-          if path.ends_with(effect::SCHEDULE_MODULE) {
-            schedule_module = Some(normal.idx);
-          }
           if let Some((_, specs)) =
             effect::MODULES.iter().find(|(name, _)| path.ends_with(&format!("/dist/{name}.js")))
           {
@@ -461,15 +457,6 @@ impl LinkStage<'_> {
       let to = sh.symbol_var(&mut a, target);
       let from = sh.symbol_var(&mut a, sym);
       a.copy(to, from);
-    }
-
-    // `Effect.repeat`, `Effect.retry` and `Effect.retryOrElse` step a Schedule through the
-    // bundled stable `Schedule.toStep`.
-    if let Some(module) = schedule_module {
-      if let Some(export) = self.metas[module].resolved_exports.get(effect::SCHEDULE_TO_STEP) {
-        lazy_roots.push(export.symbol_ref);
-        a.schedule_to_step = Some(sh.symbol_var(&mut a, export.symbol_ref));
-      }
     }
 
     phase!("model bound, {} rule symbols", sh.rule_symbols.len());

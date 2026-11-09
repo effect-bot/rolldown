@@ -516,10 +516,6 @@ pub enum Constraint {
   ThenableBail(ObjId),
   /// A callable reaching an adopted object's `then`: the await yields an unknown value.
   ThenableAwait(VarId),
-  /// What may enter a Schedule (issue, "Assumptions" 4): primitives and ordinary values flow
-  /// into the variable with their structure, a program service value never does, and a summary
-  /// becomes an unknown scalar (`Analysis::service_free`).
-  ServiceFree(VarId),
 }
 
 impl Key {
@@ -587,7 +583,6 @@ impl Constraint {
         C::Walk { walk: *walk, pool: v(*pool), arg: v(*arg), site: s(*site) }
       }
       C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
-      C::ServiceFree(dst) => C::ServiceFree(v(*dst)),
       C::ThenableBail(obj) => C::ThenableBail(*obj),
       C::ThenableAwait(dst) => C::ThenableAwait(v(*dst)),
       C::TypedArg(slot, back, site, mask) => C::TypedArg(v(*slot), v(*back), *site, *mask),
@@ -1009,14 +1004,6 @@ pub struct Analysis {
   /// Hand-written thenables that have bailed (`adopt`).
   thenables_bailed: FxHashSet<ObjId>,
 
-  /// The value variables of providers (a `KeyUse::Provide` that reached a key), for
-  /// `definitely_service`.
-  provide_sources: FxHashSet<VarId>,
-  /// Objects the generator proves are allocated at most once at run time (`Gen::alloc`).
-  pub once_allocated: FxHashSet<ObjId>,
-  /// `ServiceFree` objects waiting for the solve to settle (`service_free`).
-  pending_service_free: Vec<(ObjId, VarId)>,
-  prim_ty: Option<u32>,
   pub hash_pool: Option<VarId>,
   /// The program-wide pools of host serialization and inspection (`host_protocol`).
   json_pool: Option<VarId>,
@@ -1029,13 +1016,6 @@ pub struct Analysis {
   /// The failure slot every model Effect shares. Services never enter the error channel
   /// (issue, "Assumptions" 3), so nothing reads it: `failure_of` yields nothing.
   failure_sink: VarId,
-  /// The values `Cause.done` completes a Pull with: a Schedule's output when it ends. They are
-  /// success-side data that Effect carries through the error channel, so they are the one thing
-  /// handlers receive (`done_failure`).
-  pub done_values: VarId,
-  /// The Done signal handlers see in place of a failure: a Cause whose one Fail reason's error is
-  /// a `Done` with `done_values` as its value, and that `Done` itself (built once).
-  done_failure: Option<(ObjId, ObjId)>,
   /// Rule invocations, for diagnostics.
   pub rule_calls: FxHashMap<u16, usize>,
   /// One "any argument" variable per spread call, shared by every `arg` read of that call.
@@ -1085,10 +1065,6 @@ pub struct Analysis {
   pub effect_key_strings: VarId,
   /// Rule id of `effect:default`, once registered.
   pub default_rule: Option<u16>,
-  /// The bundled `Schedule.toStep` (stable public API), which the `Effect.repeat`,
-  /// `Effect.retry` and `Effect.retryOrElse` rules use to step a Schedule. `None` when
-  /// `effect/Schedule` is not bundled.
-  pub schedule_to_step: Option<VarId>,
   /// Model Effects whose public type is `Exit`: only these have the Exit members.
   exits: FxHashSet<ObjId>,
   /// The property name of each `o.name(...)` call site, as generated (clones' sites are not
@@ -1130,7 +1106,6 @@ impl Analysis {
     let unknown_key_values = vars.push(Var::default());
     let all_values = vars.push(Var::default());
     let failure_sink = vars.push(Var::default());
-    let done_values = vars.push(Var::default());
     let effect_key_values = vars.push(Var::default());
     let effect_key_strings = vars.push(Var::default());
     let init_vars = vars.len();
@@ -1164,9 +1139,6 @@ impl Analysis {
       ignored_pool: None,
       prim_arg: None,
       inspect_args: None,
-      pending_service_free: vec![],
-      once_allocated: FxHashSet::default(),
-      provide_sources: FxHashSet::default(),
       awaited_wraps: FxHashMap::default(),
       thenable_then: FxHashMap::default(),
       thenables_bailed: FxHashSet::default(),
@@ -1229,15 +1201,12 @@ impl Analysis {
       var_tag: "gen",
       tag_names: FxHashMap::default(),
       clone_tags: FxHashMap::default(),
-      prim_ty: None,
       hash_pool: None,
       json_pool: None,
       inspect_pool: None,
       primitive_converted: FxHashSet::default(),
       log_messages: None,
       failure_sink,
-      done_values,
-      done_failure: None,
       rule_calls: FxHashMap::default(),
       rule_memo: FxHashMap::default(),
       spread_any: FxHashMap::default(),
@@ -1265,7 +1234,6 @@ impl Analysis {
       effect_key_values,
       effect_key_strings,
       default_rule: None,
-      schedule_to_step: None,
       exits: FxHashSet::default(),
       method_names: FxHashMap::default(),
       lazy_exports: FxHashMap::default(),
@@ -1999,7 +1967,7 @@ impl Analysis {
         if self.activation_queue.is_empty() && self.new_constraints.is_empty() {
           // Rejected objects are re-checked as they change; this pass only confirms that
           // nothing became admissible without an event before the solve ends.
-          if self.recheck_all() | self.admit_service_free() | self.recheck_deferred() {
+          if self.recheck_all() | self.recheck_deferred() {
             continue;
           }
           break;
@@ -2233,7 +2201,6 @@ impl Analysis {
       }
       Constraint::Walk { walk, pool, arg, site } => self.walk(obj, *walk, *pool, *arg, *site),
       Constraint::Witness(witness, dst) => self.seed(*dst, *witness),
-      Constraint::ServiceFree(dst) => self.service_free(obj, *dst),
       // A thenable's `then` runs whoever made it: the thenable goes to that code, and the await
       // settles with what it makes. Class code or a widened set (`opaque_class`) keeps it in its
       // boundary, effect's code (`top_effect`, a summary) in effect's, anything else is code the
@@ -3262,75 +3229,6 @@ impl Analysis {
       }
     };
     self.constrain(then, Constraint::ThenableAwait(dst));
-  }
-
-  /// `ServiceFree`: a primitive flows on; a summary (which may stand for a service) becomes an
-  /// unknown scalar; an object waits for the solve to settle, then flows on unless it is
-  /// definitely a service (`definitely_service`). Admitting an object is always sound; holding
-  /// one back is sound only while it is definitely a service, so a held object is re-checked
-  /// every time the solve settles (points-to sets keep growing after admissions) and flows as
-  /// soon as it no longer is.
-  fn service_free(&mut self, obj: ObjId, dst: VarId) {
-    match self.objs[obj].kind {
-      ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim => self.seed(dst, obj),
-      ObjKind::Wrap(_) | ObjKind::Typed { .. } | ObjKind::Top(_) | ObjKind::External { .. } => {
-        self.seed(dst, self.top_host);
-      }
-      _ => self.pending_service_free.push((obj, dst)),
-    }
-  }
-
-  /// Admits the waiting `ServiceFree` objects that are not definitely services, keeping the rest
-  /// waiting for the next check; returns whether any flowed.
-  fn admit_service_free(&mut self) -> bool {
-    let pending = std::mem::take(&mut self.pending_service_free);
-    let mut admitted = false;
-    let mut held = vec![];
-    for (obj, dst) in pending {
-      if self.vars[dst].pts.contains(&obj) {
-        continue;
-      }
-      if self.definitely_service(obj) {
-        held.push((obj, dst));
-      } else {
-        self.seed(dst, obj);
-        admitted = true;
-      }
-    }
-    self.pending_service_free = held;
-    admitted
-  }
-
-  /// Must-provision: the object stands for one runtime object (`once_allocated`), and some
-  /// provider's value holds exactly that object (`provide_sources`), so that runtime object is
-  /// what was provided. Being among a key's possible values (`all_values`) is not enough: a
-  /// provider's value may hold several objects (array elements merge, say), and then none of
-  /// them is known to be the provided one.
-  fn definitely_service(&self, obj: ObjId) -> bool {
-    self.once_allocated.contains(&obj)
-      && self.provide_sources.iter().any(|src| {
-        let pts = &self.vars[*src].pts;
-        pts.len() == 1 && pts.contains(&obj)
-      })
-  }
-
-  /// What may enter a Schedule from `src` flows into `dst` (`Constraint::ServiceFree`).
-  pub fn service_free_of(&mut self, src: VarId, dst: VarId) {
-    self.constrain(src, Constraint::ServiceFree(dst));
-  }
-
-  /// The primitives `src` holds flow into `dst`; objects don't, and a summary becomes an
-  /// unknown scalar (`Constraint::FilterCopy` with a primitive-only type).
-  pub fn primitives_of(&mut self, src: VarId, dst: VarId) {
-    let ty = match self.prim_ty {
-      Some(t) => t,
-      None => {
-        let t = self.intern_ty(super::dts::Ty { prim: true, ..super::dts::Ty::default() });
-        self.prim_ty = Some(t);
-        t
-      }
-    };
-    self.constrain(src, Constraint::FilterCopy { dst, ty });
   }
 
   /// An export of a type-modelled `effect` module (design section 11): its body is not
@@ -4483,7 +4381,7 @@ impl Analysis {
 
   /// A value entering a slot (or what a call is handed, for its module's pool): an Effect
   /// contributes its success and a promise its value; a function runs with what the slot holds
-  /// (a Schedule's step, a stored callback); a stand-in enters as itself; anything else, a
+  /// (a stored callback); a stand-in enters as itself; anything else, a
   /// summary included, goes through the admission filter.
   fn slot_in(&mut self, obj: ObjId, dst: VarId, stand_in: ObjId) {
     match self.objs[obj].kind {
@@ -4491,8 +4389,8 @@ impl Analysis {
         self.constrain(success, Constraint::SlotIn(dst, stand_in));
       }
       ObjKind::Promise { value } => self.constrain(value, Constraint::SlotIn(dst, stand_in)),
-      // A function a type-modelled value holds may be called by its code (a Schedule's step, a
-      // stored callback): it runs with what the value holds.
+      // A function a type-modelled value holds may be called by its code (a stored callback): it
+      // runs with what the value holds.
       ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
         self.admit_typed(obj, dst);
         if self.typed_slot_fns.insert((obj, dst)) {
@@ -5286,52 +5184,12 @@ impl Analysis {
   }
 
   /// What an effect fails with, as handlers see it. Services never enter the error channel
-  /// (issue, "Assumptions" 3), so the pass does not track failures, defects or Causes: handlers
-  /// still run, and see only the `Done` signal that carries a Schedule's final output
-  /// (`done_values`), as a Cause and as the error itself.
-  fn failure_of(&mut self, obj: ObjId, dst: VarId) {
+  /// (issue, "Assumptions" 3), and no `Done` signal carries one (4), so the pass does not track
+  /// failures, defects, Causes or `Done` values: handlers still run, with no failure input.
+  fn failure_of(&mut self, obj: ObjId, _dst: VarId) {
     if let ObjKind::Iterator(f) = self.objs[obj].kind {
       self.activate(f);
     }
-    if matches!(
-      self.objs[obj].kind,
-      ObjKind::Effect { .. } | ObjKind::Iterator(_) | ObjKind::Wrap(_) | ObjKind::Typed { .. }
-    ) {
-      let (cause, done) = self.done_failure();
-      self.seed(dst, cause);
-      self.seed(dst, done);
-    }
-  }
-
-  /// The Cause and `Done` of `done_failure`.
-  pub fn done_failure(&mut self) -> (ObjId, ObjId) {
-    if let Some(objs) = self.done_failure {
-      return objs;
-    }
-    let done = self.alloc(ObjKind::Object, None);
-    let tag = self.field(done, &ArcStr::from("_tag"));
-    let s = self.str("Done");
-    self.seed(tag, s);
-    let brand = self.field(done, &ArcStr::from("~effect/Cause/Done"));
-    self.seed(brand, self.prim);
-    let value = self.field(done, &ArcStr::from("value"));
-    self.copy(self.done_values, value);
-    let reason = self.alloc(ObjKind::Object, None);
-    let tag = self.field(reason, &ArcStr::from("_tag"));
-    let s = self.str("Fail");
-    self.seed(tag, s);
-    let error = self.field(reason, &ArcStr::from("error"));
-    self.seed(error, done);
-    let reasons = self.alloc(ObjKind::Array, None);
-    let elem = self.elem(reasons);
-    self.seed(elem, reason);
-    let cause = self.alloc(ObjKind::Object, None);
-    let field = self.field(cause, &ArcStr::from("reasons"));
-    self.seed(field, reasons);
-    let brand = self.field(cause, &ArcStr::from("~effect/Cause"));
-    self.seed(brand, self.prim);
-    self.done_failure = Some((cause, done));
-    (cause, done)
   }
 
   pub fn key_use(&mut self, obj: ObjId, use_: &KeyUse) {
@@ -5350,7 +5208,6 @@ impl Analysis {
           self.copy(v, *dst);
         }
         KeyUse::Provide(src) => {
-          self.provide_sources.insert(*src);
           let v = self.key_value_var(&name);
           self.copy(*src, v);
         }
@@ -5366,7 +5223,6 @@ impl Analysis {
           self.handed_lookup(*dst);
         }
         KeyUse::Provide(src) => {
-          self.provide_sources.insert(*src);
           self.copy(*src, self.unknown_key_values);
         }
         KeyUse::Strings(dst) => self.seed(*dst, obj),
@@ -5374,7 +5230,6 @@ impl Analysis {
       ObjKind::AllKeys => match use_ {
         KeyUse::Lookup(dst) => self.copy(self.all_values, *dst),
         KeyUse::Provide(src) => {
-          self.provide_sources.insert(*src);
           self.copy(*src, self.unknown_key_values);
         }
         KeyUse::Strings(dst) => self.seed(*dst, obj),

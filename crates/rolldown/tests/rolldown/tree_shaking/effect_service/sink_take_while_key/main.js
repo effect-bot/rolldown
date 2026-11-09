@@ -7,8 +7,9 @@ import * as Stream from 'effect/Stream';
 // A service-free string collected by `Sink.takeWhile` comes back through the
 // Sink's `Done` signal and names a method of a service the program holds. Done
 // values that hold no service still flow, so the named method stays and the
-// bundle runs. (Whether the unread method goes depends on the program-wide
-// `Done` pool, an accepted imprecision, so it is not checked.)
+// bundle runs. (The string comes back from the type-modelled Stream and Sink as
+// an unknown scalar, so the unread method may stay, an accepted imprecision; it
+// is not checked.)
 const Store = Context.Service('test/SinkTakeWhileKey');
 const program = Effect.gen(function* () {
   const store = yield* Store;
