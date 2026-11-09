@@ -1,0 +1,10 @@
+{
+  "_comment": "Keys go through type-modelled exports that hand back what they were given (Option.some then Option.getOrThrow, Tuple.make then index 0), and the program looks services up through the results. A key effect's code returns may be one it was handed, so each lookup reaches its service's implementation and the method read through it stays. Keys handed to type-modelled code also bail today, so the unread methods are not asserted; Other, looked up directly, prunes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

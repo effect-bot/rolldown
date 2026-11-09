@@ -1,0 +1,11 @@
+{
+  "_comment": "With the widening limit at 8, small sets of key-shaped values are widened to the opaque boundary. Keys reach their lookups through widened variables: an object whose key property is written after it was widened, the same written through the widened element, a function given a key property late, and a hand-made key a service is provided under. Each lookup reaches its service's implementation, so each read method stays and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true,
+      "effectServiceShakingWiden": 8
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
