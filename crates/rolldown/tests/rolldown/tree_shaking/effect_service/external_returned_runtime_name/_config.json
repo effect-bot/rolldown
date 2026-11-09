@@ -1,5 +1,5 @@
 {
-  "_comment": "A runtime key name (process.env) is handed to an external module that returns it unchanged, and the service is looked up by what comes back. The lookup reaches the service's implementation, so the read method must stay; the unread one is removed. Red: a host value handed to unseen code is not read as a name that may be any key's. Unresolved, pending Tim's decision on whether to exclude this case (covering it collapses the Stripe gate to 0% smaller).",
+  "_comment": "A runtime key name (process.env) is handed to an external module that returns it unchanged, and the service is looked up by what comes back. Tim's decision (2026-11-09): a runtime name string handed to and returned by code the pass can't see or doesn't follow is not read as a name of any key, as for strings that code makes itself. The lookup keeps nothing: both method definitions are removed and the bundle is not run. The decision covers runtime name strings only; keys and literal key names returned by unseen code still reach their services (external_identity_key, external_returned_key_held).",
   "config": {
     "experimental": {
       "effectServiceShaking": true
