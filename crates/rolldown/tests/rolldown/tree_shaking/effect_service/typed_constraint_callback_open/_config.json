@@ -1,0 +1,10 @@
+{
+  "_comment": "A service reaches the callback given to Effect.effectify, whose declared type is a type parameter constrained to (...args: Array<any>) => any. The callback's parameters are open, so the service arrives: the method the callback reads stays and the unread one is removed. With effect 4.1.2 the constraint would not change this mask; the dts unit test constrained_callback_type_parameter_is_open guards deviation (4).",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

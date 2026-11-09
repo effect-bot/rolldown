@@ -1609,3 +1609,36 @@ fn index<'a>(program: &'a Program<'a>, dir: PathBuf, file: Option<String>) -> In
   }
   f
 }
+
+#[cfg(test)]
+mod tests {
+  use super::Dts;
+
+  /// Deviation (4) is gone: a callback declared as a type parameter has every parameter open,
+  /// whatever its constraint says. Read through the constraint, `(value: string) => void` would
+  /// close the parameter, and `(...args: Array<any>) => any` would ignore it.
+  #[test]
+  fn constrained_callback_type_parameter_is_open() {
+    let dir =
+      std::env::temp_dir().join(format!("rolldown-effect-dts-{}-constraint", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("index.d.ts");
+    std::fs::write(
+      &path,
+      [
+        "export declare const concrete: <F extends (value: string) => void>(f: F) => void;",
+        "export declare const loose: <F extends (...args: Array<any>) => any>(f: F) => void;",
+        "export declare const plain: (f: (value: string) => void) => void;",
+        "",
+      ]
+      .join("\n"),
+    )
+    .unwrap();
+    let dts = Dts::default();
+    assert_eq!(dts.callback_masks(&path, "concrete", 1), Some(vec![0xFF]));
+    assert_eq!(dts.callback_masks(&path, "loose", 1), Some(vec![0xFF]));
+    // A callback declared with a concrete parameter type still receives nothing.
+    assert_eq!(dts.callback_masks(&path, "plain", 1), Some(vec![0]));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+}
