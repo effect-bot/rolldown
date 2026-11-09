@@ -11,6 +11,9 @@ fs.writeFileSync(
     'let held;',
     'export const hold = (box) => { held = box; };',
     'export const take = () => held.inner;',
+    'let heldProto;',
+    'export const holdProto = (box) => { heldProto = box; };',
+    'export const takeProto = () => heldProto.inner;',
     '',
   ].join('\n'),
 );
@@ -19,11 +22,12 @@ fs.writeFileSync(
 // own rather than only as the bundle's first failure.
 const code = fs.readFileSync(path.join(import.meta.dirname, 'dist/main.js'), 'utf8');
 const failures = [];
-for (const name of ['nestedUsed', 'heldUsed']) {
+const used = ['nested', 'held', 'inherited', 'literalProto', 'lateProto'];
+for (const name of used.map((n) => `${n}Used`)) {
   if (!new RegExp(`(?<![.\\w$])${name}\\s*[:(]`).test(code))
     failures.push(`${name} should be kept`);
 }
-for (const name of ['nestedUnused', 'heldUnused']) {
+for (const name of used.map((n) => `${n}Unused`)) {
   if (new RegExp(`\\b${name}\\b`).test(code)) failures.push(`${name} should be removed`);
 }
 assert.deepStrictEqual(failures, []);

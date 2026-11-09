@@ -1,5 +1,5 @@
 {
-  "_comment": "An external module hands back keys it reached through ordinary values: one inside an object it was given, and one stored later in an object it already holds. Each lookup through what it returns reaches the service's implementation, so the method read there stays. Handing keys over bails nothing, so the unread methods still prune.",
+  "_comment": "An external module hands back keys it reached through ordinary values: one inside an object it was given, one stored later in an object it already holds, and keys inherited through a prototype given with the object or installed after the handover. Each lookup through what it returns reaches the service's implementation, so the method read there stays. Handing keys over bails nothing, so the unread methods still prune.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

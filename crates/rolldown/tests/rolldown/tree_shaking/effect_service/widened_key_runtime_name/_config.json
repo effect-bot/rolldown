@@ -1,0 +1,11 @@
+{
+  "_comment": "With the widening limit at 8, each eleven-value array is widened. One name in each is read from process.env, so it may name any key: as a bare name or as a key-shaped object's key, one arrives before the literal values widen the array and one is written after. A lookup through the widened element reaches the service's implementation, so the read method stays and the bundle runs; the unread methods are removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true,
+      "effectServiceShakingWiden": 8
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

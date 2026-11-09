@@ -6327,3 +6327,63 @@ fn is_index(name: &str) -> bool {
 fn is_effect_member(name: &str) -> bool {
   name.starts_with("~effect/")
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A service provided under `test/Store`, and a set that widens past a limit of two values
+  /// (three literal names). `runtime` is a value whose name is only known at run time; it
+  /// joins the set before the literal names widen it, or after. Each step is solved before the
+  /// next, so the lookup only arrives once the set is widened.
+  fn widened_lookup(runtime: impl Fn(&mut Analysis) -> ObjId, early: bool, by_name: bool) -> bool {
+    let mut a = Analysis::new();
+    a.widen_limit = 2;
+    let provided = a.alloc(ObjKind::Object, None);
+    let store = a.key_value_var(&ArcStr::from("test/Store"));
+    a.seed(store, provided);
+    let set = a.var();
+    let value = runtime(&mut a);
+    if early {
+      a.seed(set, value);
+      a.solve();
+    }
+    for i in 0..3 {
+      let name = a.str(&format!("test/Other{i}"));
+      a.seed(set, name);
+    }
+    a.solve();
+    assert!(a.vars[set].widened, "the set widens");
+    if !early {
+      a.seed(set, value);
+      a.solve();
+    }
+    let dst = a.var();
+    let use_ = KeyUse::Lookup(dst);
+    a.constrain(set, if by_name { Constraint::KeyNameUse(use_) } else { Constraint::KeyUse(use_) });
+    a.solve();
+    a.pts(dst).contains(&provided)
+  }
+
+  /// A runtime name (`process.env.X`) may name any key, also once the set holding it widened.
+  #[test]
+  fn widened_runtime_name_names_any_key() {
+    let host = |a: &mut Analysis| a.top_host;
+    assert!(widened_lookup(host, true, true), "name before widening");
+    assert!(widened_lookup(host, false, true), "name after widening");
+  }
+
+  /// A key-shaped object whose `key` is a runtime name, in a widened set: the opaque value it
+  /// becomes may be that object, so a lookup through it sees every key.
+  #[test]
+  fn widened_key_shaped_runtime_name_names_any_key() {
+    let keyed = |a: &mut Analysis| {
+      let obj = a.alloc(ObjKind::Object, None);
+      let key = a.field(obj, &ArcStr::from("key"));
+      a.seed(key, a.top_host);
+      obj
+    };
+    assert!(widened_lookup(keyed, true, false), "object before widening");
+    assert!(widened_lookup(keyed, false, false), "object after widening");
+  }
+}
