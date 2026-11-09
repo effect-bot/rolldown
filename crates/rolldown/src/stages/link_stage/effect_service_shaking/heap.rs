@@ -6544,4 +6544,91 @@ mod tests {
   fn crossed_then_widened_late_runtime_name_names_any_key() {
     assert!(crossed_then_widened(true));
   }
+
+  /// A value crosses into program code the pass does not follow first (`first`), then joins
+  /// a set that widens past a limit of two values, then `late` runs. Each step is solved
+  /// before the next. Returns whether a lookup through the widened set (by key, or by name
+  /// with `by_name`) sees the service provided under `test/Store`.
+  fn crossed_then_widened_with(
+    first: impl FnOnce(&mut Analysis) -> ObjId,
+    late: impl FnOnce(&mut Analysis, ObjId),
+    by_name: bool,
+  ) -> bool {
+    let mut a = Analysis::new();
+    a.widen_limit = 2;
+    let provided = a.alloc(ObjKind::Object, None);
+    let store = a.key_value_var(&ArcStr::from("test/Store"));
+    a.seed(store, provided);
+    let obj = first(&mut a);
+    let alias = a.var();
+    a.seed(alias, obj);
+    let class = a.unfollowed_class();
+    a.constrain(alias, Constraint::ClassEscape(class, CLASS_UNFOLLOWED));
+    a.solve();
+    let set = a.var();
+    a.seed(set, obj);
+    for i in 0..3 {
+      let name = a.str(&format!("test/Other{i}"));
+      a.seed(set, name);
+    }
+    a.solve();
+    assert!(a.vars[set].widened, "the set widens");
+    late(&mut a, obj);
+    a.solve();
+    let dst = a.var();
+    let use_ = KeyUse::Lookup(dst);
+    a.constrain(set, if by_name { Constraint::KeyNameUse(use_) } else { Constraint::KeyUse(use_) });
+    a.solve();
+    a.pts(dst).contains(&provided)
+  }
+
+  /// `Object.assign(original, { key: process.env.X })` after widening: the source is a new
+  /// spread edge of an object that crossed another boundary first.
+  #[test]
+  fn crossed_then_widened_late_spread_runtime_name_names_any_key() {
+    let late = |a: &mut Analysis, target: ObjId| {
+      let src = a.alloc(ObjKind::Object, None);
+      let key = a.field(src, &ArcStr::from("key"));
+      a.seed(key, a.top_host);
+      let v = a.var();
+      a.seed(v, src);
+      a.constrain(v, Constraint::SpreadInto(target));
+    };
+    assert!(crossed_then_widened_with(|a| a.alloc(ObjKind::Object, None), late, false));
+  }
+
+  /// A function that crossed another boundary first, then widened: what it returns (a runtime
+  /// name) is what a call of the widened value may return, so a lookup by it sees every key.
+  /// `late` gives the function's return the runtime name only after widening.
+  fn crossed_then_widened_fn(late_return: bool) -> bool {
+    let first = |a: &mut Analysis| {
+      let vars = [a.var(), a.var(), a.var(), a.var(), a.var()];
+      let f = a.fns.push(FnInfo::new(ModuleIdx::from_raw_unchecked(0), 0, FnKind::Arrow, vars));
+      let closure = a.alloc(ObjKind::Closure(f), None);
+      a.fns[f].closure = Some(closure);
+      if !late_return {
+        let ret = a.fns[f].ret;
+        a.seed(ret, a.top_host);
+      }
+      closure
+    };
+    let late = move |a: &mut Analysis, closure: ObjId| {
+      if late_return {
+        let ObjKind::Closure(f) = a.objs[closure].kind else { unreachable!() };
+        let ret = a.fns[f].ret;
+        a.seed(ret, a.top_host);
+      }
+    };
+    crossed_then_widened_with(first, late, true)
+  }
+
+  #[test]
+  fn crossed_then_widened_fn_return_names_any_key() {
+    assert!(crossed_then_widened_fn(false));
+  }
+
+  #[test]
+  fn crossed_then_widened_fn_late_return_names_any_key() {
+    assert!(crossed_then_widened_fn(true));
+  }
 }
