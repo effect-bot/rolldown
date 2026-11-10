@@ -581,9 +581,9 @@ impl Dts {
   /// The type parameters of `sig` a value of which is in a call only inside a service-free
   /// container: each occurs in the signature's parameter and return types (outside `own`, the
   /// type being read), or in the parameters of the call that returned the function (`outer`),
-  /// at least once, and only in the type arguments `effect::SERVICE_FREE_CONTAINERS` lists
-  /// (any of a Schedule's, a Sink's result and leftovers). No service passes through those
-  /// (assumption 4), so such a value holds none. The scan is by name over the declaration's
+  /// at least once, and only in the type arguments of a type `effect::SERVICE_FREE_CONTAINERS`
+  /// lists (a Schedule). No service passes through those (assumption 4), so such a value holds
+  /// none. The scan is by name over the declaration's
   /// text: a name it can't place counts as an occurrence outside a container.
   fn container_only(&self, sig: &Sig<'_>, own: oxc::span::Span) -> Vec<String> {
     use oxc::ast_visit::Visit;
@@ -597,18 +597,13 @@ impl Dts {
       fn visit_ts_type_reference(&mut self, r: &oxc::ast::ast::TSTypeReference<'a>) {
         let container = super::effect::SERVICE_FREE_CONTAINERS
           .iter()
-          .find(|(file, local, _)| self.dts.is_public(self.f, &r.type_name, file, local));
-        let Some((_, _, args)) = container else {
+          .any(|(file, local)| self.dts.is_public(self.f, &r.type_name, file, local));
+        if !container {
           oxc::ast_visit::walk::walk_ts_type_reference(self, r);
           return;
-        };
-        let Some(a) = &r.type_arguments else { return };
-        for (i, t) in a.params.iter().enumerate() {
-          if args.is_empty() || args.contains(&i) {
-            self.spans.push((self.f, t.span()));
-          } else {
-            self.visit_ts_type(t);
-          }
+        }
+        if let Some(a) = &r.type_arguments {
+          self.spans.extend(a.params.iter().map(|t| (self.f, t.span())));
         }
       }
     }
@@ -2083,18 +2078,24 @@ mod tests {
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
   }
 
-  /// A Sink's result and leftovers come back through `Done` (assumption 4), so an Effect
-  /// succeeding with a type parameter that enters the call only as a Sink's result holds no
-  /// service; one that enters as a Sink's input does.
+  /// An Effect succeeding with a type parameter that enters the call only inside a Schedule
+  /// holds no service (assumption 4), also when the Schedule is an argument of the call that
+  /// returned the function (`Sig::outer`). A Sink's result is an ordinary success
+  /// (`Sink.succeed(a)`), so one that enters as a Sink's result flows.
   #[test]
-  fn sink_results_hold_no_service() {
+  fn container_only_results() {
     let dir = std::env::temp_dir()
-      .join(format!("rolldown-effect-dts-{}-sink-results", std::process::id()))
+      .join(format!("rolldown-effect-dts-{}-container-results", std::process::id()))
       .join("dist");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
       dir.join("Effect.d.ts"),
       "export interface Effect<A, E = never, R = never> { a: A; e: E; r: R }\n",
+    )
+    .unwrap();
+    std::fs::write(
+      dir.join("Schedule.d.ts"),
+      "export interface Schedule<Output, Input = unknown> { o: Output; i: Input }\n",
     )
     .unwrap();
     std::fs::write(
@@ -2107,26 +2108,32 @@ mod tests {
       &path,
       [
         "import type { Effect } from \"./Effect.js\";",
+        "import type { Schedule } from \"./Schedule.js\";",
         "import type { Sink } from \"./Sink.js\";",
         "export interface Stream<A, E = never> { a: A; e: E }",
+        "export declare const repeat: {",
+        "  <O>(schedule: Schedule<O>): <A>(self: Effect<A>) => Effect<O>;",
+        "  <A, O>(self: Effect<A>, schedule: Schedule<O>): Effect<O>;",
+        "};",
+        "export declare const beside: <O>(schedule: Schedule<O>, o: O) => Effect<O>;",
         "export declare const run: {",
         "  <A2, A, L>(sink: Sink<A2, A, L>): <E>(self: Stream<A, E>) => Effect<A2, E>;",
         "  <A2, A, L, E>(self: Stream<A, E>, sink: Sink<A2, A, L>): Effect<A2, E>;",
         "};",
-        "export declare const input: <A>(sink: Sink<number, A>) => Effect<A>;",
-        "export declare const beside: <A2>(sink: Sink<A2>, a: A2) => Effect<A2>;",
         "",
       ]
       .join("\n"),
     )
     .unwrap();
     let dts = Dts::default();
-    let run = dts.ret_shape(&path, "run", 2);
-    assert!(run.effect && run.effect_free && !run.effect_param && !run.effect_other);
-    let (_, shape, ..) = dts.returned_call(&path, "run", 1, 1).unwrap();
-    assert!(shape.effect && shape.effect_free && !shape.effect_param && !shape.effect_other);
-    assert!(dts.ret_shape(&path, "input", 1).effect_param);
-    assert!(dts.ret_shape(&path, "beside", 2).effect_param);
+    let free =
+      |s: &super::RetShape| s.effect && s.effect_free && !s.effect_param && !s.effect_other;
+    let flows = |s: &super::RetShape| s.effect && s.effect_param && !s.effect_free;
+    assert!(free(&dts.ret_shape(&path, "repeat", 2)));
+    assert!(free(&dts.returned_call(&path, "repeat", 1, 1).unwrap().1));
+    assert!(flows(&dts.ret_shape(&path, "beside", 2)));
+    assert!(flows(&dts.ret_shape(&path, "run", 2)));
+    assert!(flows(&dts.returned_call(&path, "run", 1, 1).unwrap().1));
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
   }
 

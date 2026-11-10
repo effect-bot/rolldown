@@ -1,0 +1,10 @@
+{
+  "_comment": "Sink.succeed(store) ends with the service as an ordinary successful result, and Stream.run succeeds with it. A Sink's result is not a Done value, so the method the program calls on it stays and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

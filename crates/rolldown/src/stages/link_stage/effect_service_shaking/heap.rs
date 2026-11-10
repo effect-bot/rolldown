@@ -3803,7 +3803,7 @@ impl Analysis {
       if ret.effect_param {
         self.copy(slot, success);
       }
-      // A value that comes back only through a service-free container (a Sink's result): an
+      // A value that comes back only through a service-free container (a Schedule's output): an
       // unknown value that holds no service. A string among them may still name a member.
       if ret.effect_free {
         self.seed(success, self.top_host);
