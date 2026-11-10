@@ -1988,6 +1988,9 @@ impl Analysis {
           if self.recheck_all() | self.recheck_deferred() | self.settle_admissions() {
             continue;
           }
+          if self.release_admissions() {
+            continue;
+          }
           break;
         }
         continue;
@@ -3982,24 +3985,45 @@ impl Analysis {
     }
   }
 
-  /// At a point where the solve has settled, decides every Effect and promise handover held
-  /// back since the last one, all at once: one that may now hold a service is admitted, and
-  /// the rest go to effect's code (`hold_back`). Within a phase of the solve the outcome does
-  /// not depend on the order the solve met a handover and what the value comes to succeed
-  /// with. One that comes to hold a service in a later phase, after it went, bails that
-  /// service (sound, less precise). Returns whether any was decided.
+  /// At a point where the solve has settled: admits every held-back Effect and promise that
+  /// may now hold a service, and keeps the rest waiting. Returns whether any was admitted; the
+  /// solve then runs again, so what an admission hands on (the success of another waiting
+  /// value, directly or through copies) is seen before anything waiting is given up
+  /// (`release_admissions`). Admissions only add, so the set admitted at the end does not
+  /// depend on the order the solve met the handovers in.
   fn settle_admissions(&mut self) -> bool {
     if self.held_admissions.is_empty() {
       return false;
     }
-    for (obj, dst) in std::mem::take(&mut self.held_admissions) {
+    let pending = std::mem::take(&mut self.held_admissions);
+    let mut keep = Vec::with_capacity(pending.len());
+    let mut admitted = false;
+    for (obj, dst) in pending {
       if self.may_hold(obj) {
         self.admission_stats.0 += 1;
         self.seed(dst, obj);
+        admitted = true;
       } else {
-        self.admission_stats.1 += 1;
-        self.hold_back(obj, true);
+        keep.push((obj, dst));
       }
+    }
+    keep.append(&mut self.held_admissions);
+    self.held_admissions = keep;
+    admitted
+  }
+
+  /// Once the solve has settled and no waiting value was admitted (`settle_admissions`): every
+  /// Effect and promise still waiting holds no service at this fixpoint and goes to effect's
+  /// code, all at once (`hold_back` only adds constraints, so no release changes what another
+  /// is decided on). What it succeeds with later still goes there as it arrives (`EscapeOut`),
+  /// so a service reaching it after this bails (sound, less precise). Returns whether any went.
+  fn release_admissions(&mut self) -> bool {
+    if self.held_admissions.is_empty() {
+      return false;
+    }
+    for (obj, _) in std::mem::take(&mut self.held_admissions) {
+      self.admission_stats.1 += 1;
+      self.hold_back(obj, true);
     }
     true
   }
@@ -6658,6 +6682,118 @@ mod tests {
     for admission_first in [true, false] {
       assert_eq!(admitted_late(admission_first, true), (true, false), "service, {admission_first}");
       assert_eq!(admitted_late(admission_first, false), (false, true), "data, {admission_first}");
+    }
+  }
+
+  /// The shape of a `dependent_admissions` case.
+  #[derive(Clone, Copy, Debug)]
+  struct Dependent {
+    promise: bool,
+    through_copy: bool,
+    first_met: bool,
+  }
+
+  /// Two handovers wait for the solve to settle: `first` succeeds with what arrives through
+  /// copies, and what `first`'s admission hands on is what `second` succeeds with, directly
+  /// (`through_copy` false: `first`'s destination is `second`'s success) or through a copy.
+  /// Both are Effects, or both promises (`promise`), and the handovers are met in the order
+  /// given (`first_met`). `service`: what arrives is a provided service rather than plain
+  /// data. Returns whether each was admitted and whether what arrived went to effect's code.
+  fn dependent_admissions(case: Dependent, service: bool) -> (bool, bool, bool) {
+    let Dependent { promise, through_copy, first_met } = case;
+    let mut a = Analysis::new();
+    let handed = |a: &mut Analysis, start: u32| {
+      if promise {
+        let value = a.var();
+        (a.alloc(ObjKind::Promise { value }, None), value)
+      } else {
+        let (o, success, _) =
+          a.new_effect(Site { module: ModuleIdx::from_raw_unchecked(0), start, sub: 0 }, 0);
+        (o, success)
+      }
+    };
+    let (first, first_success) = handed(&mut a, 1);
+    let (second, second_success) = handed(&mut a, 2);
+    let first_dst = if through_copy { a.var() } else { second_success };
+    let second_dst = a.var();
+    if first_met {
+      a.admit_typed_with(first, first_dst, true);
+      a.admit_typed_with(second, second_dst, true);
+    } else {
+      a.admit_typed_with(second, second_dst, true);
+      a.admit_typed_with(first, first_dst, true);
+    }
+    assert_eq!(a.held_admissions.len(), 2, "both wait for the solve to settle");
+    if through_copy {
+      a.copy(first_dst, second_success);
+    }
+    let value = a.alloc(ObjKind::Object, None);
+    if service {
+      a.seed(a.all_values, value);
+      a.seed(a.unknown_key_values, value);
+    }
+    let chain = [a.var(), a.var()];
+    a.copy(chain[0], chain[1]);
+    a.copy(chain[1], first_success);
+    a.seed(chain[0], value);
+    a.solve();
+    (
+      a.vars[first_dst].pts.contains(&first),
+      a.vars[second_dst].pts.contains(&second),
+      a.objs[value].escaped.is_some(),
+    )
+  }
+
+  /// An admission that makes another value admissible is propagated before any value still
+  /// held back goes to effect's code: both are admitted and the service stays the program's,
+  /// whichever handover the solve met first, and whether the second sees the first directly
+  /// or only once a copy has run. When nothing arrives that may be a service, both go, and so
+  /// does what arrived.
+  #[test]
+  fn dependent_admissions_are_order_independent() {
+    let mut wrong = vec![];
+    for promise in [false, true] {
+      for through_copy in [false, true] {
+        for first_met in [true, false] {
+          for (service, expected) in [(true, (true, true, false)), (false, (false, false, true))] {
+            let case = Dependent { promise, through_copy, first_met };
+            let got = dependent_admissions(case, service);
+            if got != expected {
+              wrong.push(format!("{case:?}, service {service}: {got:?}"));
+            }
+          }
+        }
+      }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+  }
+
+  /// An Effect or promise given up at one fixpoint keeps its subscription: a service it comes
+  /// to succeed with in a later phase of the solve goes to effect's code (bails), and the value
+  /// is not admitted after the fact.
+  #[test]
+  fn released_admission_keeps_its_subscription() {
+    for promise in [false, true] {
+      let mut a = Analysis::new();
+      let (handed, success) = if promise {
+        let value = a.var();
+        (a.alloc(ObjKind::Promise { value }, None), value)
+      } else {
+        let (o, success, _) =
+          a.new_effect(Site { module: ModuleIdx::from_raw_unchecked(0), start: 1, sub: 0 }, 0);
+        (o, success)
+      };
+      let dst = a.var();
+      a.admit_typed_with(handed, dst, true);
+      a.solve();
+      assert!(a.held_admissions.is_empty(), "promise {promise}: released at the fixpoint");
+      let service = a.alloc(ObjKind::Object, None);
+      a.seed(a.all_values, service);
+      a.seed(a.unknown_key_values, service);
+      a.seed(success, service);
+      a.solve();
+      assert!(!a.vars[dst].pts.contains(&handed), "promise {promise}: not admitted later");
+      assert!(a.objs[service].escaped.is_some(), "promise {promise}: the late service bails");
     }
   }
 }
