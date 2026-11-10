@@ -1,0 +1,10 @@
+{
+  "_comment": "Exports of a type-modelled module (a package named `effect`) used as computed method names. One reached through top-level const aliases, an import or a re-export is its literal key: those methods stay and the unread one goes. One reached through a `let` or `var` that a write changes (`export let`, `export var`, or a const aliasing a reassigned `let`) holds a name the pass can't fix, so every method of those services stays and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

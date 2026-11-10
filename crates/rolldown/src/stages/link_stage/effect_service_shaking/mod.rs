@@ -373,7 +373,7 @@ impl LinkStage<'_> {
                   // A constant key (`Equal.symbol`, `Redactable.symbolRedactable`) is that key:
                   // a summary of it would make every computed member written with it a store
                   // under an unknown name.
-                  let obj = match chain.iter().find_map(|sym| self.constant_key_of(*sym)) {
+                  let obj = match self.constant_key_through(&chain) {
                     Some(key) => a.str(&key),
                     None => {
                       let dts = declarations(module).expect("checked with the declarations");
@@ -974,6 +974,22 @@ impl LinkStage<'_> {
         let heritage = class.heritage.as_ref()?;
         let _: &[ClassElement<'_>] = &class.body.body;
         return effect::key_declaration(&heritage.expression);
+      }
+    }
+    None
+  }
+
+  /// The key an export holds through its chain of value aliases (`alias_chain`, which already
+  /// resolves imports and re-exports to the declarations they name). Every hop must be a
+  /// top-level `const`, so no write can change what the export holds: a `let` or `var` on
+  /// the way (`export let key = initial; key = 'other'`) leaves it a summary, whatever the
+  /// initialiser it started from. The first hop holding a literal key names it.
+  fn constant_key_through(&self, chain: &[SymbolRef]) -> Option<String> {
+    for symbol in chain {
+      let ast = self.ast_table[symbol.owner].as_ref()?;
+      find_top_level_const_init(ast.program(), symbol.symbol)?;
+      if let Some(key) = self.constant_key_of(*symbol) {
+        return Some(key);
       }
     }
     None
