@@ -110,6 +110,9 @@ impl Fixture {
         effect_fixture::run_in_child(name, &test, limit);
         return;
       }
+      if effect_fixture::is_child() {
+        effect_fixture::wait_until_owned();
+      }
     }
     // The analysis runs in this process; cap its memory so a runaway fails the run instead of
     // exhausting the host. See `memory_guard`.
@@ -255,7 +258,6 @@ mod tests {
   #[cfg(all(unix, not(target_os = "linux")))]
   fn running(pid: u32) -> bool {
     // A zombie still counts until it is reaped, which `assert_stopped` waits for.
-    #[expect(clippy::cast_possible_wrap)]
     let pid = pid as libc::pid_t;
     // SAFETY: signal 0 only checks that the process exists.
     unsafe { libc::kill(pid, 0) == 0 }
