@@ -929,6 +929,12 @@ pub struct Analysis {
   handed_names: FxHashSet<ArcStr>,
   handed_all: bool,
   handed_lookups: FxHashSet<VarId>,
+  /// Strings known to start with a constant (`prefixed_host`): each is a host value of its own,
+  /// so every rule reads it as host data, except a key's name, which names only the keys with
+  /// that prefix. `prefix_lookups` are the lookups through such names, seen by keys named later.
+  prefixes: FxHashMap<ObjId, ArcStr>,
+  prefix_hosts: FxHashMap<ArcStr, ObjId>,
+  prefix_lookups: Vec<(ArcStr, VarId)>,
   /// Widening (`widen`): the set size past which a variable is widened, the boundary, the
   /// number of variables widened, and how many variables the analysis starts with.
   pub widen_limit: usize,
@@ -1209,6 +1215,9 @@ impl Analysis {
       handed_names: FxHashSet::default(),
       handed_all: false,
       handed_lookups: FxHashSet::default(),
+      prefixes: FxHashMap::default(),
+      prefix_hosts: FxHashMap::default(),
+      prefix_lookups: Vec::new(),
       max_entries: Self::MAX_ENTRIES,
       widen_limit: std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_WIDEN")
         .ok()
@@ -1423,7 +1432,61 @@ impl Analysis {
         self.copy(v, dst);
       }
     }
+    let prefixed: Vec<VarId> = self
+      .prefix_lookups
+      .iter()
+      .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
+      .map(|(_, dst)| *dst)
+      .collect();
+    for dst in prefixed {
+      self.copy(v, dst);
+    }
     v
+  }
+
+  /// A string the program builds from a constant prefix and run-time parts (`\`a/${x}\``,
+  /// `'a/' + x`). It is host data like any run-time string: a host value (`Top(Host)`) of its
+  /// own, one per prefix, so every rule that reads host values reads it the same way. As a key's
+  /// name it names only the keys whose names start with the prefix (`prefix_key_use`).
+  pub fn prefixed_host(&mut self, prefix: &str) -> ObjId {
+    if let Some(obj) = self.prefix_hosts.get(prefix) {
+      return *obj;
+    }
+    let prefix = ArcStr::from(prefix);
+    let obj = self.alloc(ObjKind::Top(Flavour::Host), None);
+    self.prefix_hosts.insert(prefix.clone(), obj);
+    self.prefixes.insert(obj, prefix);
+    obj
+  }
+
+  /// A key named by a string with a known prefix (`prefixed_host`). A lookup sees what is
+  /// provided under every key with that prefix, now or named later, under names the pass does
+  /// not know, and under effect's keys when one of them has the prefix. Providing through it,
+  /// or reading its names, is read as for a key of any name.
+  fn prefix_key_use(&mut self, prefix: &ArcStr, use_: &KeyUse) {
+    let KeyUse::Lookup(dst) = use_ else {
+      let all = self.all_keys;
+      self.key_use(all, use_);
+      return;
+    };
+    let dst = *dst;
+    if self.prefix_lookups.iter().any(|(p, d)| *d == dst && p == prefix) {
+      return;
+    }
+    self.prefix_lookups.push((prefix.clone(), dst));
+    let named: Vec<VarId> = self
+      .key_values
+      .iter()
+      .filter(|(name, _)| name.starts_with(prefix.as_str()))
+      .map(|(_, v)| *v)
+      .collect();
+    for v in named {
+      self.copy(v, dst);
+    }
+    self.copy(self.unknown_key_values, dst);
+    if self.effect_keys.iter().any(|k| k.starts_with(prefix.as_str())) {
+      self.copy(self.effect_key_values, dst);
+    }
   }
 
   /// A value crossed a boundary (unseen code, effect's code, a host builtin, class code or a
@@ -5513,6 +5576,10 @@ impl Analysis {
       ObjKind::Str(_) | ObjKind::AllKeys => self.key_use(obj, use_),
       ObjKind::Top(_) if obj == self.top_effect => {
         self.constrain(self.effect_key_strings, Constraint::KeyUse(use_.clone()));
+      }
+      ObjKind::Top(Flavour::Host) if self.prefixes.contains_key(&obj) => {
+        let prefix = self.prefixes[&obj].clone();
+        self.prefix_key_use(&prefix, use_);
       }
       ObjKind::Num(_) | ObjKind::Prim | ObjKind::Top(Flavour::Host) => {
         let all = self.all_keys;

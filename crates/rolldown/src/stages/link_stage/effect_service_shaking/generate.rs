@@ -254,6 +254,43 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     v
   }
 
+  /// A string built at run time: host data, or a string known to start with a constant
+  /// (`Analysis::prefixed_host`). An addition with no constant string at its start may be a
+  /// number, which is host data too.
+  fn run_time_string(&mut self, expr: &Expression<'_>) -> VarId {
+    match Self::const_prefix(expr) {
+      Some(prefix) if !prefix.is_empty() => {
+        let obj = self.a.prefixed_host(&prefix);
+        let v = self.fresh();
+        self.seed(v, obj);
+        v
+      }
+      _ => self.sh.top_host,
+    }
+  }
+
+  /// The constant start of a string expression: all of a constant string, the first part of a
+  /// template literal, or the constant start of an addition's left side (followed by its right
+  /// side's when the left side is constant).
+  fn const_prefix(expr: &Expression<'_>) -> Option<String> {
+    if let Some(s) = Self::const_string_of(expr) {
+      return Some(s);
+    }
+    match expr {
+      Expression::TemplateLiteral(t) => {
+        Some(t.quasis.first()?.value.cooked.as_ref()?.as_str()?.to_string())
+      }
+      Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
+        match Self::const_string_of(&b.left) {
+          Some(l) => Some(l + &Self::const_prefix(&b.right).unwrap_or_default()),
+          None => Self::const_prefix(&b.left),
+        }
+      }
+      Expression::ParenthesizedExpression(p) => Self::const_prefix(&p.expression),
+      _ => None,
+    }
+  }
+
   fn str_var(&mut self, s: &str) -> VarId {
     let obj = self.a.str(s);
     let v = self.fresh();
@@ -1385,7 +1422,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
           let v = self.expr(e);
           self.constrain(v, Constraint::Protocol(Protocol::Primitive));
         }
-        self.sh.top_host
+        self.run_time_string(expr)
       }
       Expression::Identifier(id) => self.reference_var(id),
       Expression::Super(_) => self.super_prototype(),
@@ -1448,7 +1485,11 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
           | BinaryOperator::Division => {
             self.constrain(l, Constraint::Protocol(Protocol::Primitive));
             self.constrain(r, Constraint::Protocol(Protocol::Primitive));
-            if b.operator == BinaryOperator::Addition { self.sh.top_host } else { self.sh.prim }
+            if b.operator == BinaryOperator::Addition {
+              self.run_time_string(expr)
+            } else {
+              self.sh.prim
+            }
           }
           _ => self.sh.prim,
         }
