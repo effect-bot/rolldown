@@ -2,8 +2,9 @@
 //! services. This is the only file that names an Effect API.
 //!
 //! Rules bind to the canonical symbols of the public exports listed in
-//! `MODULES` (see `mod.rs`), so `internalEffect.map` inside `effect`'s own
-//! modules hits the same rule as `Effect.map` in user code. The modelled
+//! `MODULES` (see `mod.rs`), so `internalEffect.map` inside a module analysed
+//! under the service-constructor exception hits the same rule as `Effect.map`
+//! in user code. The modelled
 //! modules are the public ones listed here and the internal modules their ruled
 //! exports resolve into. Their exports without an explicit rule get
 //! `effect:default`, which is sound by construction: callbacks receive every
@@ -364,8 +365,8 @@ pub const MODULES: &[(&str, &[(&str, Spec)])] = &[
   ),
 ];
 
-/// Public modules that are otherwise ordinary code: only the exports listed here take a rule, and
-/// the rest of each module is analysed generically. Effect's own formatting and structural
+/// Public modules that are otherwise type-modelled: only the exports listed here take a rule, and
+/// the rest of each module is modelled from its `.d.ts`. Effect's own formatting and structural
 /// equality walk a value's keys, which keeps nothing (issue, "When a method is kept").
 pub const LISTED_MODULES: &[(&str, &[(&str, Spec)])] = &[
   ("Equal", &[("equals", Spec::Rule("effect:Equal.equals"))]),

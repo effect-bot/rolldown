@@ -136,7 +136,8 @@ impl LinkStage<'_> {
     // The modelled modules are the public modules `MODULES` names, plus the modules their
     // explicitly ruled exports resolve into (`Effect.map` is `internal.map`, so
     // `internal/effect.js` sits behind rules too). Every other module of the package is
-    // ordinary code and analysed generically. See design section 3.
+    // type-modelled from its `.d.ts`, except the service-constructor modules, which are analysed
+    // as ordinary code (below). See design sections 3 and 11.
     let mut effect_found = false;
     let mut effect_external = false;
     let mut unsupported_version: Option<String> = None;
@@ -436,8 +437,9 @@ impl LinkStage<'_> {
         }
       }
     }
-    // The listed exports of otherwise ordinary modules (`effect::LISTED_MODULES`): their
-    // declarations take the rule, and the generator skips them.
+    // The listed exports of otherwise type-modelled modules (`effect::LISTED_MODULES`): their
+    // declarations take the rule over the typed object. Should a listed module be analysed under
+    // the service-constructor exception, the generator skips them, so the rule still holds.
     for (module, specs) in &listed_modules {
       for (name, spec) in *specs {
         let Some(export) = self.metas[*module].resolved_exports.get(*name) else { continue };
@@ -614,28 +616,17 @@ impl LinkStage<'_> {
       }
     }
 
-    // == type bounds: the exported functions of `effect`'s ordinary modules, bounded by the
-    // `.d.ts` next to each (design section 8). Their bounds are resolved when first called.
-    for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
-      let Module::Normal(normal) = module else { continue };
-      if modelled.contains(&normal.idx) {
-        continue;
-      }
-      let is_effect = normal
-        .originative_resolved_id
-        .package_json
-        .as_ref()
-        .is_some_and(|pkg| pkg.name() == Some("effect"));
-      let Some(js) = normal.id.as_str().strip_suffix(".js").filter(|_| is_effect) else { continue };
-      let dts_path = std::path::PathBuf::from(format!("{js}.d.ts"));
-      if !dts_path.exists() {
-        continue;
-      }
-      let Some(ast) = self.ast_table[normal.idx].as_ref() else { continue };
+    // == type bounds (design section 8): the exported functions of the modules analysed under the
+    // service-constructor exception, bounded by the `.d.ts` next to each and resolved when first
+    // called. They are the only `effect` functions whose bodies are analysed; a call into any
+    // other `effect` module goes through the type model, which reads the same declarations.
+    for module in order.iter().copied().filter(|m| analysed.contains(m) && !modelled.contains(m)) {
+      let dts_path = declarations(module).expect("checked with the declarations");
+      let Some(ast) = self.ast_table[module].as_ref() else { continue };
       for (name, f, returned) in exported_functions(ast.program()) {
-        a.lazy_bounds.insert((normal.idx, f.0), (dts_path.clone(), name.clone(), f.1, false));
+        a.lazy_bounds.insert((module, f.0), (dts_path.clone(), name.clone(), f.1, false));
         if let Some(r) = returned {
-          a.lazy_bounds.entry((normal.idx, r.0)).or_insert((dts_path.clone(), name, r.1, true));
+          a.lazy_bounds.entry((module, r.0)).or_insert((dts_path.clone(), name, r.1, true));
         }
       }
     }
@@ -933,7 +924,8 @@ impl LinkStage<'_> {
   }
 
   /// A public export and the declarations it aliases: `export const map = internal.map`
-  /// binds the rule to `internal.map`'s declaration too, so internal callers hit it.
+  /// binds the rule to `internal.map`'s declaration too, so a call that reaches the declaration
+  /// another way (from a module analysed under the service-constructor exception) hits it.
   fn alias_chain(&self, symbol: SymbolRef) -> Vec<SymbolRef> {
     let mut chain = vec![];
     let mut current = self.symbols.canonical_ref_for(symbol);

@@ -823,9 +823,11 @@ impl Dts {
     if out.iter().all(Option::is_none) { None } else { Some(out) }
   }
 
-  /// The bounds of the function that the function exported as `name` returns (`(input) => ...`
-  /// in `decodeUnknownSync(schema)(input)`), which takes `nparams` parameters: the call
-  /// signatures of each declared return type, with the outer type parameters still open.
+  /// The bounds of the function that the function exported as `name` returns, which takes
+  /// `nparams` parameters: the call signatures of each declared return type, with the outer type
+  /// parameters still open. Only a module analysed under the service-constructor exception needs
+  /// this: `internal/glob.js`'s `make` returns the `glob` method `FileSystem.make` installs. A
+  /// type-modelled export's returned function is bounded by `returned_call` instead.
   pub fn returned_bounds(&self, path: &Path, name: &str, nparams: usize) -> Bounds {
     let start = std::time::Instant::now();
     let mut inner = vec![];

@@ -867,7 +867,8 @@ pub struct Analysis {
   /// For each variable receiving what an object run as an effect yields, the variable whose
   /// objects are read wholesale into it (`success_of`).
   effect_gates: FxHashMap<VarId, VarId>,
-  /// Type bounds of exported functions of `effect`'s ordinary modules, by (module, span start):
+  /// Type bounds of the exported functions of the modules analysed under the service-constructor
+  /// exception, by (module, span start):
   /// a type index per parameter and for the return value (`None` is open).
   fn_bounds: FxHashMap<(ModuleIdx, u32), FnBounds>,
   /// Exported functions whose bounds are resolved when first called: their `.d.ts`, export name,
@@ -5151,8 +5152,7 @@ impl Analysis {
         // A user object used as an effect (Effectable): what it yields is what its fields hold,
         // at worst. Effect's combinators take an `Effect`, whose type requires the
         // `~effect/Effect` member, so an object that can't have it is not run: it waits like any
-        // value a declared type rejects (design section 8). Schedule's own code hands a
-        // callback's result to `Effect.map` only once `isEffect` holds, for example.
+        // value a declared type rejects (design section 8).
         let ty = self.effect_type();
         let gate = match self.effect_gates.get(&dst) {
           Some(g) => *g,
