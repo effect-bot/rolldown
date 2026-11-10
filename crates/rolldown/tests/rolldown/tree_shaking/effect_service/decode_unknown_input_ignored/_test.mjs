@@ -9,11 +9,13 @@ import path from 'node:path';
 // unbundled.
 //
 // The program's own call sites stay in the bundle, so the check looks for the
-// method definitions (`name:` in the service object), not the bare name.
+// method definitions (`name: () =>` in the service object), not the bare name.
+// It requires a function value: `PluginShape`'s schema field is also named
+// `greet` (`Struct({ greet: declare(...) })`), and it is not a method.
 const code = fs.readFileSync(path.join(import.meta.dirname, 'dist/main.js'), 'utf8');
 const failures = [];
 for (const name of ['flush', 'greet']) {
-  if (new RegExp(`(?<![.\\w$])${name}\\s*:`).test(code)) {
+  if (new RegExp(`(?<![.\\w$])${name}\\s*:\\s*(?:\\(|async\\b|function\\b)`).test(code)) {
     failures.push(`the definition of ${name} should be removed`);
   }
 }
