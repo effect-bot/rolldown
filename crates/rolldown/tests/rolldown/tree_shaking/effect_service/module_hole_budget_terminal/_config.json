@@ -1,0 +1,11 @@
+{
+  "_comment": "Running out of budget is final across module-hole solves: the first solve, with the hole running every function handed to it, goes over the budget the config sets, so every method stays even though a second solve, with the hole analysed, would fit.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true,
+      "effectServiceShakingMaxEntries": 5000
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

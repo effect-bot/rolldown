@@ -33,6 +33,15 @@ use self::generate::{Gen, ModuleFacts, Shared};
 use self::heap::{Analysis, Constraint, Flavour, FnId, ObjKind, Pending};
 use super::LinkStage;
 
+/// The work of every solve of one build (`effect_service_shaking_with` runs one per round).
+#[derive(Default)]
+struct Rounds {
+  count: usize,
+  entries: u64,
+  steps: u64,
+  solve: std::time::Duration,
+}
+
 impl LinkStage<'_> {
   fn warn_effect_service_shaking(&mut self, reason: String) {
     if self.options.checks.contains(EventKindSwitcher::EffectServiceShaking) {
@@ -51,7 +60,8 @@ impl LinkStage<'_> {
     // Each solve that finds a service, a key or a provider in a module hole analyses those
     // modules in the next one (`module_holes`). The set only grows, so this ends.
     let mut analysed_holes: FxHashSet<ModuleIdx> = FxHashSet::default();
-    while self.effect_service_shaking_with(start, &mut analysed_holes) {}
+    let mut rounds = Rounds::default();
+    while self.effect_service_shaking_with(start, &mut analysed_holes, &mut rounds) {}
   }
 
   /// One solve with the module holes `module_holes` leaves after `analysed_holes`. Returns
@@ -61,6 +71,7 @@ impl LinkStage<'_> {
     &mut self,
     start: std::time::Instant,
     analysed_holes: &mut FxHashSet<ModuleIdx>,
+    rounds: &mut Rounds,
   ) -> bool {
     let debug = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_DEBUG").is_some();
     let report_enabled = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some();
@@ -684,7 +695,12 @@ impl LinkStage<'_> {
       a.activate(f);
     }
     phase!("solving");
+    let solve_start = std::time::Instant::now();
     a.solve();
+    rounds.count += 1;
+    rounds.entries += a.total_pts + a.total_copies;
+    rounds.steps += a.steps;
+    rounds.solve += solve_start.elapsed();
     // Refinement: a module hole that a service, a key or a provider reached is analysed in the
     // next solve, so that it keeps no more methods than its code reads.
     let reached: Vec<ModuleIdx> = {
@@ -694,7 +710,8 @@ impl LinkStage<'_> {
       v.dedup();
       v
     };
-    if !reached.is_empty() {
+    // Running out of budget is terminal: every method is kept, with no further solve.
+    if !reached.is_empty() && !a.bail_all {
       if report_enabled || debug {
         let names: Vec<&str> =
           reached.iter().map(|m| self.module_table[*m].id().as_str()).collect();
@@ -903,6 +920,13 @@ impl LinkStage<'_> {
         a.steps,
         solved.as_millis(),
         start.elapsed().as_millis()
+      );
+      eprintln!(
+        "[effect-service-shaking] solves: {} (the line above is the last; vars, objects, entries and steps are its own, solve and total ms run from the first); all solves: {} entries, {} steps, {} ms solving",
+        rounds.count,
+        rounds.entries,
+        rounds.steps,
+        rounds.solve.as_millis()
       );
       if report.bail_all {
         eprintln!("[effect-service-shaking] every key kept:");
