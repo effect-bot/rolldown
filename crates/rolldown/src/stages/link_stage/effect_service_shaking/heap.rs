@@ -490,6 +490,10 @@ pub enum Constraint {
   /// Values entering a type-modelled value's slot (`Analysis::slot_in`); the object is the
   /// stand-in for what the admission filter holds back.
   SlotIn(VarId, ObjId),
+  /// A Sink handed to a call that succeeds with the Sink's result (`RetShape::effect_sink`):
+  /// what a type-modelled value holds goes to the first variable. Anything else stands for
+  /// what the call holds: the call's result object and its slot (the third) go there too.
+  SinkOf(VarId, ObjId, VarId),
   /// A call reaching only the functions (closures, classes, builtins) of the variable.
   CallFn(Box<Call>),
   /// A protocol method call (`protocol_call`) with the type model on: a summary found under a
@@ -613,6 +617,7 @@ impl Constraint {
         C::TypedReceiverIf(*callee, *recv, v(*slot), v(*back), *site)
       }
       C::SlotIn(dst, stand_in) => C::SlotIn(v(*dst), *stand_in),
+      C::SinkOf(dst, result, slot) => C::SinkOf(v(*dst), *result, v(*slot)),
       C::TypedConcrete(ty, site) => C::TypedConcrete(*ty, *site),
       C::AdmitTyped(dst, prim) => C::AdmitTyped(v(*dst), *prim),
       C::TypedNested(slot, back, site, mask) => C::TypedNested(v(*slot), v(*back), *site, *mask),
@@ -2358,6 +2363,13 @@ impl Analysis {
       Constraint::TypedArg(slot, back, site, mask, prim, opaque) => {
         self.typed_arg(obj, *slot, *back, *site, *mask, *prim, *opaque);
       }
+      Constraint::SinkOf(dst, result, slot) => match self.objs[obj].kind {
+        ObjKind::Typed { slot: held, .. } if !self.is_stand_in(obj) => self.copy(held, *dst),
+        _ => {
+          self.seed(*dst, *result);
+          self.copy(*slot, *dst);
+        }
+      },
       Constraint::TypedReceiver(callee, name, slot, back, site) => {
         if matches!(self.objs[obj].kind, ObjKind::Typed { .. }) {
           self.typed_arg(obj, *slot, *back, *site, 0, false, false);
@@ -3808,6 +3820,10 @@ impl Analysis {
       if ret.effect_free {
         self.seed(success, self.top_host);
       }
+      if ret.effect_sink != 0 {
+        let outer = (export == NO_EXPORT && !self.is_stand_in(callee)).then_some(callee_slot);
+        self.sink_success(success, (result, slot), ret.effect_sink, &call.args, outer);
+      }
       self.seed(call.ret, eff);
     }
     if ret.free {
@@ -4711,6 +4727,46 @@ impl Analysis {
         let _ = stand_in;
         self.admit_typed(obj, dst);
       }
+    }
+  }
+
+  /// What a call succeeds with when that is a Sink's result (`RetShape::effect_sink`,
+  /// `Stream.run`): what the Sink it is handed holds, and the stream elements the Sink
+  /// collected, which are not tracked (Tim's decision of 2026-11-10): an unknown value that
+  /// holds no service. `mask` has bit `j` for a Sink at argument `j` and bit 7 for one handed
+  /// to the call that returned this function, whose slot is `outer`. A Sink the call can't
+  /// place stands for all the call holds: its result object and slot (`call`).
+  fn sink_success(
+    &mut self,
+    success: VarId,
+    call: (ObjId, VarId),
+    mask: u8,
+    args: &[Arg],
+    outer: Option<VarId>,
+  ) {
+    let (result, slot) = call;
+    self.seed(success, self.top_host);
+    let mut whole = false;
+    for (j, a) in args.iter().enumerate().take(7) {
+      if mask & (1 << j) == 0 {
+        continue;
+      }
+      match a {
+        Arg::Var(v) => self.constrain(*v, Constraint::SinkOf(success, result, slot)),
+        Arg::Spread(_) => whole = true,
+      }
+    }
+    // A Sink position past the arguments given.
+    whole |= (0..7).any(|j| mask & (1 << j) != 0 && j >= args.len());
+    if mask & 0x80 != 0 {
+      match outer {
+        Some(o) => self.copy(o, success),
+        None => whole = true,
+      }
+    }
+    if whole {
+      self.seed(success, result);
+      self.copy(slot, success);
     }
   }
 

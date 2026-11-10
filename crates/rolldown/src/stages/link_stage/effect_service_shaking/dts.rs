@@ -101,6 +101,11 @@ pub struct RetShape {
   /// `Effect` succeeding with one.
   pub free: bool,
   pub effect_free: bool,
+  /// An `Effect` succeeding with a type parameter that occurs among the parameters only as a
+  /// Sink's result (`Dts::sink_results`): the success holds what the arguments at these
+  /// positions hold (bit `j` for parameter `j`, bit 7 for the parameters of the call that
+  /// returned the function), not what the call's other arguments hold.
+  pub effect_sink: u8,
   pub other: bool,
   /// An object type that mentions no type parameter: what the call returns holds nothing the
   /// caller handed it (direction 2: results at concrete types are service-free).
@@ -192,6 +197,14 @@ pub struct Dts {
   pub files_parsed: Cell<usize>,
 }
 
+/// How a signature's return reads its type parameters (`Dts::sig_ret_shape`): those whose
+/// values are in the call only inside a service-free container, and those that occur among the
+/// parameters only as a Sink's result, with their positions.
+struct Routes {
+  free: Vec<String>,
+  sink: Vec<(String, u8)>,
+}
+
 fn spec_path(dir: &Path, spec: &str) -> Option<PathBuf> {
   if !spec.starts_with('.') {
     return None;
@@ -264,8 +277,11 @@ impl Dts {
     use oxc::span::GetSpan;
     match sig.ret {
       Some(t) => {
-        let free = self.container_only(sig, t.span());
-        self.ret_shape_of(sig.file, t, &sig.tparams, &free, out, 0);
+        let routes = Routes {
+          free: self.container_only(sig, t.span()),
+          sink: self.sink_results(sig, t.span()),
+        };
+        self.ret_shape_of(sig.file, t, &sig.tparams, &routes, out, 0);
       }
       None => out.unknown = true,
     }
@@ -276,7 +292,7 @@ impl Dts {
     f: usize,
     t: &TSType<'_>,
     tp: &[String],
-    free: &[String],
+    routes: &Routes,
     out: &mut RetShape,
     depth: u32,
   ) {
@@ -286,17 +302,17 @@ impl Dts {
     }
     match t {
       TSType::TSParenthesizedType(p) => {
-        self.ret_shape_of(f, &p.type_annotation, tp, free, out, depth + 1);
+        self.ret_shape_of(f, &p.type_annotation, tp, routes, out, depth + 1);
       }
       TSType::TSUnionType(u) => {
         for m in &u.types {
-          self.ret_shape_of(f, m, tp, free, out, depth + 1);
+          self.ret_shape_of(f, m, tp, routes, out, depth + 1);
         }
       }
       TSType::TSTypeReference(r) => {
         if let TSTypeName::IdentifierReference(id) = &r.type_name {
           if tp.iter().any(|p| p == id.name.as_str()) {
-            if r.type_arguments.is_none() && free.iter().any(|p| p == id.name.as_str()) {
+            if r.type_arguments.is_none() && routes.free.iter().any(|p| p == id.name.as_str()) {
               out.free = true;
             } else {
               out.param = true;
@@ -309,14 +325,20 @@ impl Dts {
           if idx.file == "Effect.d.ts" && local == "Effect" {
             out.effect = true;
             let success = r.type_arguments.as_ref().and_then(|a| a.params.first());
-            let bare = |names: &[String]| {
-              matches!(success, Some(TSType::TSTypeReference(sr))
-                if sr.type_arguments.is_none()
-                  && matches!(&sr.type_name, TSTypeName::IdentifierReference(id)
-                    if names.iter().any(|p| p == id.name.as_str())))
+            let bare = match success {
+              Some(TSType::TSTypeReference(sr)) if sr.type_arguments.is_none() => {
+                match &sr.type_name {
+                  TSTypeName::IdentifierReference(id) => Some(id.name.as_str()),
+                  _ => None,
+                }
+              }
+              _ => None,
             };
+            let free = bare.is_some_and(|n| routes.free.iter().any(|p| p == n));
+            let sink = bare.and_then(|n| routes.sink.iter().find(|(p, _)| p == n)).map(|(_, m)| *m);
             match success {
-              _ if bare(free) => out.effect_free = true,
+              _ if free => out.effect_free = true,
+              _ if let Some(m) = sink => out.effect_sink |= m,
               Some(TSType::TSTypeReference(sr)) if matches!(&sr.type_name, TSTypeName::IdentifierReference(id) if tp.iter().any(|p| p == id.name.as_str())) =>
               {
                 out.effect_param = true;
@@ -582,28 +604,93 @@ impl Dts {
   /// container: each occurs in the signature's parameter and return types (outside `own`, the
   /// type being read), or in the parameters of the call that returned the function (`outer`),
   /// at least once, and only in the type arguments of a type `effect::SERVICE_FREE_CONTAINERS`
-  /// lists (a Schedule). No service passes through those (assumption 4), so such a value holds
-  /// none. The scan is by name over the declaration's
-  /// text: a name it can't place counts as an occurrence outside a container.
+  /// lists (a Schedule, `only_inside`). No service passes through those (assumption 4), so
+  /// such a value holds none.
   fn container_only(&self, sig: &Sig<'_>, own: oxc::span::Span) -> Vec<String> {
+    let containers: Vec<(&str, &str, Option<usize>)> =
+      super::effect::SERVICE_FREE_CONTAINERS.iter().map(|(f, l)| (*f, *l, None)).collect();
+    self.only_inside(sig, own, &containers)
+  }
+
+  /// The type parameters of `sig` that occur in its parameters (and those of the call that
+  /// returned it, `outer`) only as a Sink's result (`effect::SINK_RESULT`), each with the
+  /// positions it occurs at: bit `j` for parameter `j`, bit 7 for `outer`. One in a rest
+  /// parameter or past the seventh is left out. Tim's decision of 2026-11-10: a stream element
+  /// a Sink collects into its result is not tracked, so what such a call succeeds with is what
+  /// the Sink it is handed holds (`Sink.succeed(a)`'s `a`), not what its stream holds.
+  fn sink_results(&self, sig: &Sig<'_>, own: oxc::span::Span) -> Vec<(String, u8)> {
+    use oxc::span::GetSpan;
+    let (file, local, arg) = super::effect::SINK_RESULT;
+    let names = self.only_inside(sig, own, &[(file, local, Some(arg))]);
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mentions = |f: usize, t: &TSType<'_>, p: &str| {
+      let span = t.span();
+      let Some(text) = self.index(f).source.get(span.start as usize..span.end as usize) else {
+        return true;
+      };
+      let bytes = text.as_bytes();
+      text.match_indices(p).any(|(i, _)| {
+        let end = i + p.len();
+        (i == 0 || !word(bytes[i - 1])) && (end >= bytes.len() || !word(bytes[end]))
+      })
+    };
+    names
+      .into_iter()
+      .filter_map(|p| {
+        let mut mask = 0u8;
+        for (j, (t, rest)) in sig.params.iter().enumerate() {
+          if t.is_some_and(|t| mentions(sig.file, t, &p)) {
+            if *rest || j >= 7 {
+              return None;
+            }
+            mask |= 1 << j;
+          }
+        }
+        if sig.outer.iter().any(|(f, t)| mentions(*f, t, &p)) {
+          mask |= 0x80;
+        }
+        (mask != 0).then_some((p, mask))
+      })
+      .collect()
+  }
+
+  /// The type parameters of `sig` that occur at least once, and only in the type arguments
+  /// `containers` names (a public type, and the index of the argument, or `None` for every
+  /// argument), in the signature's parameter and return types (outside `own`, the type being
+  /// read) and in `outer`. The scan is by name over the declaration's text: a name it can't
+  /// place counts as an occurrence outside a container.
+  fn only_inside(
+    &self,
+    sig: &Sig<'_>,
+    own: oxc::span::Span,
+    containers: &[(&str, &str, Option<usize>)],
+  ) -> Vec<String> {
     use oxc::ast_visit::Visit;
     use oxc::span::GetSpan;
-    struct Containers<'d> {
+    struct Containers<'d, 'c> {
       dts: &'d Dts,
       f: usize,
+      containers: &'c [(&'c str, &'c str, Option<usize>)],
       spans: Vec<(usize, oxc::span::Span)>,
     }
-    impl<'a> Visit<'a> for Containers<'_> {
+    impl<'a> Visit<'a> for Containers<'_, '_> {
       fn visit_ts_type_reference(&mut self, r: &oxc::ast::ast::TSTypeReference<'a>) {
-        let container = super::effect::SERVICE_FREE_CONTAINERS
+        let container = self
+          .containers
           .iter()
-          .any(|(file, local)| self.dts.is_public(self.f, &r.type_name, file, local));
-        if !container {
+          .find(|(file, local, _)| self.dts.is_public(self.f, &r.type_name, file, local));
+        let Some((_, _, arg)) = container else {
           oxc::ast_visit::walk::walk_ts_type_reference(self, r);
           return;
-        }
-        if let Some(a) = &r.type_arguments {
-          self.spans.extend(a.params.iter().map(|t| (self.f, t.span())));
+        };
+        let arg = *arg;
+        let Some(a) = &r.type_arguments else { return };
+        for (i, t) in a.params.iter().enumerate() {
+          if arg.is_none_or(|k| k == i) {
+            self.spans.push((self.f, t.span()));
+          } else {
+            self.visit_ts_type(t);
+          }
         }
       }
     }
@@ -616,7 +703,7 @@ impl Dts {
       .collect();
     let mut spans = vec![];
     for (f, t) in &types {
-      let mut c = Containers { dts: self, f: *f, spans: vec![] };
+      let mut c = Containers { dts: self, f: *f, containers, spans: vec![] };
       c.visit_ts_type(t);
       spans.extend(c.spans);
     }
@@ -2080,8 +2167,10 @@ mod tests {
 
   /// An Effect succeeding with a type parameter that enters the call only inside a Schedule
   /// holds no service (assumption 4), also when the Schedule is an argument of the call that
-  /// returned the function (`Sig::outer`). A Sink's result is an ordinary success
-  /// (`Sink.succeed(a)`), so one that enters as a Sink's result flows.
+  /// returned the function (`Sig::outer`). A Sink's result is an ordinary success, so one that
+  /// enters as a Sink's result is not free: it is what the Sink holds (`effect_sink`, at the
+  /// Sink's position), data-first and through a returned function. One that also enters
+  /// outside a Sink's result, or as a Sink's input, flows as a type parameter does.
   #[test]
   fn container_only_results() {
     let dir = std::env::temp_dir()
@@ -2120,6 +2209,8 @@ mod tests {
         "  <A2, A, L>(sink: Sink<A2, A, L>): <E>(self: Stream<A, E>) => Effect<A2, E>;",
         "  <A2, A, L, E>(self: Stream<A, E>, sink: Sink<A2, A, L>): Effect<A2, E>;",
         "};",
+        "export declare const seeded: <A2, A>(self: Stream<A>, sink: Sink<A2, A>, a: A2) => Effect<A2>;",
+        "export declare const echo: <A>(sink: Sink<A, A>) => Effect<A>;",
         "",
       ]
       .join("\n"),
@@ -2132,8 +2223,15 @@ mod tests {
     assert!(free(&dts.ret_shape(&path, "repeat", 2)));
     assert!(free(&dts.returned_call(&path, "repeat", 1, 1).unwrap().1));
     assert!(flows(&dts.ret_shape(&path, "beside", 2)));
-    assert!(flows(&dts.ret_shape(&path, "run", 2)));
-    assert!(flows(&dts.returned_call(&path, "run", 1, 1).unwrap().1));
+    let sink = |s: &super::RetShape, m: u8| {
+      s.effect && s.effect_sink == m && !s.effect_param && !s.effect_free && !s.effect_other
+    };
+    assert!(sink(&dts.ret_shape(&path, "run", 2), 0b10));
+    assert!(sink(&dts.returned_call(&path, "run", 1, 1).unwrap().1, 0x80));
+    assert!(flows(&dts.ret_shape(&path, "seeded", 3)));
+    assert_eq!(dts.ret_shape(&path, "seeded", 3).effect_sink, 0);
+    assert!(flows(&dts.ret_shape(&path, "echo", 1)));
+    assert_eq!(dts.ret_shape(&path, "echo", 1).effect_sink, 0);
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
   }
 

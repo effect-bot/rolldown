@@ -68,6 +68,13 @@ pub const INERT_TYPES: &[(&str, &[&str])] =
 /// ordinary success (`Sink.succeed(a)`), not a `Done` value.
 pub const SERVICE_FREE_CONTAINERS: &[(&str, &str)] = &[("Schedule.d.ts", "Schedule")];
 
+/// A Sink's result type argument (`Sink<A, In, L, E, R>`'s `A`). Tim's decision of
+/// 2026-11-10: a service that enters a Sink as a stream element and comes back in the Sink's
+/// result is not tracked. A call that succeeds with a type parameter occurring among its
+/// parameters only here (`Stream.run`) succeeds with what the Sink it is handed holds
+/// (`Sink.succeed(a)`'s `a`), not with its stream's elements (`Dts::sink_results`).
+pub const SINK_RESULT: (&str, &str, usize) = ("Sink.d.ts", "Sink", 0);
+
 /// The `effect` major version the model is written against.
 pub const SUPPORTED_MAJOR: &str = "4";
 

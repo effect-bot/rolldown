@@ -4,10 +4,10 @@ import * as Effect from 'effect/Effect';
 import * as Layer from 'effect/Layer';
 import * as Sink from 'effect/Sink';
 import * as Stream from 'effect/Stream';
-// A service collected by `Sink.takeWhile` comes back through the Sink's `Done`
-// signal. No service is ever a `Done` value (Tim's decision, assumption 4), so
-// the read keeps nothing: both method definitions are removed and the bundle
-// is not run.
+// A service collected by `Sink.takeWhile` comes back in the Sink's result. A
+// service that enters a Sink as a stream element and comes back in its result
+// is not tracked (Tim's decision, 2026-11-10), so the read keeps nothing: both
+// method definitions are removed and the bundle is not run.
 const Store = Context.Service('test/SinkTakeWhileService');
 const program = Effect.gen(function* () {
   const store = yield* Store;

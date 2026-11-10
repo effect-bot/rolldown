@@ -1,0 +1,10 @@
+{
+  "_comment": "Sink.succeed(store) handed to the data-last Stream.run through pipe ends with the service as an ordinary successful result. Tim's exclusion of stream elements collected into a Sink's result does not cover a value the Sink is handed itself, so the method the program calls on it stays and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
