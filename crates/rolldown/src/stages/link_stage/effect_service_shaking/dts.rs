@@ -135,6 +135,10 @@ struct Index<'a> {
   /// The file's name (`Tracer.d.ts`).
   file: String,
   locals: FxHashMap<String, Local<'a>>,
+  /// Function declarations by local name. A function may share its name with an interface (a
+  /// declaration merge, `interface decodeTo` and `function decodeTo`), which `locals` keeps
+  /// for type references.
+  funcs: FxHashMap<String, Vec<&'a oxc::ast::ast::Function<'a>>>,
   /// Exported name to local name.
   exports: FxHashMap<String, String>,
   /// `export { a as b } from "./x"`: exported name to (specifier, imported name).
@@ -1198,7 +1202,9 @@ impl Dts {
   fn signatures(&self, path: &Path, name: &str) -> Option<Vec<Sig<'_>>> {
     let (f, local) = self.export(path, name, 0)?;
     let mut out = vec![];
-    match self.index(f).locals.get(&local)? {
+    let idx = self.index(f);
+    let funcs = idx.funcs.get(&local).map(|fs| Local::Funcs(fs.clone()));
+    match funcs.as_ref().or_else(|| idx.locals.get(&local))? {
       Local::Funcs(fs) => {
         for func in fs {
           out.push(sig_of(
@@ -1717,6 +1723,7 @@ fn index<'a>(program: &'a Program<'a>, dir: PathBuf, file: Option<String>) -> In
     dir,
     file: file.unwrap_or_default(),
     locals: FxHashMap::default(),
+    funcs: FxHashMap::default(),
     exports: FxHashMap::default(),
     reexports: FxHashMap::default(),
     stars: vec![],
@@ -1743,6 +1750,7 @@ fn index<'a>(program: &'a Program<'a>, dir: PathBuf, file: Option<String>) -> In
           {
             v.push(func);
           }
+          f.funcs.entry(n.clone()).or_default().push(func);
           names.push(n);
         }
       }

@@ -477,6 +477,13 @@ pub enum Constraint {
   /// contributes to the call's slot. The flag: a callback among it is declared to return a
   /// value that holds no service.
   TypedArg(VarId, VarId, Site, u8, bool),
+  /// The receivers of `o.name(...)` where the callee is the summary (`typed_call`): a summary
+  /// is its own receiver; another object is one only if its `name` may be the summary
+  /// (`TypedReceiverIf`). Slot, back variable and site as for `TypedArg`.
+  TypedReceiver(ObjId, ArcStr, VarId, VarId, Site),
+  /// What `TypedReceiver` reads off a receiver (the second object): if the callee summary is
+  /// among it, the receiver goes to the call as `TypedArg` does.
+  TypedReceiverIf(ObjId, ObjId, VarId, VarId, Site),
   /// Values entering a type-modelled value's slot (`Analysis::slot_in`); the object is the
   /// stand-in for what the admission filter holds back.
   SlotIn(VarId, ObjId),
@@ -489,6 +496,10 @@ pub enum Constraint {
   /// What a callback handed to type-modelled code returns (`typed_callback`): it goes to unseen
   /// code, and so does what an Effect or promise among it succeeds with.
   EscapeOut,
+  /// A record or function handed to effect's code whose functions go without what they return
+  /// (`escape_with` with `ret` false): their returns are tracked where they go
+  /// (`typed_callback`).
+  EscapeHeld,
   /// A member of an options object handed to type-modelled code: a function effect code may
   /// call with the slot (`typed_callback`); a type-modelled function among them is routed as
   /// `pool_route` does.
@@ -592,11 +603,18 @@ impl Constraint {
       C::TypedArg(slot, back, site, mask, prim) => {
         C::TypedArg(v(*slot), v(*back), *site, *mask, *prim)
       }
+      C::TypedReceiver(callee, name, slot, back, site) => {
+        C::TypedReceiver(*callee, name.clone(), v(*slot), v(*back), *site)
+      }
+      C::TypedReceiverIf(callee, recv, slot, back, site) => {
+        C::TypedReceiverIf(*callee, *recv, v(*slot), v(*back), *site)
+      }
       C::SlotIn(dst, stand_in) => C::SlotIn(v(*dst), *stand_in),
       C::TypedConcrete(ty, site) => C::TypedConcrete(*ty, *site),
       C::AdmitTyped(dst, prim) => C::AdmitTyped(v(*dst), *prim),
       C::TypedNested(slot, back, site, mask) => C::TypedNested(v(*slot), v(*back), *site, *mask),
       C::EscapeOut => C::EscapeOut,
+      C::EscapeHeld => C::EscapeHeld,
       C::ProtocolCall(call) => match C::Call(call.clone()).remap(v, s) {
         C::Call(c) => C::ProtocolCall(c),
         _ => unreachable!(),
@@ -2337,6 +2355,21 @@ impl Analysis {
       Constraint::TypedArg(slot, back, site, mask, prim) => {
         self.typed_arg(obj, *slot, *back, *site, *mask, *prim);
       }
+      Constraint::TypedReceiver(callee, name, slot, back, site) => {
+        if matches!(self.objs[obj].kind, ObjKind::Typed { .. }) {
+          self.typed_arg(obj, *slot, *back, *site, 0, false);
+        } else {
+          let holder = self.holder(obj);
+          let member = self.var();
+          self.constrain(holder, Constraint::Load { key: Key::Name(name.clone()), dst: member });
+          self.constrain(member, Constraint::TypedReceiverIf(*callee, obj, *slot, *back, *site));
+        }
+      }
+      Constraint::TypedReceiverIf(callee, recv, slot, back, site) => {
+        if obj == *callee {
+          self.typed_arg(*recv, *slot, *back, *site, 0, false);
+        }
+      }
       Constraint::SlotIn(dst, stand_in) => self.slot_in(obj, *dst, *stand_in),
       Constraint::AdmitTyped(dst, prim) => self.admit_typed_with(obj, *dst, !*prim),
       Constraint::TypedConcrete(ty, site) => self.typed_concrete(obj, *ty, *site),
@@ -2350,6 +2383,7 @@ impl Analysis {
       Constraint::TypedNested(slot, back, site, mask) => {
         self.typed_nested(obj, *slot, *back, *site, *mask);
       }
+      Constraint::EscapeHeld => self.escape_with(obj, Flavour::Ext, Some(EFFECT_ESCAPE), false),
       Constraint::BailKeys => self.bail_keys(obj),
       Constraint::HandName => self.hand_name(obj),
       Constraint::LookupIn { key, dst } => self.lookup_in(obj, *key, *dst),
@@ -2406,6 +2440,10 @@ impl Analysis {
       | Constraint::AwaitOf(_)
       | Constraint::ThenableBail(_) => {
         self.constrain(held_var, c.clone());
+        false
+      }
+      Constraint::TypedReceiver(_, _, slot, back, site) => {
+        self.constrain(held_var, Constraint::TypedArg(*slot, *back, *site, 0, false));
         false
       }
       Constraint::Call(call) => {
@@ -2970,14 +3008,22 @@ impl Analysis {
         r(self, &merged);
         self.var_tag = saved_tag;
       }
-      // A function effect's code made runs effect's code: what it is handed goes there.
+      // A function effect's code made runs effect's code: what it is handed goes there. As for
+      // any unseen method (`escape_args`), `o.name(...)` runs it with `this` only for the
+      // receivers whose `name` it may be.
       ObjKind::Top(_) if callee == self.top_effect => {
         for a in &call.args {
           let (Arg::Var(v) | Arg::Spread(v)) = a;
           self.constrain(*v, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
         }
         if let Some(this) = call.this {
-          self.constrain(this, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
+          let c = match self.method_names.get(&call.site) {
+            Some(name) => {
+              Constraint::EscapeReceiver(Flavour::Ext, Some(EFFECT_ESCAPE), name.clone())
+            }
+            None => Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)),
+          };
+          self.constrain(this, c);
         }
         self.seed(call.ret, callee);
       }
@@ -3582,8 +3628,14 @@ impl Analysis {
     }
     if export == NO_EXPORT {
       if let Some(this) = call.this {
-        // A method call has no signature: it bails what it reaches (below).
-        self.constrain(this, Constraint::TypedArg(slot, back, call.site, 0, false));
+        // A method call has no signature: it bails what it reaches (below). Its receivers are
+        // the objects whose `name` is the summary, not every value `this` may hold (a value the
+        // summary holds, read as its result, calls its own method).
+        let c = match self.method_names.get(&call.site) {
+          Some(name) => Constraint::TypedReceiver(callee, name.clone(), slot, back, call.site),
+          None => Constraint::TypedArg(slot, back, call.site, 0, false),
+        };
+        self.constrain(this, c);
       }
     }
     let sig = if export != NO_EXPORT {
@@ -3594,8 +3646,12 @@ impl Analysis {
       None
     };
     // A call the summary can't resolve (a method, or a value with no known signature) bails
-    // the services it reaches: what it holds and is handed goes to unseen code.
-    if sig.is_none() && !call.is_new {
+    // the services it reaches: what it holds and is handed goes to unseen code. A method called
+    // with no arguments hands that code nothing new: it may return what the value holds (the
+    // result has it) and run the functions the value holds (which run with its slot already,
+    // `slot_in`), so what the value holds stays where it is.
+    let getter = call.this.is_some() && call.args.is_empty();
+    if sig.is_none() && !call.is_new && !getter {
       self.constrain(slot, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
       self.constrain(handed, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
     }
@@ -3672,7 +3728,8 @@ impl Analysis {
       if generic {
         // A callback declared to return a value that holds no service goes without its return.
         let prim = sig.as_ref().is_some_and(|s| s.free_returns.get(i).copied().unwrap_or(false));
-        self.constrain(arg, Constraint::AdmitTyped(handed, prim));
+        // Functions go without their returns here: `typed_callback` (below) tracks those.
+        self.constrain(arg, Constraint::AdmitTyped(handed, true));
         // Without a signature, the call hands what it holds to unseen code (below), so its
         // callbacks run with unknown arguments.
         let mask = sig.as_ref().map_or(0, |s| s.masks.get(i).copied().unwrap_or(0xFF));
@@ -4635,7 +4692,7 @@ impl Analysis {
         self.constrain(inner, Constraint::SlotIn(slot, top));
       }
       ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
-        self.admit_typed_with(obj, slot, !prim);
+        self.admit_typed_with(obj, slot, false);
         self.typed_callback(obj, slot, back, site, mask, prim);
       }
       ObjKind::Key { strings, .. } => {
@@ -4654,10 +4711,11 @@ impl Analysis {
           self.seed(slot, obj);
           if matches!(self.objs[obj].kind, ObjKind::Array) {
             let elem = self.elem(obj);
-            self.constrain(elem, Constraint::AdmitTyped(slot, false));
+            self.constrain(elem, Constraint::AdmitTyped(slot, true));
           }
         } else {
-          self.admit_typed(obj, slot);
+          // Its functions run as callbacks (`typed_nested_callbacks`), which track their returns.
+          self.admit_typed_with(obj, slot, false);
         }
         self.typed_nested_callbacks(obj, slot, back, site, mask);
       }
@@ -4783,20 +4841,22 @@ impl Analysis {
     if self.debug {
       self.callback_log.push((site.module.raw(), site.start, mask, slot, f));
     }
+    let mask = self.declared_args_mask(f, mask);
     if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_TRACKED_CALLBACKS").is_none() {
       if mask != 0 {
         self.constrain(slot, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
       }
-      self.escape_with(f, Flavour::Ext, Some(EFFECT_ESCAPE), !prim);
-      if prim {
-        let _ = (back, site);
-        return;
-      }
-      // What it returns may come back out of the call wrapped in an Effect or a promise (a
-      // `decode` succeeding with a service): what those succeed with goes to unseen code too.
-      if let ObjKind::Closure(fid) = self.objs[f].kind {
+      let closure = match self.objs[f].kind {
+        ObjKind::Closure(fid) => Some(fid),
+        _ => None,
+      };
+      self.escape_with(f, Flavour::Ext, Some(EFFECT_ESCAPE), closure.is_none());
+      // What it returns goes back to the call that runs it, as a value the call holds: it
+      // enters the slot as an argument would (an Effect or promise contributes what it succeeds
+      // with), so a decoded value that is a service reaches the code reading the result.
+      if let (Some(fid), false) = (closure, prim) {
         let ret = self.fns[fid].ret;
-        self.constrain(ret, Constraint::EscapeOut);
+        self.constrain(ret, Constraint::SlotIn(slot, self.top_effect));
       }
       let _ = (back, site);
       return;
@@ -4843,6 +4903,25 @@ impl Analysis {
     let call = Call { site: call_site, this: None, args, ret, is_new: false, builtin: None };
     self.constrain(callee, Constraint::Call(Box::new(call)));
     self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF, false));
+  }
+
+  /// `mask` (a callback's parameter positions, `Dts::callback_masks`) narrowed to the
+  /// arguments `f` can read. An arrow has no `arguments` object of its own, so it reads only
+  /// what its declared parameters receive: `() => x` receives nothing the call holds.
+  fn declared_args_mask(&self, f: ObjId, mask: u8) -> u8 {
+    let ObjKind::Closure(fid) = self.objs[f].kind else { return mask };
+    let info = &self.fns[fid];
+    if !matches!(info.kind, FnKind::Arrow) {
+      return mask;
+    }
+    let mut readable = 0u8;
+    for j in 0..info.params.len() {
+      readable |= 1 << j.min(7);
+    }
+    if info.rest.is_some() {
+      readable |= 0x80;
+    }
+    mask & readable
   }
 
   /// The callbacks inside an options object or array handed to type-modelled code.
@@ -5245,6 +5324,11 @@ impl Analysis {
   /// before.
   fn escape_receiver(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>, name: &ArcStr) {
     match self.objs[obj].kind {
+      // A function effect's code made, called as a summary's method: the summary's own methods
+      // are its method summary (`typed_member`), whose call decides what it hands over
+      // (`typed_call`); a function it holds as a value of a type parameter does not read it
+      // through `this`.
+      ObjKind::Typed { .. } if site == Some(EFFECT_ESCAPE) && !self.is_stand_in(obj) => {}
       ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
         match self.objs[obj].fields.get(name).copied() {
           Some(slot) => self.constrain(slot, Constraint::EscapeIfOpaque(obj, flavour, site)),
@@ -6308,8 +6392,11 @@ impl Analysis {
     // An escape into effect's code runs once; one into code the pass can't see runs once too,
     // even after the first (it hands over more: values from unseen code may be anything).
     let into_effect = flavour == Flavour::Ext && site == Some(EFFECT_ESCAPE);
-    // Only a function has a return to hold back.
-    let ret = ret || !into_effect || !matches!(self.objs[obj].kind, ObjKind::Closure(_));
+    // Only a function, or a record or array of them, has returns to hold back.
+    let ret = ret
+      || !into_effect
+      || !matches!(self.objs[obj].kind, ObjKind::Closure(_) | ObjKind::Object | ObjKind::Array);
+    let closure = matches!(self.objs[obj].kind, ObjKind::Closure(_));
     self.hand_key(obj, false);
     let repeat = if into_effect {
       self.objs[obj].escaped.is_some() || !self.effect_escaped.insert(obj)
@@ -6351,15 +6438,19 @@ impl Analysis {
         if external {
           self.objs[obj].demand.all();
         }
+        // A record's functions go without their returns when it does (`release_ret`).
+        let held =
+          if ret || closure { Constraint::Escape(flavour, site) } else { Constraint::EscapeHeld };
         let fields: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
         for f in fields {
-          self.constrain(f, Constraint::Escape(flavour, site));
+          self.constrain(f, held.clone());
         }
         let elem = self.elem(obj);
-        self.constrain(elem, Constraint::Escape(flavour, site));
+        self.constrain(elem, held);
         // Fields written from outside may hold anything (what effect's code made, for it). A
         // function handed only where it is declared a callback that returns no service has no
-        // properties by that type: effect's code writes none (`release_ret` adds them).
+        // properties by that type, and a record of callbacks is read for them: effect's code
+        // writes none (`release_ret` adds them).
         if external && ret {
           let top = if into_effect { self.top_effect } else { self.top_ext };
           self.unknown_store(obj, elem, top);
@@ -6438,6 +6529,14 @@ impl Analysis {
   /// without its return (`escape_with`): its return goes there, and effect's code may write
   /// into it.
   fn release_ret(&mut self, obj: ObjId) {
+    if matches!(self.objs[obj].kind, ObjKind::Object | ObjKind::Array) {
+      let mut vars: Vec<VarId> = self.objs[obj].fields.values().copied().collect();
+      vars.push(self.elem(obj));
+      for v in vars {
+        self.constrain(v, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
+      }
+      return;
+    }
     let ObjKind::Closure(f) = self.objs[obj].kind else { return };
     let elem = self.elem(obj);
     self.unknown_store(obj, elem, self.top_effect);
