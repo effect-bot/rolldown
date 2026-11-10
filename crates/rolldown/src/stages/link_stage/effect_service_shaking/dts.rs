@@ -96,6 +96,11 @@ pub struct RetShape {
   /// An `Effect` whose success is an object type that mentions no type parameter.
   pub effect_concrete: bool,
   pub prim: bool,
+  /// A type parameter whose values enter the call only inside a service-free container
+  /// (`Dts::container_only`): an unknown value that holds no service. `effect_free` is an
+  /// `Effect` succeeding with one.
+  pub free: bool,
+  pub effect_free: bool,
   pub other: bool,
   /// An object type that mentions no type parameter: what the call returns holds nothing the
   /// caller handed it (direction 2: results at concrete types are service-free).
@@ -103,9 +108,10 @@ pub struct RetShape {
   pub unknown: bool,
 }
 
-/// What `Dts::returned_call` reads: bounds, return shape, generic positions, callback masks and
-/// which parameters take callbacks whose returns hold no service.
-pub type ReturnedCall = (Bounds, RetShape, (Vec<bool>, bool), Vec<u8>, Vec<bool>);
+/// What `Dts::returned_call` reads: bounds, return shape, generic positions, callback masks,
+/// which parameters take callbacks whose returns hold no service, and which are opaque values of
+/// a type parameter (`Dts::opaque_positions`).
+pub type ReturnedCall = (Bounds, RetShape, (Vec<bool>, bool), Vec<u8>, Vec<bool>, Vec<bool>);
 
 /// The bounds of one exported function: a type per parameter, the elements of its rest
 /// parameter, and the return type (`None` is open).
@@ -165,7 +171,14 @@ struct Sig<'a> {
   params: Vec<(Option<&'a TSType<'a>>, bool)>,
   ret: Option<&'a TSType<'a>>,
   tparams: Vec<String>,
+  /// The declared constraint of each of the signature's own type parameters, in `tparams`'s
+  /// order. Type parameters added after them (a returned function's outer ones) have none
+  /// recorded, and count as constrained.
+  constraints: Vec<Option<&'a TSType<'a>>>,
   file: usize,
+  /// For the function a call returns (`returned_sigs`): the parameter types of the call that
+  /// returned it, with their file. Its outer type parameters may occur there.
+  outer: Vec<(usize, &'a TSType<'a>)>,
 }
 
 /// The `.d.ts` files read so far. Files are parsed when a bound first needs them, and live as
@@ -236,10 +249,7 @@ impl Dts {
         let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
         let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
         for sig in matching {
-          match sig.ret {
-            Some(t) => self.ret_shape_of(sig.file, t, &sig.tparams, &mut out, 0),
-            None => out.unknown = true,
-          }
+          self.sig_ret_shape(sig, &mut out);
         }
       }
     }
@@ -247,24 +257,50 @@ impl Dts {
     out
   }
 
-  fn ret_shape_of(&self, f: usize, t: &TSType<'_>, tp: &[String], out: &mut RetShape, depth: u32) {
+  /// The return shape of one signature. A type parameter a value of which enters the call only
+  /// inside a service-free container (`container_only`) holds no service, so a return of one,
+  /// or an `Effect` succeeding with one, is an unknown value that holds none (`RetShape::free`).
+  fn sig_ret_shape(&self, sig: &Sig<'_>, out: &mut RetShape) {
+    use oxc::span::GetSpan;
+    match sig.ret {
+      Some(t) => {
+        let free = self.container_only(sig, t.span());
+        self.ret_shape_of(sig.file, t, &sig.tparams, &free, out, 0);
+      }
+      None => out.unknown = true,
+    }
+  }
+
+  fn ret_shape_of(
+    &self,
+    f: usize,
+    t: &TSType<'_>,
+    tp: &[String],
+    free: &[String],
+    out: &mut RetShape,
+    depth: u32,
+  ) {
     if depth > 8 {
       out.unknown = true;
       return;
     }
     match t {
       TSType::TSParenthesizedType(p) => {
-        self.ret_shape_of(f, &p.type_annotation, tp, out, depth + 1);
+        self.ret_shape_of(f, &p.type_annotation, tp, free, out, depth + 1);
       }
       TSType::TSUnionType(u) => {
         for m in &u.types {
-          self.ret_shape_of(f, m, tp, out, depth + 1);
+          self.ret_shape_of(f, m, tp, free, out, depth + 1);
         }
       }
       TSType::TSTypeReference(r) => {
         if let TSTypeName::IdentifierReference(id) = &r.type_name {
           if tp.iter().any(|p| p == id.name.as_str()) {
-            out.param = true;
+            if r.type_arguments.is_none() && free.iter().any(|p| p == id.name.as_str()) {
+              out.free = true;
+            } else {
+              out.param = true;
+            }
             return;
           }
         }
@@ -273,7 +309,14 @@ impl Dts {
           if idx.file == "Effect.d.ts" && local == "Effect" {
             out.effect = true;
             let success = r.type_arguments.as_ref().and_then(|a| a.params.first());
+            let bare = |names: &[String]| {
+              matches!(success, Some(TSType::TSTypeReference(sr))
+                if sr.type_arguments.is_none()
+                  && matches!(&sr.type_name, TSTypeName::IdentifierReference(id)
+                    if names.iter().any(|p| p == id.name.as_str())))
+            };
             match success {
+              _ if bare(free) => out.effect_free = true,
               Some(TSType::TSTypeReference(sr)) if matches!(&sr.type_name, TSTypeName::IdentifierReference(id) if tp.iter().any(|p| p == id.name.as_str())) =>
               {
                 out.effect_param = true;
@@ -354,6 +397,34 @@ impl Dts {
     Some(out)
   }
 
+  /// For a call to the function exported as `name` with `nparams` arguments: per argument,
+  /// whether its declared type is, in every signature the call may match, a type parameter
+  /// whose constraint names no member (none, `unknown` or `any`; for a rest parameter, an
+  /// array of those). Code generic in such a type reads no member of the value by name, as an
+  /// `unknown`/`any` position reads none (assumption 2). `None` without a signature.
+  pub fn opaque_positions(&self, path: &Path, name: &str, nparams: usize) -> Option<Vec<bool>> {
+    let start = std::time::Instant::now();
+    let sigs = self.signatures(path, name)?;
+    let out = self.opaque_of_sigs(&sigs, nparams);
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    Some(out)
+  }
+
+  fn opaque_of_sigs(&self, sigs: &[Sig<'_>], nparams: usize) -> Vec<bool> {
+    let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
+    let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
+    let mut out = vec![!matching.is_empty(); nparams];
+    for sig in matching {
+      for (i, opaque) in out.iter_mut().enumerate() {
+        *opaque &= match sig.params.get(i).or_else(|| sig.params.last().filter(|(_, r)| *r)) {
+          Some((Some(t), rest)) => opaque_tparam(sig, t, *rest),
+          _ => false,
+        };
+      }
+    }
+    out
+  }
+
   /// For a call with `nparams` arguments: per parameter, which parameters of the callbacks its
   /// declared type holds (directly, in a union, or as members of an options type) take a value
   /// of a type parameter, as a bit mask over the first 8. A callback parameter of a concrete
@@ -371,7 +442,7 @@ impl Dts {
   /// type admits is declared to return a value that holds no service, in every signature the
   /// call may match. That is a primitive (`Predicate<A>`'s `(a: A) => boolean`), a type
   /// parameter a value of which leaves the call only inside a Schedule (`Schedule.map`'s
-  /// `Output2`, assumption 4; `schedule_only`), or an `Effect` that succeeds with one of
+  /// `Output2`, assumption 4; `container_only`), or an `Effect` that succeeds with one of
   /// those. Anything else is not: a type parameter that may come back out, `unknown`, an
   /// object, a callback type given as a type parameter, an options object.
   pub fn callback_free_returns(
@@ -437,7 +508,7 @@ impl Dts {
           .map(|d| d.params.iter().map(|p| p.name.name.as_str().to_string()).collect())
           .unwrap_or_default();
         let free: Vec<String> =
-          self.schedule_only(sig, ret.span()).into_iter().filter(|p| !own.contains(p)).collect();
+          self.container_only(sig, ret.span()).into_iter().filter(|p| !own.contains(p)).collect();
         let mut tps = own;
         tps.extend(tp.iter().cloned());
         self.return_free(f, ret, &tps, &free, 0)
@@ -507,48 +578,61 @@ impl Dts {
     })
   }
 
-  /// The type parameters of `sig` a value of which leaves a call only inside a Schedule: each
-  /// occurs in the signature's parameter and return types (outside `own`, the callback return
-  /// being read) at least once, and only in type arguments of one of
-  /// `effect::SERVICE_FREE_CONTAINERS`. Services never pass through a Schedule (assumption 4),
-  /// so such a value holds none. The scan is by name over the declaration's text: a name it
-  /// can't place counts as an occurrence outside a Schedule.
-  fn schedule_only(&self, sig: &Sig<'_>, own: oxc::span::Span) -> Vec<String> {
+  /// The type parameters of `sig` a value of which is in a call only inside a service-free
+  /// container: each occurs in the signature's parameter and return types (outside `own`, the
+  /// type being read), or in the parameters of the call that returned the function (`outer`),
+  /// at least once, and only in the type arguments `effect::SERVICE_FREE_CONTAINERS` lists
+  /// (any of a Schedule's, a Sink's result and leftovers). No service passes through those
+  /// (assumption 4), so such a value holds none. The scan is by name over the declaration's
+  /// text: a name it can't place counts as an occurrence outside a container.
+  fn container_only(&self, sig: &Sig<'_>, own: oxc::span::Span) -> Vec<String> {
     use oxc::ast_visit::Visit;
     use oxc::span::GetSpan;
     struct Containers<'d> {
       dts: &'d Dts,
       f: usize,
-      spans: Vec<oxc::span::Span>,
+      spans: Vec<(usize, oxc::span::Span)>,
     }
     impl<'a> Visit<'a> for Containers<'_> {
       fn visit_ts_type_reference(&mut self, r: &oxc::ast::ast::TSTypeReference<'a>) {
         let container = super::effect::SERVICE_FREE_CONTAINERS
           .iter()
-          .any(|(file, local)| self.dts.is_public(self.f, &r.type_name, file, local));
-        if container {
-          if let Some(a) = &r.type_arguments {
-            self.spans.push(a.span);
-          }
+          .find(|(file, local, _)| self.dts.is_public(self.f, &r.type_name, file, local));
+        let Some((_, _, args)) = container else {
+          oxc::ast_visit::walk::walk_ts_type_reference(self, r);
           return;
+        };
+        let Some(a) = &r.type_arguments else { return };
+        for (i, t) in a.params.iter().enumerate() {
+          if args.is_empty() || args.contains(&i) {
+            self.spans.push((self.f, t.span()));
+          } else {
+            self.visit_ts_type(t);
+          }
         }
-        oxc::ast_visit::walk::walk_ts_type_reference(self, r);
       }
     }
-    let types: Vec<&TSType<'_>> =
-      sig.params.iter().filter_map(|(t, _)| *t).chain(sig.ret).collect();
-    let mut c = Containers { dts: self, f: sig.file, spans: vec![] };
-    for t in &types {
+    let types: Vec<(usize, &TSType<'_>)> = sig
+      .params
+      .iter()
+      .filter_map(|(t, _)| t.map(|t| (sig.file, t)))
+      .chain(sig.ret.map(|t| (sig.file, t)))
+      .chain(sig.outer.iter().copied())
+      .collect();
+    let mut spans = vec![];
+    for (f, t) in &types {
+      let mut c = Containers { dts: self, f: *f, spans: vec![] };
       c.visit_ts_type(t);
+      spans.extend(c.spans);
     }
-    let src = self.index(sig.file).source;
     let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
     sig
       .tparams
       .iter()
       .filter(|p| {
         let mut inside = false;
-        for t in &types {
+        for (f, t) in &types {
+          let src = self.index(*f).source;
           let span = t.span();
           let Some(text) = src.get(span.start as usize..span.end as usize) else { return false };
           let bytes = text.as_bytes();
@@ -562,10 +646,10 @@ impl Dts {
               reason = "declaration files are under 4 GiB"
             )]
             let at = span.start + i as u32;
-            if own.start <= at && at < own.end {
+            if *f == sig.file && own.start <= at && at < own.end {
               continue;
             }
-            if !c.spans.iter().any(|s| s.start <= at && at < s.end) {
+            if !spans.iter().any(|(sf, s)| sf == f && s.start <= at && at < s.end) {
               return false;
             }
             inside = true;
@@ -720,6 +804,8 @@ impl Dts {
       }
       for s in &mut inner[before..] {
         s.tparams.extend(sig.tparams.iter().cloned());
+        s.outer.extend(sig.params.iter().filter_map(|(t, _)| t.map(|t| (sig.file, t))));
+        s.outer.extend(sig.outer.iter().copied());
       }
     }
     Some(inner)
@@ -744,10 +830,7 @@ impl Dts {
       let same: Vec<&Sig<'_>> = inner.iter().filter(|s| s.params.len() == nargs).collect();
       let matching: Vec<&Sig<'_>> = if same.is_empty() { inner.iter().collect() } else { same };
       for sig in matching {
-        match sig.ret {
-          Some(t) => self.ret_shape_of(sig.file, t, &sig.tparams, &mut shape, 0),
-          None => shape.unknown = true,
-        }
+        self.sig_ret_shape(sig, &mut shape);
       }
       (
         bounds,
@@ -755,6 +838,7 @@ impl Dts {
         self.generic_of_sigs(&inner, nargs),
         self.callback_masks_of(&inner, nargs),
         self.free_returns_of(&inner, nargs),
+        self.opaque_of_sigs(&inner, nargs),
       )
     });
     self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
@@ -1697,6 +1781,48 @@ fn tparams_in(
   }
 }
 
+/// Whether a value at a parameter declared `t` (its elements, for a rest parameter) is a
+/// value of a type parameter of `sig` whose constraint names no member (`opaque_positions`).
+fn opaque_tparam(sig: &Sig<'_>, t: &TSType<'_>, rest: bool) -> bool {
+  // The element type of an array type: `T[]`, `readonly T[]`, `Array<T>`, `ReadonlyArray<T>`.
+  fn elem<'b>(t: &'b TSType<'b>) -> Option<&'b TSType<'b>> {
+    match t {
+      TSType::TSParenthesizedType(p) => elem(&p.type_annotation),
+      TSType::TSArrayType(a) => Some(&a.element_type),
+      TSType::TSTypeOperatorType(o) => elem(&o.type_annotation),
+      TSType::TSTypeReference(r) => match &r.type_name {
+        TSTypeName::IdentifierReference(id)
+          if matches!(id.name.as_str(), "Array" | "ReadonlyArray") =>
+        {
+          r.type_arguments.as_ref().filter(|a| a.params.len() == 1).map(|a| &a.params[0])
+        }
+        _ => None,
+      },
+      _ => None,
+    }
+  }
+  let open = |t: &TSType<'_>| matches!(t, TSType::TSAnyKeyword(_) | TSType::TSUnknownKeyword(_));
+  // A bare type parameter of `sig`, with its constraint (`None` if it has none).
+  let tparam = |t: &TSType<'_>| -> Option<Option<&TSType<'_>>> {
+    let TSType::TSTypeReference(r) = strip_parens(t) else { return None };
+    let TSTypeName::IdentifierReference(id) = &r.type_name else { return None };
+    if r.type_arguments.is_some() {
+      return None;
+    }
+    let i = sig.tparams.iter().position(|p| p == id.name.as_str())?;
+    sig.constraints.get(i).copied()
+  };
+  let unconstrained = |c: Option<&TSType<'_>>| c.is_none_or(open);
+  if !rest {
+    return tparam(t).is_some_and(unconstrained);
+  }
+  // `...values: As` with `As extends ReadonlyArray<any>`, or `...values: Array<A>`.
+  if let Some(c) = tparam(t) {
+    return c.is_none_or(|c| open(c) || elem(c).is_some_and(open));
+  }
+  elem(t).is_some_and(|e| tparam(e).is_some_and(unconstrained))
+}
+
 fn sig_of<'a>(
   params: &'a FormalParameters<'a>,
   ret: Option<&'a TSType<'a>>,
@@ -1714,7 +1840,9 @@ fn sig_of<'a>(
   let tparams = tps
     .map(|d| d.params.iter().map(|p| p.name.name.as_str().to_string()).collect())
     .unwrap_or_default();
-  Sig { params: ps, ret, tparams, file }
+  let constraints =
+    tps.map(|d| d.params.iter().map(|p| p.constraint.as_ref()).collect()).unwrap_or_default();
+  Sig { params: ps, ret, tparams, constraints, file, outer: vec![] }
 }
 
 fn index<'a>(program: &'a Program<'a>, dir: PathBuf, file: Option<String>) -> Index<'a> {
@@ -1952,6 +2080,89 @@ mod tests {
     assert_eq!(dts.callback_free_returns(&path, "dropped", 1), Some(vec![false]));
     assert_eq!(dts.callback_free_returns(&path, "delay", 1), Some(vec![false]));
     assert_eq!(dts.callback_free_returns(&path, "cond", 1), Some(vec![true]));
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+  }
+
+  /// A Sink's result and leftovers come back through `Done` (assumption 4), so an Effect
+  /// succeeding with a type parameter that enters the call only as a Sink's result holds no
+  /// service; one that enters as a Sink's input does.
+  #[test]
+  fn sink_results_hold_no_service() {
+    let dir = std::env::temp_dir()
+      .join(format!("rolldown-effect-dts-{}-sink-results", std::process::id()))
+      .join("dist");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+      dir.join("Effect.d.ts"),
+      "export interface Effect<A, E = never, R = never> { a: A; e: E; r: R }\n",
+    )
+    .unwrap();
+    std::fs::write(
+      dir.join("Sink.d.ts"),
+      "export interface Sink<A, In = unknown, L = never> { a: A; i: In; l: L }\n",
+    )
+    .unwrap();
+    let path = dir.join("Stream.d.ts");
+    std::fs::write(
+      &path,
+      [
+        "import type { Effect } from \"./Effect.js\";",
+        "import type { Sink } from \"./Sink.js\";",
+        "export interface Stream<A, E = never> { a: A; e: E }",
+        "export declare const run: {",
+        "  <A2, A, L>(sink: Sink<A2, A, L>): <E>(self: Stream<A, E>) => Effect<A2, E>;",
+        "  <A2, A, L, E>(self: Stream<A, E>, sink: Sink<A2, A, L>): Effect<A2, E>;",
+        "};",
+        "export declare const input: <A>(sink: Sink<number, A>) => Effect<A>;",
+        "export declare const beside: <A2>(sink: Sink<A2>, a: A2) => Effect<A2>;",
+        "",
+      ]
+      .join("\n"),
+    )
+    .unwrap();
+    let dts = Dts::default();
+    let run = dts.ret_shape(&path, "run", 2);
+    assert!(run.effect && run.effect_free && !run.effect_param && !run.effect_other);
+    let (_, shape, ..) = dts.returned_call(&path, "run", 1, 1).unwrap();
+    assert!(shape.effect && shape.effect_free && !shape.effect_param && !shape.effect_other);
+    assert!(dts.ret_shape(&path, "input", 1).effect_param);
+    assert!(dts.ret_shape(&path, "beside", 2).effect_param);
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+  }
+
+  /// A value of a type parameter whose constraint names no member is opaque to generic code; one
+  /// whose constraint names members, or a type that only mentions a type parameter, is not.
+  #[test]
+  fn opaque_type_parameter_positions() {
+    let dir = std::env::temp_dir()
+      .join(format!("rolldown-effect-dts-{}-opaque", std::process::id()))
+      .join("dist");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Stream.d.ts");
+    std::fs::write(
+      &path,
+      [
+        "export interface Stream<A> { a: A }",
+        "export declare const make: <const As extends ReadonlyArray<any>>(...values: As) => Stream<As[number]>;",
+        "export declare const of: <A>(...values: Array<A>) => Stream<A>;",
+        "export declare const succeed: <A>(value: A) => Stream<A>;",
+        "export declare const loose: <A extends unknown>(value: A, n: number) => Stream<A>;",
+        "export declare const handlers: <H extends { run: () => void }>(h: H) => Stream<H>;",
+        "export declare const record: <A>(h: { run: () => A }) => Stream<A>;",
+        "export declare const both: { <A>(value: A): Stream<A>; <A>(value: { run: () => A }): Stream<A> };",
+        "",
+      ]
+      .join("\n"),
+    )
+    .unwrap();
+    let dts = Dts::default();
+    assert_eq!(dts.opaque_positions(&path, "make", 2), Some(vec![true, true]));
+    assert_eq!(dts.opaque_positions(&path, "of", 1), Some(vec![true]));
+    assert_eq!(dts.opaque_positions(&path, "succeed", 1), Some(vec![true]));
+    assert_eq!(dts.opaque_positions(&path, "loose", 2), Some(vec![true, false]));
+    assert_eq!(dts.opaque_positions(&path, "handlers", 1), Some(vec![false]));
+    assert_eq!(dts.opaque_positions(&path, "record", 1), Some(vec![false]));
+    assert_eq!(dts.opaque_positions(&path, "both", 1), Some(vec![false]));
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
   }
 }

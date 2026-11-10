@@ -100,6 +100,9 @@ struct TypedSig {
   /// Per parameter: every callback it admits is declared to return a value that holds no
   /// service (`Dts::callback_free_returns`).
   free_returns: Vec<bool>,
+  /// Per argument: a value of a type parameter whose constraint names no member, so effect's
+  /// code reads none of its members by name (`Dts::opaque_positions`).
+  opaque: Vec<bool>,
 }
 
 /// A stand-in for the service-free values a type-modelled call site is handed (direction 2's
@@ -476,7 +479,7 @@ pub enum Constraint {
   /// An argument of a call into type-modelled `effect` code (`Analysis::typed_arg`): what it
   /// contributes to the call's slot. The flag: a callback among it is declared to return a
   /// value that holds no service.
-  TypedArg(VarId, VarId, Site, u8, bool),
+  TypedArg(VarId, VarId, Site, u8, bool, bool),
   /// The receivers of `o.name(...)` where the callee is the summary (`typed_call`): a summary
   /// is its own receiver; another object is one only if its `name` may be the summary
   /// (`TypedReceiverIf`). Slot, back variable and site as for `TypedArg`.
@@ -600,8 +603,8 @@ impl Constraint {
       C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
       C::ThenableBail(obj) => C::ThenableBail(*obj),
       C::ThenableAwait(dst) => C::ThenableAwait(v(*dst)),
-      C::TypedArg(slot, back, site, mask, prim) => {
-        C::TypedArg(v(*slot), v(*back), *site, *mask, *prim)
+      C::TypedArg(slot, back, site, mask, prim, opaque) => {
+        C::TypedArg(v(*slot), v(*back), *site, *mask, *prim, *opaque)
       }
       C::TypedReceiver(callee, name, slot, back, site) => {
         C::TypedReceiver(*callee, name.clone(), v(*slot), v(*back), *site)
@@ -983,7 +986,7 @@ pub struct Analysis {
   /// Each call's handed-values variable, translated for slots (`slot_in`).
   typed_backs: FxHashMap<VarId, VarId>,
   /// (object, slot) pairs `typed_arg` has handled.
-  typed_args_seen: FxHashSet<(ObjId, VarId, bool)>,
+  typed_args_seen: FxHashSet<(ObjId, VarId, bool, bool)>,
   /// The method summary read off a type-modelled value.
   typed_methods: FxHashMap<ObjId, ObjId>,
   /// The module each type-modelled call result comes from, for its container pool.
@@ -2352,12 +2355,12 @@ impl Analysis {
           self.seed(*dst, t);
         }
       }
-      Constraint::TypedArg(slot, back, site, mask, prim) => {
-        self.typed_arg(obj, *slot, *back, *site, *mask, *prim);
+      Constraint::TypedArg(slot, back, site, mask, prim, opaque) => {
+        self.typed_arg(obj, *slot, *back, *site, *mask, *prim, *opaque);
       }
       Constraint::TypedReceiver(callee, name, slot, back, site) => {
         if matches!(self.objs[obj].kind, ObjKind::Typed { .. }) {
-          self.typed_arg(obj, *slot, *back, *site, 0, false);
+          self.typed_arg(obj, *slot, *back, *site, 0, false, false);
         } else {
           let holder = self.holder(obj);
           let member = self.var();
@@ -2367,7 +2370,7 @@ impl Analysis {
       }
       Constraint::TypedReceiverIf(callee, recv, slot, back, site) => {
         if obj == *callee {
-          self.typed_arg(*recv, *slot, *back, *site, 0, false);
+          self.typed_arg(*recv, *slot, *back, *site, 0, false, false);
         }
       }
       Constraint::SlotIn(dst, stand_in) => self.slot_in(obj, *dst, *stand_in),
@@ -2443,7 +2446,7 @@ impl Analysis {
         false
       }
       Constraint::TypedReceiver(_, _, slot, back, site) => {
-        self.constrain(held_var, Constraint::TypedArg(*slot, *back, *site, 0, false));
+        self.constrain(held_var, Constraint::TypedArg(*slot, *back, *site, 0, false, false));
         false
       }
       Constraint::Call(call) => {
@@ -3404,7 +3407,7 @@ impl Analysis {
       Some(outer) => {
         let (dts, name) = (e.dts.clone(), e.name.clone());
         self.dts.returned_call(&dts, &name, origin.1, nargs).map(
-          |(b, ret, (generic, rest_generic), masks, free_returns)| {
+          |(b, ret, (generic, rest_generic), masks, free_returns, opaque)| {
             let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
             let rest = b.rest.map(|t| self.intern_ty(t));
             TypedSig {
@@ -3417,6 +3420,7 @@ impl Analysis {
               rest_generic,
               masks,
               free_returns,
+              opaque,
             }
           },
         )
@@ -3444,10 +3448,22 @@ impl Analysis {
     let masks = self.dts.callback_masks(&dts, &name, nargs).unwrap_or_else(|| vec![0xFF; nargs]);
     let free_returns =
       self.dts.callback_free_returns(&dts, &name, nargs).unwrap_or_else(|| vec![false; nargs]);
+    let opaque =
+      self.dts.opaque_positions(&dts, &name, nargs).unwrap_or_else(|| vec![false; nargs]);
     let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
     let rest = b.rest.map(|t| self.intern_ty(t));
-    let sig =
-      TypedSig { params, rest, ret, stores, reads, generic, rest_generic, masks, free_returns };
+    let sig = TypedSig {
+      params,
+      rest,
+      ret,
+      stores,
+      reads,
+      generic,
+      rest_generic,
+      masks,
+      free_returns,
+      opaque,
+    };
     self.typed_sigs.insert((export, nargs), sig.clone());
     Some(sig)
   }
@@ -3534,6 +3550,30 @@ impl Analysis {
       }
     };
     self.seed(dst, method);
+  }
+
+  /// The one result a type-modelled call site returns at a concrete type: a summary that holds
+  /// nothing the caller handed it.
+  fn typed_plain_result(
+    &mut self,
+    key: (Site, Option<ObjId>),
+    module: Option<ModuleIdx>,
+    origin: (u32, usize),
+    site: Site,
+  ) -> ObjId {
+    if let Some(p) = self.typed_plain_results.get(&key) {
+      return *p;
+    }
+    let empty = self.var();
+    let p = self.alloc(ObjKind::Typed { slot: empty, export: NO_EXPORT }, Some(site));
+    self.typed_plain_results.insert(key, p);
+    if let Some(m) = module {
+      self.typed_result_module.insert(p, m);
+    }
+    if origin.0 != NO_EXPORT {
+      self.typed_result_origin.insert(p, origin);
+    }
+    p
   }
 
   /// A call into type-modelled `effect` code (an export, or a value it made). The body is not
@@ -3633,7 +3673,7 @@ impl Analysis {
         // summary holds, read as its result, calls its own method).
         let c = match self.method_names.get(&call.site) {
           Some(name) => Constraint::TypedReceiver(callee, name.clone(), slot, back, call.site),
-          None => Constraint::TypedArg(slot, back, call.site, 0, false),
+          None => Constraint::TypedArg(slot, back, call.site, 0, false, false),
         };
         self.constrain(this, c);
       }
@@ -3733,7 +3773,8 @@ impl Analysis {
         // Without a signature, the call hands what it holds to unseen code (below), so its
         // callbacks run with unknown arguments.
         let mask = sig.as_ref().map_or(0, |s| s.masks.get(i).copied().unwrap_or(0xFF));
-        self.constrain(arg, Constraint::TypedArg(slot, back, call.site, mask, prim));
+        let opaque = sig.as_ref().is_some_and(|s| s.opaque.get(i).copied().unwrap_or(false));
+        self.constrain(arg, Constraint::TypedArg(slot, back, call.site, mask, prim, opaque));
       } else {
         self.constrain(arg, Constraint::TypedConcrete(ty.unwrap_or(u32::MAX), call.site));
       }
@@ -3742,26 +3783,8 @@ impl Analysis {
       self.copy(arg, pool);
     }
     let ret = sig.map_or(super::dts::RetShape { unknown: true, ..Default::default() }, |s| s.ret);
-    let plain = if ret.concrete || ret.effect_concrete {
-      let p = match self.typed_plain_results.get(&key) {
-        Some(p) => *p,
-        None => {
-          let empty = self.var();
-          let p = self.alloc(ObjKind::Typed { slot: empty, export: NO_EXPORT }, Some(call.site));
-          self.typed_plain_results.insert(key, p);
-          if let Some(m) = module {
-            self.typed_result_module.insert(p, m);
-          }
-          if export != NO_EXPORT {
-            self.typed_result_origin.insert(p, (export, nargs));
-          }
-          p
-        }
-      };
-      Some(p)
-    } else {
-      None
-    };
+    let plain = (ret.concrete || ret.effect_concrete)
+      .then(|| self.typed_plain_result(key, module, (export, nargs), call.site));
     if ret.concrete {
       if let Some(p) = plain {
         self.seed(call.ret, p);
@@ -3780,7 +3803,15 @@ impl Analysis {
       if ret.effect_param {
         self.copy(slot, success);
       }
+      // A value that comes back only through a service-free container (a Sink's result): an
+      // unknown value that holds no service. A string among them may still name a member.
+      if ret.effect_free {
+        self.seed(success, self.top_host);
+      }
       self.seed(call.ret, eff);
+    }
+    if ret.free {
+      self.seed(call.ret, self.top_host);
     }
     if ret.param || ret.unknown {
       self.copy(slot, call.ret);
@@ -4024,7 +4055,7 @@ impl Analysis {
       let v = match a {
         Arg::Var(v) | Arg::Spread(v) => *v,
       };
-      self.constrain(v, Constraint::TypedArg(returns, returns, call.site, 0xFF, false));
+      self.constrain(v, Constraint::TypedArg(returns, returns, call.site, 0xFF, false, false));
     }
     self.seed(call.ret, stand_in);
     self.copy(returns, call.ret);
@@ -4118,12 +4149,18 @@ impl Analysis {
       self.seed(dst, obj);
       return;
     }
-    // An Effect or promise is decided when the solve settles: what it succeeds with often
-    // arrives after the handover (a fiber handed to `addObserver` before its Effect has run),
-    // and the decision must not depend on which the solve met first. Records, arrays and
+    // An Effect, promise or type-modelled result is decided when the solve settles: what it
+    // succeeds with or holds often arrives after the handover (a fiber handed to `addObserver`
+    // before its Effect has run, a `Stream.make(record)` handed to `Stream.run` before the
+    // record reaches its slot), and the decision must not depend on which the solve met first.
+    // A result that comes to hold a service flows as itself; one that holds none goes to
+    // effect's code then, without dragging what it will never hold along. Records, arrays and
     // functions are decided now: deciding them at the fixpoint too admits values whose flow
     // the budget can't carry (`distilled_stripe` grows from 0.8M to 7.6M entries).
-    if !matches!(self.objs[obj].kind, ObjKind::Effect { .. } | ObjKind::Promise { .. }) {
+    if !matches!(
+      self.objs[obj].kind,
+      ObjKind::Effect { .. } | ObjKind::Promise { .. } | ObjKind::Typed { .. }
+    ) {
       self.admission_stats.1 += 1;
       self.hold_back(obj, ret);
       if filter {
@@ -4149,8 +4186,19 @@ impl Analysis {
     let pending = std::mem::take(&mut self.held_admissions);
     let mut keep = Vec::with_capacity(pending.len());
     let mut admitted = false;
+    // One walk per value: a value handed to many sites is held once per site. What an
+    // admission seeds is seen on the next pass, after the solve has run again.
+    let mut holds: FxHashMap<ObjId, bool> = FxHashMap::default();
     for (obj, dst) in pending {
-      if self.may_hold(obj) {
+      let hold = match holds.get(&obj) {
+        Some(h) => *h,
+        None => {
+          let h = self.may_hold(obj);
+          holds.insert(obj, h);
+          h
+        }
+      };
+      if hold {
         self.admission_stats.0 += 1;
         self.seed(dst, obj);
         admitted = true;
@@ -4669,12 +4717,24 @@ impl Analysis {
   /// What one argument at a generic position of a type-modelled call contributes to its slot
   /// (`typed_call`). A summary's contents flow on; an Effect contributes its success, a promise
   /// its value; a key or class handed over keeps every method; functions run with the slot as
-  /// callbacks, and a record's or array's handlers do too (effect code reads them by name).
-  /// The value itself enters the slot only if it may hold a service (`admit_typed`).
-  fn typed_arg(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site, mask: u8, prim: bool) {
-    // Once per (object, slot, flag): a callback's result feeds the same slot back. A callback
+  /// callbacks, and a record's or array's handlers do too (effect code reads them by name),
+  /// unless the position is `opaque`: a value of a type parameter whose constraint names no
+  /// member has none read. The value itself enters the slot only if it may hold a service
+  /// (`admit_typed`).
+  #[expect(clippy::too_many_arguments, reason = "the fields of `Constraint::TypedArg`")]
+  fn typed_arg(
+    &mut self,
+    obj: ObjId,
+    slot: VarId,
+    back: VarId,
+    site: Site,
+    mask: u8,
+    prim: bool,
+    opaque: bool,
+  ) {
+    // Once per (object, slot, flags): a callback's result feeds the same slot back. A callback
     // handed where its return is open is not skipped for having been handed where it is not.
-    if !self.typed_args_seen.insert((obj, slot, prim)) {
+    if !self.typed_args_seen.insert((obj, slot, prim, opaque)) {
       return;
     }
     let top = self.top_effect;
@@ -4717,7 +4777,9 @@ impl Analysis {
           // Its functions run as callbacks (`typed_nested_callbacks`), which track their returns.
           self.admit_typed_with(obj, slot, false);
         }
-        self.typed_nested_callbacks(obj, slot, back, site, mask);
+        if !opaque {
+          self.typed_nested_callbacks(obj, slot, back, site, mask);
+        }
       }
       _ => self.admit_typed(obj, slot),
     }
@@ -4889,7 +4951,7 @@ impl Analysis {
           self.seed(r, arr);
         }
         self.seed(this, self.top_host);
-        self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF, false));
+        self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF, false, false));
         return;
       }
     }
@@ -4902,7 +4964,7 @@ impl Analysis {
       (0..4).map(|j| Arg::Var(if mask & (1 << j) != 0 { slot } else { unknown })).collect();
     let call = Call { site: call_site, this: None, args, ret, is_new: false, builtin: None };
     self.constrain(callee, Constraint::Call(Box::new(call)));
-    self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF, false));
+    self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF, false, false));
   }
 
   /// `mask` (a callback's parameter positions, `Dts::callback_masks`) narrowed to the

@@ -62,10 +62,13 @@ pub enum Spec {
 pub const INERT_TYPES: &[(&str, &[&str])] =
   &[("Tracer.d.ts", &["Span", "AnySpan", "ExternalSpan", "NativeSpan", "SpanLink"])];
 
-/// Public types no service passes through (issue, "Assumptions" 4): a value of a type
-/// parameter that leaves a call only inside one of them holds no service
-/// (`Dts::callback_free_returns`).
-pub const SERVICE_FREE_CONTAINERS: &[(&str, &str)] = &[("Schedule.d.ts", "Schedule")];
+/// Public types no service passes through (issue, "Assumptions" 4), with the type arguments
+/// that carry none (empty: all of them). A value of a type parameter that is in a call only
+/// there holds no service (`Dts::container_only`). A Schedule's values never hold one; a
+/// Sink's result and leftovers (`Sink<A, In, L>`'s `A` and `L`) come back as its `End`, the
+/// `Done` signal, which is no service's value.
+pub const SERVICE_FREE_CONTAINERS: &[(&str, &str, &[usize])] =
+  &[("Schedule.d.ts", "Schedule", &[]), ("Sink.d.ts", "Sink", &[0, 2])];
 
 /// The `effect` major version the model is written against.
 pub const SUPPORTED_MAJOR: &str = "4";
