@@ -190,14 +190,15 @@ mod tests {
   use super::Fixture;
   use crate::effect_fixture;
 
-  fn hung_fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/effect_fixture_hangs")
+  /// Each test has a fixture of its own, so no test can remove another's output.
+  fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
   }
 
   /// Runs the fixture on a thread named after this test, so the harness can tell which test it
-  /// is, and returns its panic message, or fails when it is still running after the limit and a
-  /// few seconds of slack.
-  fn run_hung(plugins: Vec<SharedPluginable>) -> String {
+  /// is. Returns its panic message, or `None` when it passed, and fails when it is still
+  /// running after the limit and a few seconds of slack.
+  fn run(fixture: PathBuf, plugins: Vec<SharedPluginable>) -> Option<String> {
     let limit = effect_fixture::time_limit().expect("the time limit is on");
     let name = std::thread::current().name().expect("libtest names test threads").to_owned();
     let (tx, rx) = mpsc::channel();
@@ -205,7 +206,7 @@ mod tests {
       .name(name)
       .spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-          Fixture::new(hung_fixture()).run_integration_test_with_plugins(plugins);
+          Fixture::new(fixture).run_integration_test_with_plugins(plugins);
         }));
         let message = result.err().map(|err| {
           err
@@ -219,14 +220,31 @@ mod tests {
       .unwrap();
     let bound = limit + Duration::from_secs(3);
     match rx.recv_timeout(bound) {
-      Ok(Some(message)) => message,
-      Ok(None) => panic!("the hung fixture passed"),
+      Ok(message) => message,
       Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-        panic!("the hung fixture was still running {} s after it started", bound.as_secs())
+        panic!("the fixture was still running {} s after it started", bound.as_secs())
       }
     }
   }
 
+  /// The pid the fixture's `_test.mjs` wrote for the child process it started.
+  fn sleeper_pid(fixture: &Path) -> u32 {
+    let pid_file = fixture.join("dist/sleeper.pid");
+    let pid = std::fs::read_to_string(&pid_file).expect("the test script started its child");
+    let _ = std::fs::remove_file(&pid_file);
+    pid.trim().parse().unwrap()
+  }
+
+  /// Waits a few seconds for the process to end, and fails if it does not.
+  fn assert_stopped(pid: u32) {
+    let started = Instant::now();
+    while running(pid) && started.elapsed() < Duration::from_secs(5) {
+      std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!running(pid), "the test script's child process {pid} is still running");
+  }
+
+  #[cfg(target_os = "linux")]
   fn running(pid: u32) -> bool {
     // A killed process stays a zombie until whoever adopted it reaps it.
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -234,20 +252,53 @@ mod tests {
     })
   }
 
-  #[cfg(target_os = "linux")]
+  #[cfg(all(unix, not(target_os = "linux")))]
+  fn running(pid: u32) -> bool {
+    // A zombie still counts until it is reaped, which `assert_stopped` waits for.
+    #[expect(clippy::cast_possible_wrap)]
+    let pid = pid as libc::pid_t;
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+  }
+
+  #[cfg(windows)]
+  fn running(pid: u32) -> bool {
+    use windows_sys::Win32::{
+      Foundation::{CloseHandle, WAIT_TIMEOUT},
+      System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    // SAFETY: the handle is checked before use and closed after it.
+    unsafe {
+      let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+      if process.is_null() {
+        return false;
+      }
+      let running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+      CloseHandle(process);
+      running
+    }
+  }
+
   #[test]
   fn a_hung_test_script_and_its_children_are_stopped() {
-    let pid_file = hung_fixture().join("dist/sleeper.pid");
-    let _ = std::fs::remove_file(&pid_file);
-    let started = Instant::now();
-    let message = run_hung(vec![]);
-    assert!(message.contains("time limit"), "{message}");
-    let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
-    let _ = std::fs::remove_file(&pid_file);
-    while running(pid) && started.elapsed() < Duration::from_secs(10) {
-      std::thread::sleep(Duration::from_millis(20));
+    let fixture = fixture("effect_fixture_hangs");
+    let message = run(fixture.clone(), vec![]).expect("the hung fixture passed");
+    assert!(message.contains("stopped it and its child processes"), "{message}");
+    assert_stopped(sleeper_pid(&fixture));
+  }
+
+  #[test]
+  fn a_child_left_by_a_finished_test_script_is_stopped() {
+    let fixture = fixture("effect_fixture_leaves_child");
+    if let Some(message) = run(fixture.clone(), vec![]) {
+      panic!("{message}");
     }
-    assert!(!running(pid), "the test script's child process {pid} is still running");
+    // The child process runs the same test and leaves the check to its parent, which owns the
+    // processes the fixture started.
+    if effect_fixture::is_child() {
+      return;
+    }
+    assert_stopped(sleeper_pid(&fixture));
   }
 
   /// Blocks its thread in the build, as a runaway analysis would.
@@ -274,10 +325,10 @@ mod tests {
     }
   }
 
-  #[cfg(target_os = "linux")]
   #[test]
   fn a_build_that_never_yields_is_stopped() {
-    let message = run_hung(vec![Pluginable::new_shared(Spin)]);
-    assert!(message.contains("time limit"), "{message}");
+    let message = run(fixture("effect_fixture_build_hangs"), vec![Pluginable::new_shared(Spin)])
+      .expect("the fixture whose build never yields passed");
+    assert!(message.contains("stopped it and its child processes"), "{message}");
   }
 }

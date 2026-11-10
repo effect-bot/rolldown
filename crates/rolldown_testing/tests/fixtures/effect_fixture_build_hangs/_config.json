@@ -1,0 +1,10 @@
+{
+  "_comment": "Not a suite fixture: `fixture::tests` builds it with a plugin that never yields, to check that the harness stops a hung build. Its `_test.mjs` finishes at once, so only the build can hang.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

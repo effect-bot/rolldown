@@ -1,0 +1,10 @@
+{
+  "_comment": "Not a suite fixture: `fixture::tests` runs it to check that the harness stops a process the test script leaves running when it finishes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
