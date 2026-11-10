@@ -230,77 +230,78 @@ mod tests {
     }
   }
 
-  /// The pid the fixture's `_test.mjs` wrote for the child process it started.
-  fn sleeper_pid(fixture: &Path) -> u32 {
-    let pid_file = fixture.join("dist/sleeper.pid");
-    let pid = std::fs::read_to_string(&pid_file).expect("the test script started its child");
-    let _ = std::fs::remove_file(&pid_file);
-    pid.trim().parse().unwrap()
-  }
-
-  /// Waits a few seconds for the process to end, and fails if it does not.
-  fn assert_stopped(pid: u32) {
+  /// Fails unless the child process the fixture's `_test.mjs` started has stopped: it writes a counter
+  /// to `dist/beat` every 20 ms. A counter works the same on every platform and in a PID
+  /// namespace, where the pid the script sees is not the one the test would see.
+  fn assert_stopped(fixture: &Path) {
+    let beat_file = fixture.join("dist/beat");
+    let beat = || std::fs::read_to_string(&beat_file).ok();
+    assert!(beat().is_some(), "the test script did not start its child process");
     let started = Instant::now();
-    while running(pid) && started.elapsed() < Duration::from_secs(5) {
-      std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(!running(pid), "the test script's child process {pid} is still running");
-  }
-
-  #[cfg(target_os = "linux")]
-  fn running(pid: u32) -> bool {
-    // A killed process stays a zombie until whoever adopted it reaps it.
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-      stat.rsplit(')').next().is_some_and(|rest| !rest.trim_start().starts_with('Z'))
-    })
-  }
-
-  #[cfg(all(unix, not(target_os = "linux")))]
-  fn running(pid: u32) -> bool {
-    // A zombie still counts until it is reaped, which `assert_stopped` waits for.
-    let pid = pid as libc::pid_t;
-    // SAFETY: signal 0 only checks that the process exists.
-    unsafe { libc::kill(pid, 0) == 0 }
-  }
-
-  #[cfg(windows)]
-  fn running(pid: u32) -> bool {
-    use windows_sys::Win32::{
-      Foundation::{CloseHandle, WAIT_TIMEOUT},
-      System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
-    };
-    // SAFETY: the handle is checked before use and closed after it.
-    unsafe {
-      let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-      if process.is_null() {
-        return false;
+    loop {
+      let before = beat();
+      std::thread::sleep(Duration::from_millis(200));
+      if beat() == before {
+        break;
       }
-      let running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
-      CloseHandle(process);
-      running
+      assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the test script's child process is still running"
+      );
     }
+    let _ = std::fs::remove_file(&beat_file);
+  }
+
+  fn clear_beat(fixture: &Path) {
+    let _ = std::fs::remove_file(fixture.join("dist/beat"));
+  }
+
+  /// A fixture whose `_test.mjs` hangs: the harness stops it, and the child it started.
+  fn check_hung(name: &str) {
+    let fixture = fixture(name);
+    clear_beat(&fixture);
+    let message = run(fixture.clone(), vec![]).expect("the hung fixture passed");
+    assert!(message.contains("stopped it and its child processes"), "{message}");
+    assert_stopped(&fixture);
+  }
+
+  /// A fixture whose `_test.mjs` finishes and leaves a child running: the fixture passes, and
+  /// the harness stops the child.
+  fn check_left_child(name: &str) {
+    let fixture = fixture(name);
+    // The child process runs the same test and leaves the check to its parent, which owns the
+    // processes the fixture started.
+    if effect_fixture::is_child() {
+      if let Some(message) = run(fixture, vec![]) {
+        panic!("{message}");
+      }
+      return;
+    }
+    clear_beat(&fixture);
+    if let Some(message) = run(fixture.clone(), vec![]) {
+      panic!("{message}");
+    }
+    assert_stopped(&fixture);
   }
 
   #[test]
   fn a_hung_test_script_and_its_children_are_stopped() {
-    let fixture = fixture("effect_fixture_hangs");
-    let message = run(fixture.clone(), vec![]).expect("the hung fixture passed");
-    assert!(message.contains("stopped it and its child processes"), "{message}");
-    assert_stopped(sleeper_pid(&fixture));
+    check_hung("effect_fixture_hangs");
   }
 
   #[test]
   fn a_child_left_by_a_finished_test_script_is_stopped() {
-    let fixture = fixture("effect_fixture_leaves_child");
-    if let Some(message) = run(fixture.clone(), vec![]) {
-      panic!("{message}");
-    }
-    // The child process runs the same test and leaves the check to its parent, which owns the
-    // processes the fixture started.
-    if effect_fixture::is_child() {
-      return;
-    }
-    assert_stopped(sleeper_pid(&fixture));
+    check_left_child("effect_fixture_leaves_child");
+  }
+
+  #[test]
+  fn a_detached_child_of_a_hung_test_script_is_stopped() {
+    check_hung("effect_fixture_detached_hangs");
+  }
+
+  #[test]
+  fn a_detached_child_left_by_a_finished_test_script_is_stopped() {
+    check_left_child("effect_fixture_detached_leaves_child");
   }
 
   /// Blocks its thread in the build, as a runaway analysis would.

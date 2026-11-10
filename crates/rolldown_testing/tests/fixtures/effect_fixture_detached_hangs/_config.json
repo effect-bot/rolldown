@@ -1,0 +1,10 @@
+{
+  "_comment": "Not a suite fixture: `fixture::tests` runs it to check that the harness stops a hung `_test.mjs` and a child it started in a session of its own.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
