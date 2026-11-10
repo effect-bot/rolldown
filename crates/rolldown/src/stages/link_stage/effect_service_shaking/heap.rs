@@ -6967,14 +6967,44 @@ mod tests {
     assert!(!withheld_return(true, None), "only withheld: the return stays");
   }
 
-  /// An Effect is handed to type-modelled code (`AdmitTyped`) while what it succeeds with
-  /// arrives through a chain of copies, set up after or before the handover (`admission_first`)
-  /// and solved once. `service`: what arrives is a provided service rather than plain data.
-  /// Returns whether the Effect was admitted and whether what arrived went to effect's code.
-  fn admitted_late(admission_first: bool, service: bool) -> (bool, bool) {
+  /// The kinds of value whose admission waits for the solve to settle (`admit_typed_with`).
+  #[derive(Clone, Copy, Debug)]
+  enum Held {
+    Effect,
+    Promise,
+    /// A type-modelled result (`Stream.make(record)`): what it holds is its slot.
+    Typed,
+  }
+
+  const HELD: [Held; 3] = [Held::Effect, Held::Promise, Held::Typed];
+
+  /// A fresh value of kind `held`, with the variable what it succeeds with or holds arrives in.
+  fn held_value(a: &mut Analysis, held: Held, start: u32) -> (ObjId, VarId) {
+    match held {
+      Held::Effect => {
+        let (o, success, _) =
+          a.new_effect(Site { module: ModuleIdx::from_raw_unchecked(0), start, sub: 0 }, 0);
+        (o, success)
+      }
+      Held::Promise => {
+        let value = a.var();
+        (a.alloc(ObjKind::Promise { value }, None), value)
+      }
+      Held::Typed => {
+        let slot = a.var();
+        (a.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, None), slot)
+      }
+    }
+  }
+
+  /// A value is handed to type-modelled code (`AdmitTyped`) while what it succeeds with or
+  /// holds arrives through a chain of copies, set up after or before the handover
+  /// (`admission_first`) and solved once. `service`: what arrives is a provided service rather
+  /// than plain data. Returns whether the value was admitted and whether what arrived went to
+  /// effect's code.
+  fn admitted_late(held: Held, admission_first: bool, service: bool) -> (bool, bool) {
     let mut a = Analysis::new();
-    let (effect, success, _) =
-      a.new_effect(Site { module: ModuleIdx::from_raw_unchecked(0), start: 1, sub: 0 }, 0);
+    let (handed_value, success) = held_value(&mut a, held, 1);
     let value = a.alloc(ObjKind::Object, None);
     if service {
       a.seed(a.all_values, value);
@@ -6983,7 +7013,7 @@ mod tests {
     let (handed, dst) = (a.var(), a.var());
     let chain = [a.var(), a.var(), a.var()];
     let admit = |a: &mut Analysis| {
-      a.seed(handed, effect);
+      a.seed(handed, handed_value);
       a.constrain(handed, Constraint::AdmitTyped(dst, false));
     };
     // The copies exist before the value does, so it travels through them during the solve.
@@ -7001,24 +7031,26 @@ mod tests {
       admit(&mut a);
     }
     a.solve();
-    (a.vars[dst].pts.contains(&effect), a.objs[value].escaped.is_some())
+    (a.vars[dst].pts.contains(&handed_value), a.objs[value].escaped.is_some())
   }
 
-  /// Admission is decided at the fixpoint, not when the handover is met: an Effect that comes
-  /// to succeed with a service is admitted, and the service stays the program's, in either
-  /// order. One that never does goes to effect's code with what it succeeds with.
+  /// Admission is decided at the fixpoint, not when the handover is met: a value that comes to
+  /// succeed with or hold a service is admitted, and the service stays the program's, in either
+  /// order. One that never does goes to effect's code with what it holds.
   #[test]
   fn admission_is_order_independent() {
-    for admission_first in [true, false] {
-      assert_eq!(admitted_late(admission_first, true), (true, false), "service, {admission_first}");
-      assert_eq!(admitted_late(admission_first, false), (false, true), "data, {admission_first}");
+    for held in HELD {
+      for first in [true, false] {
+        assert_eq!(admitted_late(held, first, true), (true, false), "{held:?} service, {first}");
+        assert_eq!(admitted_late(held, first, false), (false, true), "{held:?} data, {first}");
+      }
     }
   }
 
   /// The shape of a `dependent_admissions` case.
   #[derive(Clone, Copy, Debug)]
   struct Dependent {
-    promise: bool,
+    held: Held,
     through_copy: bool,
     first_met: bool,
   }
@@ -7026,24 +7058,14 @@ mod tests {
   /// Two handovers wait for the solve to settle: `first` succeeds with what arrives through
   /// copies, and what `first`'s admission hands on is what `second` succeeds with, directly
   /// (`through_copy` false: `first`'s destination is `second`'s success) or through a copy.
-  /// Both are Effects, or both promises (`promise`), and the handovers are met in the order
-  /// given (`first_met`). `service`: what arrives is a provided service rather than plain
-  /// data. Returns whether each was admitted and whether what arrived went to effect's code.
+  /// Both are of kind `held`, and the handovers are met in the order given (`first_met`).
+  /// `service`: what arrives is a provided service rather than plain data. Returns whether
+  /// each was admitted and whether what arrived went to effect's code.
   fn dependent_admissions(case: Dependent, service: bool) -> (bool, bool, bool) {
-    let Dependent { promise, through_copy, first_met } = case;
+    let Dependent { held, through_copy, first_met } = case;
     let mut a = Analysis::new();
-    let handed = |a: &mut Analysis, start: u32| {
-      if promise {
-        let value = a.var();
-        (a.alloc(ObjKind::Promise { value }, None), value)
-      } else {
-        let (o, success, _) =
-          a.new_effect(Site { module: ModuleIdx::from_raw_unchecked(0), start, sub: 0 }, 0);
-        (o, success)
-      }
-    };
-    let (first, first_success) = handed(&mut a, 1);
-    let (second, second_success) = handed(&mut a, 2);
+    let (first, first_success) = held_value(&mut a, held, 1);
+    let (second, second_success) = held_value(&mut a, held, 2);
     let first_dst = if through_copy { a.var() } else { second_success };
     let second_dst = a.var();
     if first_met {
@@ -7082,11 +7104,11 @@ mod tests {
   #[test]
   fn dependent_admissions_are_order_independent() {
     let mut wrong = vec![];
-    for promise in [false, true] {
+    for held in HELD {
       for through_copy in [false, true] {
         for first_met in [true, false] {
           for (service, expected) in [(true, (true, true, false)), (false, (false, false, true))] {
-            let case = Dependent { promise, through_copy, first_met };
+            let case = Dependent { held, through_copy, first_met };
             let got = dependent_admissions(case, service);
             if got != expected {
               wrong.push(format!("{case:?}, service {service}: {got:?}"));
@@ -7098,32 +7120,25 @@ mod tests {
     assert!(wrong.is_empty(), "{wrong:#?}");
   }
 
-  /// An Effect or promise given up at one fixpoint keeps its subscription: a service it comes
-  /// to succeed with in a later phase of the solve goes to effect's code (bails), and the value
-  /// is not admitted after the fact.
+  /// A value given up at one fixpoint keeps its subscription: a service it comes to succeed
+  /// with or hold in a later phase of the solve goes to effect's code (bails), and the value is
+  /// not admitted after the fact.
   #[test]
   fn released_admission_keeps_its_subscription() {
-    for promise in [false, true] {
+    for held in HELD {
       let mut a = Analysis::new();
-      let (handed, success) = if promise {
-        let value = a.var();
-        (a.alloc(ObjKind::Promise { value }, None), value)
-      } else {
-        let (o, success, _) =
-          a.new_effect(Site { module: ModuleIdx::from_raw_unchecked(0), start: 1, sub: 0 }, 0);
-        (o, success)
-      };
+      let (handed, success) = held_value(&mut a, held, 1);
       let dst = a.var();
       a.admit_typed_with(handed, dst, true);
       a.solve();
-      assert!(a.held_admissions.is_empty(), "promise {promise}: released at the fixpoint");
+      assert!(a.held_admissions.is_empty(), "{held:?}: released at the fixpoint");
       let service = a.alloc(ObjKind::Object, None);
       a.seed(a.all_values, service);
       a.seed(a.unknown_key_values, service);
       a.seed(success, service);
       a.solve();
-      assert!(!a.vars[dst].pts.contains(&handed), "promise {promise}: not admitted later");
-      assert!(a.objs[service].escaped.is_some(), "promise {promise}: the late service bails");
+      assert!(!a.vars[dst].pts.contains(&handed), "{held:?}: not admitted later");
+      assert!(a.objs[service].escaped.is_some(), "{held:?}: the late service bails");
     }
   }
 }
