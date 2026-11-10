@@ -1,0 +1,10 @@
+{
+  "_comment": "A callback declared to take one argument reads the service through a rest parameter (Option.map). The rest parameter receives every argument from its position on, so the method it calls stays and the bundle runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

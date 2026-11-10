@@ -4969,19 +4969,22 @@ impl Analysis {
 
   /// `mask` (a callback's parameter positions, `Dts::callback_masks`) narrowed to the
   /// arguments `f` can read. An arrow has no `arguments` object of its own, so it reads only
-  /// what its declared parameters receive: `() => x` receives nothing the call holds.
+  /// what its declared parameters receive: `() => x` receives nothing the call holds. A rest
+  /// parameter receives every argument from its position on (`(...xs) => xs[0]` reads the
+  /// first).
   fn declared_args_mask(&self, f: ObjId, mask: u8) -> u8 {
     let ObjKind::Closure(fid) = self.objs[f].kind else { return mask };
     let info = &self.fns[fid];
     if !matches!(info.kind, FnKind::Arrow) {
       return mask;
     }
+    let n = info.params.len();
     let mut readable = 0u8;
-    for j in 0..info.params.len() {
+    for j in 0..n {
       readable |= 1 << j.min(7);
     }
     if info.rest.is_some() {
-      readable |= 0x80;
+      readable |= 0xFF << n.min(7);
     }
     mask & readable
   }
