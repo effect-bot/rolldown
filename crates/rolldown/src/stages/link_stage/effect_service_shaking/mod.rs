@@ -122,6 +122,7 @@ impl LinkStage<'_> {
       key_symbols: FxHashSet::default(),
       key_ctor_symbols: FxHashSet::default(),
       key_ctor_members: FxHashSet::default(),
+      hole_values: FxHashMap::default(),
     };
 
     // == modules: namespaces, externals, CommonJS
@@ -514,6 +515,11 @@ impl LinkStage<'_> {
     // references from analysed modules and the globals crosses into it, as into a class hole.
     let holes = self.module_holes(&order, &is_effect_module, analysed_holes);
     let mut hole_modules: FxHashMap<heap::ObjId, ModuleIdx> = FxHashMap::default();
+    for module in order.iter().copied().filter(|m| holes.contains(m)) {
+      let (class, value) = self.module_hole(&mut a, &mut sh, module, &holes);
+      hole_modules.insert(class, module);
+      sh.hole_values.insert(module, value);
+    }
 
     // == per-module facts and constraint generation
     let mut module_fns = vec![];
@@ -526,8 +532,6 @@ impl LinkStage<'_> {
       }
       let scoping = self.symbols[normal.idx].as_ref().expect("module symbols").scoping();
       if holes.contains(&normal.idx) {
-        let class = self.module_hole(&mut a, &mut sh, normal.idx, &holes);
-        hole_modules.insert(class, normal.idx);
         continue;
       }
       let mut external_imports = FxHashMap::default();
@@ -544,11 +548,22 @@ impl LinkStage<'_> {
               };
               external_imports.insert(*sym, (obj, name));
             }
-            Module::Normal(_) => {
-              if sh.cjs_modules.contains(&target) {
-                cjs_imports.insert(*sym);
+            // A CommonJS module's exports are not linked to its importers' bindings: when it is a
+            // hole, they read its value, so what they hand it still crosses into it.
+            Module::Normal(_) => match sh.hole_values.get(&target) {
+              Some(value) if sh.cjs_modules.contains(&target) => {
+                let name = match &import.imported {
+                  Specifier::Star => None,
+                  Specifier::Literal(l) => Some(ArcStr::from(l.as_str())),
+                };
+                external_imports.insert(*sym, (*value, name));
               }
-            }
+              _ => {
+                if sh.cjs_modules.contains(&target) {
+                  cjs_imports.insert(*sym);
+                }
+              }
+            },
           },
           None => {
             let obj = host::external_module(&mut a, record.module_request.as_str());
@@ -595,7 +610,8 @@ impl LinkStage<'_> {
       }
       if sh.cjs_modules.contains(&normal.idx) {
         let elem = a.elem(ns);
-        a.seed(elem, a.top_ext);
+        let value = sh.hole_values.get(&normal.idx).copied().unwrap_or(a.top_ext);
+        a.seed(elem, value);
       }
     }
 
@@ -976,7 +992,7 @@ impl LinkStage<'_> {
     sh: &mut Shared<'_>,
     module: ModuleIdx,
     holes: &FxHashSet<ModuleIdx>,
-  ) -> heap::ObjId {
+  ) -> (heap::ObjId, heap::ObjId) {
     let Module::Normal(normal) = &self.module_table.modules[module] else {
       unreachable!("a module hole is a normal module")
     };
@@ -1022,7 +1038,7 @@ impl LinkStage<'_> {
       let v = (sh.resolve_global)(a, &mut sh.globals, name);
       a.constrain(v, Constraint::ClassRef(class, vec![]));
     }
-    class
+    (class, op)
   }
 
   /// A module's exports in name order: `resolved_exports` is a hash map whose iteration order

@@ -103,6 +103,9 @@ pub struct Shared<'l> {
   pub module_fns: IndexVec<ModuleIdx, Option<FnId>>,
   /// Modules whose exports are reached through CommonJS interop.
   pub cjs_modules: FxHashSet<ModuleIdx>,
+  /// The value of each module hole (`LinkStage::module_hole`): what its exports, its
+  /// namespace and a `require` of it give.
+  pub hole_values: FxHashMap<ModuleIdx, ObjId>,
   /// Lazy top-level statements: the canonical symbol each declares -> its body.
   pub lazy_decls: FxHashMap<SymbolRef, FnId>,
   /// Every symbol reference: (the body it appears in, canonical symbol).
@@ -1321,6 +1324,19 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     let (callee, this) = self.callee(&c.callee);
     let args = self.args(&c.arguments);
+    // `require` of a module hole gives the hole's value, so what is handed to it crosses in.
+    let required = self
+      .m
+      .dynamic_imports
+      .get(&c.node_id.get().index())
+      .copied()
+      .flatten()
+      .and_then(|target| self.sh.hole_values.get(&target).copied());
+    if let Some(value) = required {
+      let v = self.call(callee, this, args, c.span, false);
+      self.seed(v, value);
+      return v;
+    }
     if let Expression::StaticMemberExpression(m) = &c.callee {
       // `o.m(...)`: the name lets a call into unseen code hand over only the receivers that
       // can hold that callee (`Analysis::method_names`).

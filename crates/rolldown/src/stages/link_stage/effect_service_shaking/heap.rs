@@ -908,6 +908,9 @@ pub struct Analysis {
   /// for everything its code makes, and back.
   pub opaque_of: FxHashMap<ObjId, ObjId>,
   pub opaque_class: FxHashMap<ObjId, ObjId>,
+  /// The classes whose opaque value reached a key position: a key, a key's name or a class's
+  /// heritage (`boundary_key`). A module hole among them is analysed in the next solve.
+  pub keyed_boundaries: FxHashSet<ObjId>,
   /// Objects that crossed into a class body: the class and how (`CLASS_HOW`), first only.
   pub class_escaped: FxHashMap<ObjId, (ObjId, u8)>,
   /// `Reflect.get`/`Reflect.set` receivers waiting on a target that may become class-related.
@@ -1195,6 +1198,7 @@ impl Analysis {
       typed_slot_fns: FxHashSet::default(),
       opaque_of: FxHashMap::default(),
       opaque_class: FxHashMap::default(),
+      keyed_boundaries: FxHashSet::default(),
       class_escaped: FxHashMap::default(),
       pending_receivers: FxHashMap::default(),
       hole_related: FxHashMap::default(),
@@ -5380,9 +5384,19 @@ impl Analysis {
       // host builtin, class code or a widened set): a key made there, or one handed to it
       // (`hand_key`).
       ObjKind::Typed { .. } | ObjKind::Top(_) | ObjKind::External { .. } => {
+        self.boundary_key(obj);
         let unseen = self.unseen_keys;
         self.key_use(unseen, use_);
       }
+    }
+  }
+
+  /// A boundary's value in a key position. Reading it as a key unseen code made assumes that
+  /// code never names the program's keys; a module hole is bundled code that may, so it is
+  /// recorded (`keyed_boundaries`) and analysed in the next solve.
+  fn boundary_key(&mut self, obj: ObjId) {
+    if let Some(&class) = self.opaque_class.get(&obj) {
+      self.keyed_boundaries.insert(class);
     }
   }
 
@@ -5422,6 +5436,7 @@ impl Analysis {
         self.key_use(unseen, use_);
       }
       ObjKind::Top(_) | ObjKind::External { .. } | ObjKind::Wrap(_) => {
+        self.boundary_key(base);
         self.key_use(base, use_);
         self.own_key_use(class, use_);
       }
@@ -5472,6 +5487,7 @@ impl Analysis {
       _ => false,
     };
     if possible_key {
+      self.boundary_key(base);
       // Heritage from code the pass can't see: a key that code may have made.
       let unseen = self.unseen_keys;
       self.key_use(unseen, use_);
@@ -5500,6 +5516,7 @@ impl Analysis {
         self.key_use(all, use_);
       }
       ObjKind::Top(_) | ObjKind::External { .. } => {
+        self.boundary_key(obj);
         let unseen = self.unseen_keys;
         self.key_use(unseen, use_);
       }
@@ -6081,9 +6098,10 @@ impl Analysis {
   }
 
   /// The class holes a service, a key or a provider reached during the solve: those behind
-  /// `hole_bails`, and those holding effect's key constructor.
+  /// `hole_bails`, those holding effect's key constructor, and those whose opaque value reached
+  /// a key position (`keyed_boundaries`).
   pub fn bailing_holes(&self) -> FxHashSet<ObjId> {
-    let mut out = FxHashSet::default();
+    let mut out = self.keyed_boundaries.clone();
     for (k, v) in &self.key_values {
       if self.never_prune.contains(k) {
         continue;

@@ -1,0 +1,10 @@
+{
+  "_comment": "Callbacks handed to module holes (static import, CommonJS import, require, dynamic import) make a key from the name the hole passes and call a method through it: each hole is analysed, every called method stays and the unread one goes.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
