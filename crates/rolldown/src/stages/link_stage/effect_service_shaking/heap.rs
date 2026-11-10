@@ -999,6 +999,11 @@ pub struct Analysis {
   unknown_store_filters: FxHashMap<VarId, VarId>,
   /// Work held back by the admission filter (`Deferred`).
   deferred: Vec<Deferred>,
+  /// Effects and promises handed to type-modelled code before they may hold a service
+  /// (`admit_typed`), with their destinations; decided when the solve settles
+  /// (`settle_admissions`).
+  held_admissions: Vec<(ObjId, VarId)>,
+  held_admissions_seen: FxHashSet<(ObjId, VarId)>,
   /// Objects known to hold something that may be a service (`may_hold` only grows).
   live: FxHashSet<ObjId>,
   /// The size of `never_prune` when `live` was last valid.
@@ -1178,6 +1183,8 @@ impl Analysis {
       site_stand_ins: FxHashMap::default(),
       unknown_store_filters: FxHashMap::default(),
       deferred: vec![],
+      held_admissions: vec![],
+      held_admissions_seen: FxHashSet::default(),
       live: FxHashSet::default(),
       live_code: FxHashSet::default(),
       live_never_prune: 0,
@@ -1978,7 +1985,7 @@ impl Analysis {
         if self.activation_queue.is_empty() && self.new_constraints.is_empty() {
           // Rejected objects are re-checked as they change; this pass only confirms that
           // nothing became admissible without an event before the solve ends.
-          if self.recheck_all() | self.recheck_deferred() {
+          if self.recheck_all() | self.recheck_deferred() | self.settle_admissions() {
             continue;
           }
           break;
@@ -3656,7 +3663,8 @@ impl Analysis {
   /// A service has methods, so a value that reaches none of these holds no service, and nothing
   /// read from it can call or name one. Strings, numbers and other primitives hold nothing. The
   /// answer only turns from false to true as the solve grows (`live` keeps the positives), so a
-  /// held-back object is re-checked whenever the solve settles (`recheck_deferred`).
+  /// held-back object is re-checked whenever the solve settles (`recheck_deferred`,
+  /// `settle_admissions`).
   fn may_hold(&mut self, obj: ObjId) -> bool {
     self.reaches(obj, false)
   }
@@ -3959,7 +3967,46 @@ impl Analysis {
       self.seed(dst, obj);
       return;
     }
-    self.admission_stats.1 += 1;
+    // An Effect or promise is decided when the solve settles: what it succeeds with often
+    // arrives after the handover (a fiber handed to `addObserver` before its Effect has run),
+    // and the decision must not depend on which the solve met first. Records, arrays and
+    // functions are decided now: deciding them at the fixpoint too admits values whose flow
+    // the budget can't carry (`distilled_stripe` grows from 0.8M to 7.6M entries).
+    if !matches!(self.objs[obj].kind, ObjKind::Effect { .. } | ObjKind::Promise { .. }) {
+      self.admission_stats.1 += 1;
+      self.hold_back(obj, ret);
+      return;
+    }
+    if self.held_admissions_seen.insert((obj, dst)) {
+      self.held_admissions.push((obj, dst));
+    }
+  }
+
+  /// At a point where the solve has settled, decides every Effect and promise handover held
+  /// back since the last one, all at once: one that may now hold a service is admitted, and
+  /// the rest go to effect's code (`hold_back`). Within a phase of the solve the outcome does
+  /// not depend on the order the solve met a handover and what the value comes to succeed
+  /// with. One that comes to hold a service in a later phase, after it went, bails that
+  /// service (sound, less precise). Returns whether any was decided.
+  fn settle_admissions(&mut self) -> bool {
+    if self.held_admissions.is_empty() {
+      return false;
+    }
+    for (obj, dst) in std::mem::take(&mut self.held_admissions) {
+      if self.may_hold(obj) {
+        self.admission_stats.0 += 1;
+        self.seed(dst, obj);
+      } else {
+        self.admission_stats.1 += 1;
+        self.hold_back(obj, true);
+      }
+    }
+    true
+  }
+
+  /// A value handed to type-modelled code that holds no service: it goes to effect's code. A
+  /// function goes without its return when `ret` is false.
+  fn hold_back(&mut self, obj: ObjId, ret: bool) {
     match self.objs[obj].kind {
       // A summary, Effect or promise that holds no prunable service yet may come to hold one
       // (its slot, success or value grows): what it holds goes to unseen code as it arrives, so
@@ -6564,5 +6611,53 @@ mod tests {
       assert!(withheld_return(false, Some(second)), "{name} before the withheld handover");
     }
     assert!(!withheld_return(true, None), "only withheld: the return stays");
+  }
+
+  /// An Effect is handed to type-modelled code (`AdmitTyped`) while what it succeeds with
+  /// arrives through a chain of copies, set up after or before the handover (`admission_first`)
+  /// and solved once. `service`: what arrives is a provided service rather than plain data.
+  /// Returns whether the Effect was admitted and whether what arrived went to effect's code.
+  fn admitted_late(admission_first: bool, service: bool) -> (bool, bool) {
+    let mut a = Analysis::new();
+    let (effect, success, _) =
+      a.new_effect(Site { module: ModuleIdx::from_raw_unchecked(0), start: 1, sub: 0 }, 0);
+    let value = a.alloc(ObjKind::Object, None);
+    if service {
+      a.seed(a.all_values, value);
+      a.seed(a.unknown_key_values, value);
+    }
+    let (handed, dst) = (a.var(), a.var());
+    let chain = [a.var(), a.var(), a.var()];
+    let admit = |a: &mut Analysis| {
+      a.seed(handed, effect);
+      a.constrain(handed, Constraint::AdmitTyped(dst, false));
+    };
+    // The copies exist before the value does, so it travels through them during the solve.
+    let arrive = |a: &mut Analysis| {
+      a.copy(chain[0], chain[1]);
+      a.copy(chain[1], chain[2]);
+      a.copy(chain[2], success);
+      a.seed(chain[0], value);
+    };
+    if admission_first {
+      admit(&mut a);
+      arrive(&mut a);
+    } else {
+      arrive(&mut a);
+      admit(&mut a);
+    }
+    a.solve();
+    (a.vars[dst].pts.contains(&effect), a.objs[value].escaped.is_some())
+  }
+
+  /// Admission is decided at the fixpoint, not when the handover is met: an Effect that comes
+  /// to succeed with a service is admitted, and the service stays the program's, in either
+  /// order. One that never does goes to effect's code with what it succeeds with.
+  #[test]
+  fn admission_is_order_independent() {
+    for admission_first in [true, false] {
+      assert_eq!(admitted_late(admission_first, true), (true, false), "service, {admission_first}");
+      assert_eq!(admitted_late(admission_first, false), (false, true), "data, {admission_first}");
+    }
   }
 }
