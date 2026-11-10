@@ -4,12 +4,11 @@ import * as Effect from 'effect/Effect';
 import * as Layer from 'effect/Layer';
 import * as Sink from 'effect/Sink';
 import * as Stream from 'effect/Stream';
-// A service-free string collected by `Sink.takeWhile` comes back through the
-// Sink's `Done` signal and names a method of a service the program holds. Done
-// values that hold no service still flow, so the named method stays and the
-// bundle runs. (The string comes back from the type-modelled Stream and Sink as
-// an unknown scalar, so the unread method may stay, an accepted imprecision; it
-// is not checked.)
+// A service-free string collected by `Sink.takeWhile` comes back in the Sink's
+// result and names a method of a service the program holds. A Sink's result is
+// untracked (assumption 6) but comes back as an unknown scalar, which may name
+// any method, so the named method stays and the bundle runs. (The unread method
+// may stay too, an accepted imprecision; it is not checked.)
 const Store = Context.Service('test/SinkTakeWhileKey');
 const program = Effect.gen(function* () {
   const store = yield* Store;

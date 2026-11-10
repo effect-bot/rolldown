@@ -1,5 +1,5 @@
 {
-  "_comment": "Sink.succeed(store) handed to the data-last Stream.run through pipe ends with the service as an ordinary successful result. Tim's exclusion of stream elements collected into a Sink's result does not cover a value the Sink is handed itself, so the method the program calls on it stays and the bundle runs.",
+  "_comment": "Stream.empty.pipe(Stream.run(Sink.succeed(store))), the data-last form, succeeds with the service as the Sink's result. No service passes through a Sink's result or leftovers (Tim's decision, assumption 6), so the read keeps nothing: both method definitions are removed and the bundle is not run. The built program breaks on sinkUsed, which Tim accepted because the pattern is rare.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

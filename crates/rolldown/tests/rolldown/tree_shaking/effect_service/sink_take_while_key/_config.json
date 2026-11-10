@@ -1,5 +1,5 @@
 {
-  "_comment": "A service-free string collected by Sink.takeWhile comes back through the Sink's Done signal and names a method of a service the program holds. Done values that hold no service still flow: the named method stays and the bundle runs. The string comes back from the type-modelled Stream and Sink as an unknown scalar, so the unread method may stay (accepted imprecision); it is not checked.",
+  "_comment": "A service-free string collected by Sink.takeWhile comes back in the Sink's result and names a method of a service the program holds. A Sink's result is untracked (assumption 6) but comes back as an unknown scalar, which may name any method: the named method stays and the bundle runs. The string comes back from the type-modelled Stream and Sink as an unknown scalar, so the unread method may stay (accepted imprecision); it is not checked.",
   "config": {
     "experimental": {
       "effectServiceShaking": true

@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 
-// The method a `Done` value names must stay. The unread method is not checked:
+// The method a Sink's result names must stay. The unread method is not checked:
 // a string is not tracked through the type-modelled Stream and Sink, so it comes
 // back as an unknown scalar and the computed read may keep every method
 // (accepted imprecision, design principle 10).

@@ -4,11 +4,10 @@ import * as Effect from 'effect/Effect';
 import * as Layer from 'effect/Layer';
 import * as Sink from 'effect/Sink';
 import * as Stream from 'effect/Stream';
-// `Sink.succeed(store)` handed to the data-last `Stream.run` through `pipe`
-// ends with the service as an ordinary successful result. Tim's exclusion of
-// stream elements collected into a Sink's result does not cover a value the
-// Sink is handed itself, so the method the program calls on it stays and the
-// bundle runs.
+// `Stream.empty.pipe(Stream.run(Sink.succeed(store)))`, the data-last form,
+// succeeds with the service as the Sink's result. No service passes through a
+// Sink's result or leftovers (Tim's decision, assumption 6), so the read keeps
+// nothing: both method definitions are removed and the bundle is not run.
 const Store = Context.Service('test/SinkSucceedDataLastService');
 const program = Effect.gen(function* () {
   const store = yield* Store;

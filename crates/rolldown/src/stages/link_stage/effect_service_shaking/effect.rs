@@ -62,18 +62,14 @@ pub enum Spec {
 pub const INERT_TYPES: &[(&str, &[&str])] =
   &[("Tracer.d.ts", &["Span", "AnySpan", "ExternalSpan", "NativeSpan", "SpanLink"])];
 
-/// Public types no service passes through (issue, "Assumptions" 4): a value of a type
-/// parameter that is in a call only inside one of them holds no service
-/// (`Dts::container_only`). A Sink is not one: its result and leftovers (`End`) are an
-/// ordinary success (`Sink.succeed(a)`), not a `Done` value.
-pub const SERVICE_FREE_CONTAINERS: &[(&str, &str)] = &[("Schedule.d.ts", "Schedule")];
-
-/// A Sink's result type argument (`Sink<A, In, L, E, R>`'s `A`). Tim's decision of
-/// 2026-11-10: a service that enters a Sink as a stream element and comes back in the Sink's
-/// result is not tracked. A call that succeeds with a type parameter occurring among its
-/// parameters only here (`Stream.run`) succeeds with what the Sink it is handed holds
-/// (`Sink.succeed(a)`'s `a`), not with its stream's elements (`Dts::sink_results`).
-pub const SINK_RESULT: (&str, &str, usize) = ("Sink.d.ts", "Sink", 0);
+/// Public types no service passes through, with the type arguments that carry none (empty:
+/// all of them). A value of a type parameter that is in a call only there holds no service
+/// (`Dts::container_only`). A Schedule's values never hold one (issue, "Assumptions" 4). A
+/// Sink's result and leftovers (`Sink<A, In, L>`'s `A` and `L`) never hold one either
+/// (assumption 6, Tim's decision of 2026-11-10). That is its own assumption: a Sink's `End` is
+/// an ordinary success, not a `Done` signal. A Sink's input `In` is not covered.
+pub const SERVICE_FREE_CONTAINERS: &[(&str, &str, &[usize])] =
+  &[("Schedule.d.ts", "Schedule", &[]), ("Sink.d.ts", "Sink", &[0, 2])];
 
 /// The `effect` major version the model is written against.
 pub const SUPPORTED_MAJOR: &str = "4";
