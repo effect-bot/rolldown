@@ -2079,6 +2079,9 @@ impl Analysis {
         ObjKind::Top(Flavour::Host) => self.seed(*dst, self.all_keys),
         ObjKind::Top(_) => self.seed(*dst, self.unseen_keys),
         ObjKind::Builtin { .. } if self.is_default(obj) => self.copy(self.effect_key_strings, *dst),
+        // A module hole's value may be a container whose keys are the program's: the hole is
+        // analysed in the next solve (`boundary_key`).
+        ObjKind::External { .. } => self.boundary_key(obj),
         _ => {}
       },
       Constraint::ElemOf(dst) => self.elem_of(obj, *dst),
@@ -2201,7 +2204,7 @@ impl Analysis {
         ObjKind::Str(_) => self.seed(*dst, obj),
         ObjKind::Wrap(_) | ObjKind::Typed { .. } => self.copy(self.effect_key_strings, *dst),
         ObjKind::Top(_) if obj == self.top_effect => self.copy(self.effect_key_strings, *dst),
-        ObjKind::External { .. } if self.is_opaque(obj) => {}
+        ObjKind::External { .. } if self.is_opaque(obj) => self.boundary_key(obj),
         ObjKind::Top(Flavour::Host) | ObjKind::External { flavour: Flavour::Host, .. } => {
           self.seed(*dst, self.all_keys);
         }

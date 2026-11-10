@@ -1,0 +1,10 @@
+{
+  "_comment": "Contexts and Layers passed into and returned from a module hole, contexts its callbacks build, and Context.makeUnsafe over maps it builds: every called method stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
