@@ -1,0 +1,10 @@
+{
+  "_comment": "Callbacks handed to Schedule constructors return Effects that call a service: Schedule.map's returns an Effect.sync that calls a captured service, and Schedule.while's an Effect.gen that yields the service and calls it. A callback's return goes to effect's code without being read (services never pass through a Schedule, assumption 4), but the callbacks and the Effects they return still run: both called methods stay, the unread one goes, and the bundle runs. Guards the Schedule callback-return filter against dropping what a callback runs.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -97,9 +97,9 @@ struct TypedSig {
   /// Per parameter: which parameters of the callbacks it holds take values of a type parameter
   /// (`Dts::callback_masks`).
   masks: Vec<u8>,
-  /// Per parameter: every callback it admits is declared to return only primitives
-  /// (`Dts::callback_prim_returns`).
-  prim_returns: Vec<bool>,
+  /// Per parameter: every callback it admits is declared to return a value that holds no
+  /// service (`Dts::callback_free_returns`).
+  free_returns: Vec<bool>,
 }
 
 /// A stand-in for the service-free values a type-modelled call site is handed (direction 2's
@@ -474,8 +474,8 @@ pub enum Constraint {
   /// protocol method loaded into the variable).
   Witness(ObjId, VarId),
   /// An argument of a call into type-modelled `effect` code (`Analysis::typed_arg`): what it
-  /// contributes to the call's slot. The flag: a callback among it is declared to return only
-  /// primitives.
+  /// contributes to the call's slot. The flag: a callback among it is declared to return a
+  /// value that holds no service.
   TypedArg(VarId, VarId, Site, u8, bool),
   /// Values entering a type-modelled value's slot (`Analysis::slot_in`); the object is the
   /// stand-in for what the admission filter holds back.
@@ -3269,7 +3269,7 @@ impl Analysis {
       Some(outer) => {
         let (dts, name) = (e.dts.clone(), e.name.clone());
         self.dts.returned_call(&dts, &name, origin.1, nargs).map(
-          |(b, ret, (generic, rest_generic), masks, prim_returns)| {
+          |(b, ret, (generic, rest_generic), masks, free_returns)| {
             let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
             let rest = b.rest.map(|t| self.intern_ty(t));
             TypedSig {
@@ -3281,7 +3281,7 @@ impl Analysis {
               generic,
               rest_generic,
               masks,
-              prim_returns,
+              free_returns,
             }
           },
         )
@@ -3307,12 +3307,12 @@ impl Analysis {
     let (generic, rest_generic) =
       self.dts.generic_positions(&dts, &name, nargs).unwrap_or((vec![true; nargs], true));
     let masks = self.dts.callback_masks(&dts, &name, nargs).unwrap_or_else(|| vec![0xFF; nargs]);
-    let prim_returns =
-      self.dts.callback_prim_returns(&dts, &name, nargs).unwrap_or_else(|| vec![false; nargs]);
+    let free_returns =
+      self.dts.callback_free_returns(&dts, &name, nargs).unwrap_or_else(|| vec![false; nargs]);
     let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
     let rest = b.rest.map(|t| self.intern_ty(t));
     let sig =
-      TypedSig { params, rest, ret, stores, reads, generic, rest_generic, masks, prim_returns };
+      TypedSig { params, rest, ret, stores, reads, generic, rest_generic, masks, free_returns };
     self.typed_sigs.insert((export, nargs), sig.clone());
     Some(sig)
   }
@@ -3581,8 +3581,8 @@ impl Analysis {
         Some(t) => self.typed_filtered_arg(v, t),
       };
       if generic {
-        // A callback declared to return only primitives goes over without its return.
-        let prim = sig.as_ref().is_some_and(|s| s.prim_returns.get(i).copied().unwrap_or(false));
+        // A callback declared to return a value that holds no service goes without its return.
+        let prim = sig.as_ref().is_some_and(|s| s.free_returns.get(i).copied().unwrap_or(false));
         self.constrain(arg, Constraint::AdmitTyped(handed, prim));
         // Without a signature, the call hands what it holds to unseen code (below), so its
         // callbacks run with unknown arguments.
@@ -4585,7 +4585,8 @@ impl Analysis {
   /// callbacks with the slot instead (`ROLLDOWN_EFFECT_SERVICE_SHAKING_TRACKED_CALLBACKS=1`, a
   /// diagnostic) merges every call's slot into every callback and does not finish on the gates.
   ///
-  /// A callback declared to return only primitives (`prim`, `Predicate<A>`) hands effect's
+  /// A callback declared to return a value that holds no service (`prim`; `Predicate<A>`, or
+  /// `Schedule.map`'s output under assumption 4: `Dts::callback_free_returns`) hands effect's
   /// code nothing it returns: a value at a position whose declared type admits only primitives
   /// holds no service (direction 2, as for arguments at concrete positions). Its return goes to
   /// that code only if the same function is also handed over where its return is open.
@@ -6064,7 +6065,7 @@ impl Analysis {
   }
 
   /// `escape`. With `ret` false, a function that goes to effect's code goes without what it
-  /// returns (`typed_callback`'s callbacks declared to return only primitives); the first
+  /// returns (`typed_callback`'s callbacks declared to return no service); the first
   /// escape that hands its return over, whenever it comes, does.
   fn escape_with(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>, ret: bool) {
     // An escape into effect's code runs once; one into code the pass can't see runs once too,
@@ -6120,7 +6121,7 @@ impl Analysis {
         let elem = self.elem(obj);
         self.constrain(elem, Constraint::Escape(flavour, site));
         // Fields written from outside may hold anything (what effect's code made, for it). A
-        // function handed only where it is declared a callback that returns primitives has no
+        // function handed only where it is declared a callback that returns no service has no
         // properties by that type: effect's code writes none (`release_ret` adds them).
         if external && ret {
           let top = if into_effect { self.top_effect } else { self.top_ext };
@@ -6514,7 +6515,7 @@ mod tests {
   }
 
   /// A function that returns an object is handed to effect's code twice: once without its
-  /// return (a callback declared to return primitives) and once by `second`. Each step is
+  /// return (a callback declared to return no service) and once by `second`. Each step is
   /// solved before the next, in the order given. Returns whether the object it returns went to
   /// effect's code.
   fn withheld_return(withheld_first: bool, second: Option<fn(&mut Analysis, ObjId)>) -> bool {

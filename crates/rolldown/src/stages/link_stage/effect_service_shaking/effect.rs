@@ -62,6 +62,11 @@ pub enum Spec {
 pub const INERT_TYPES: &[(&str, &[&str])] =
   &[("Tracer.d.ts", &["Span", "AnySpan", "ExternalSpan", "NativeSpan", "SpanLink"])];
 
+/// Public types no service passes through (issue, "Assumptions" 4): a value of a type
+/// parameter that leaves a call only inside one of them holds no service
+/// (`Dts::callback_free_returns`).
+pub const SERVICE_FREE_CONTAINERS: &[(&str, &str)] = &[("Schedule.d.ts", "Schedule")];
+
 /// The `effect` major version the model is written against.
 pub const SUPPORTED_MAJOR: &str = "4";
 

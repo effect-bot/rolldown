@@ -104,7 +104,7 @@ pub struct RetShape {
 }
 
 /// What `Dts::returned_call` reads: bounds, return shape, generic positions, callback masks and
-/// which parameters take callbacks that return only primitives.
+/// which parameters take callbacks whose returns hold no service.
 pub type ReturnedCall = (Bounds, RetShape, (Vec<bool>, bool), Vec<u8>, Vec<bool>);
 
 /// The bounds of one exported function: a type per parameter, the elements of its rest
@@ -364,10 +364,13 @@ impl Dts {
   }
 
   /// For a call with `nparams` arguments: per parameter, whether every callback its declared
-  /// type admits is declared to return only primitives (`Predicate<A>`'s `(a: A) => boolean`),
-  /// in every signature the call may match. A type parameter, an options object, or a callback
-  /// whose return is open, `unknown` or holds an object type is not.
-  pub fn callback_prim_returns(
+  /// type admits is declared to return a value that holds no service, in every signature the
+  /// call may match. That is a primitive (`Predicate<A>`'s `(a: A) => boolean`), a type
+  /// parameter a value of which leaves the call only inside a Schedule (`Schedule.map`'s
+  /// `Output2`, assumption 4; `schedule_only`), or an `Effect` that succeeds with one of
+  /// those. Anything else is not: a type parameter that may come back out, `unknown`, an
+  /// object, a callback type given as a type parameter, an options object.
+  pub fn callback_free_returns(
     &self,
     path: &Path,
     name: &str,
@@ -375,20 +378,20 @@ impl Dts {
   ) -> Option<Vec<bool>> {
     let start = std::time::Instant::now();
     let sigs = self.signatures(path, name)?;
-    let out = self.prim_returns_of(&sigs, nparams);
+    let out = self.free_returns_of(&sigs, nparams);
     self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
     Some(out)
   }
 
-  fn prim_returns_of(&self, sigs: &[Sig<'_>], nparams: usize) -> Vec<bool> {
+  fn free_returns_of(&self, sigs: &[Sig<'_>], nparams: usize) -> Vec<bool> {
     let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
     let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
     let mut out = vec![!matching.is_empty(); nparams];
     for sig in matching {
-      for (i, prim) in out.iter_mut().enumerate() {
+      for (i, free) in out.iter_mut().enumerate() {
         let t = sig.params.get(i).or_else(|| sig.params.last().filter(|(_, r)| *r));
-        *prim &= match t {
-          Some((Some(t), _)) => self.returns_prim(sig.file, t, &sig.tparams, 0),
+        *free &= match t {
+          Some((Some(t), _)) => self.callback_returns_free(sig, t, 0),
           _ => false,
         };
       }
@@ -396,24 +399,44 @@ impl Dts {
     out
   }
 
-  /// Whether `t` is a callback type, or a union of them and primitives, whose every call
-  /// signature returns only primitives.
-  fn returns_prim(&self, f: usize, t: &TSType<'_>, tp: &[String], depth: u32) -> bool {
+  /// Whether `t`, a parameter type of `sig`, is a callback type, or a union of them and
+  /// primitives, whose every call signature returns a value that holds no service.
+  fn callback_returns_free(&self, sig: &Sig<'_>, t: &TSType<'_>, depth: u32) -> bool {
+    use oxc::span::GetSpan;
     if depth > 6 {
       return false;
     }
+    let f = sig.file;
+    let tp = &sig.tparams;
     match t {
-      TSType::TSParenthesizedType(p) => self.returns_prim(f, &p.type_annotation, tp, depth + 1),
+      TSType::TSParenthesizedType(p) => {
+        self.callback_returns_free(sig, &p.type_annotation, depth + 1)
+      }
       TSType::TSUnionType(u) => {
         let callable = |x: &TSType<'_>| !self.classify(f, x, tp, depth + 1).prim_only();
         u.types.iter().any(callable)
-          && u.types.iter().all(|x| !callable(x) || self.returns_prim(f, x, tp, depth + 1))
+          && u.types.iter().all(|x| !callable(x) || self.callback_returns_free(sig, x, depth + 1))
       }
       TSType::TSTypeReference(r)
         if matches!(&r.type_name, TSTypeName::IdentifierReference(id)
           if tp.iter().any(|p| p == id.name.as_str())) =>
       {
         false
+      }
+      // A callback written in the signature: its return may be a type parameter of the
+      // signature that leaves the call only inside a Schedule.
+      TSType::TSFunctionType(ft) => {
+        let ret = &ft.return_type.type_annotation;
+        let own: Vec<String> = ft
+          .type_parameters
+          .as_ref()
+          .map(|d| d.params.iter().map(|p| p.name.name.as_str().to_string()).collect())
+          .unwrap_or_default();
+        let free: Vec<String> =
+          self.schedule_only(sig, ret.span()).into_iter().filter(|p| !own.contains(p)).collect();
+        let mut tps = own;
+        tps.extend(tp.iter().cloned());
+        self.return_free(f, ret, &tps, &free, 0)
       }
       _ => {
         let mut sigs = vec![];
@@ -423,12 +446,131 @@ impl Dts {
             s.ret.is_some_and(|r| {
               let mut tps = s.tparams.clone();
               tps.extend(tp.iter().cloned());
-              let c = self.classify(s.file, r, &tps, 0);
-              c.prim_only() && !c.ignored
+              self.return_free(s.file, r, &tps, &[], 0)
             })
           })
       }
     }
+  }
+
+  /// Whether a callback's declared return `t` holds no service: primitives, a type parameter
+  /// in `free`, or an `Effect` that succeeds with one of those (its failure and requirements
+  /// carry no service: assumption 3, and requirements are types).
+  fn return_free(
+    &self,
+    f: usize,
+    t: &TSType<'_>,
+    tp: &[String],
+    free: &[String],
+    depth: u32,
+  ) -> bool {
+    if depth > 6 {
+      return false;
+    }
+    match t {
+      TSType::TSParenthesizedType(p) => {
+        self.return_free(f, &p.type_annotation, tp, free, depth + 1)
+      }
+      TSType::TSUnionType(u) => u.types.iter().all(|m| self.return_free(f, m, tp, free, depth + 1)),
+      TSType::TSTypeReference(r) => {
+        if let TSTypeName::IdentifierReference(id) = &r.type_name {
+          if tp.iter().any(|p| p == id.name.as_str()) {
+            return free.iter().any(|p| p == id.name.as_str()) && r.type_arguments.is_none();
+          }
+        }
+        if self.is_public(f, &r.type_name, "Effect.d.ts", "Effect") {
+          return r
+            .type_arguments
+            .as_ref()
+            .and_then(|a| a.params.first())
+            .is_some_and(|success| self.return_free(f, success, tp, free, depth + 1));
+        }
+        let c = self.classify(f, t, tp, 0);
+        c.prim_only() && !c.ignored
+      }
+      _ => {
+        let c = self.classify(f, t, tp, 0);
+        c.prim_only() && !c.ignored
+      }
+    }
+  }
+
+  /// Whether the type name `n` in `f` is `local` of effect's public module `file`.
+  fn is_public(&self, f: usize, n: &TSTypeName<'_>, file: &str, local: &str) -> bool {
+    self.name_in(f, n, 0).is_some_and(|(rf, l)| {
+      let idx = self.index(rf);
+      l == local && idx.file == file && idx.dir.file_name().is_some_and(|d| d == "dist")
+    })
+  }
+
+  /// The type parameters of `sig` a value of which leaves a call only inside a Schedule: each
+  /// occurs in the signature's parameter and return types (outside `own`, the callback return
+  /// being read) at least once, and only in type arguments of one of
+  /// `effect::SERVICE_FREE_CONTAINERS`. Services never pass through a Schedule (assumption 4),
+  /// so such a value holds none. The scan is by name over the declaration's text: a name it
+  /// can't place counts as an occurrence outside a Schedule.
+  fn schedule_only(&self, sig: &Sig<'_>, own: oxc::span::Span) -> Vec<String> {
+    use oxc::ast_visit::Visit;
+    use oxc::span::GetSpan;
+    struct Containers<'d> {
+      dts: &'d Dts,
+      f: usize,
+      spans: Vec<oxc::span::Span>,
+    }
+    impl<'a> Visit<'a> for Containers<'_> {
+      fn visit_ts_type_reference(&mut self, r: &oxc::ast::ast::TSTypeReference<'a>) {
+        let container = super::effect::SERVICE_FREE_CONTAINERS
+          .iter()
+          .any(|(file, local)| self.dts.is_public(self.f, &r.type_name, file, local));
+        if container {
+          if let Some(a) = &r.type_arguments {
+            self.spans.push(a.span);
+          }
+          return;
+        }
+        oxc::ast_visit::walk::walk_ts_type_reference(self, r);
+      }
+    }
+    let types: Vec<&TSType<'_>> =
+      sig.params.iter().filter_map(|(t, _)| *t).chain(sig.ret).collect();
+    let mut c = Containers { dts: self, f: sig.file, spans: vec![] };
+    for t in &types {
+      c.visit_ts_type(t);
+    }
+    let src = self.index(sig.file).source;
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    sig
+      .tparams
+      .iter()
+      .filter(|p| {
+        let mut inside = false;
+        for t in &types {
+          let span = t.span();
+          let Some(text) = src.get(span.start as usize..span.end as usize) else { return false };
+          let bytes = text.as_bytes();
+          for (i, _) in text.match_indices(p.as_str()) {
+            let end = i + p.len();
+            if (i > 0 && word(bytes[i - 1])) || (end < bytes.len() && word(bytes[end])) {
+              continue;
+            }
+            #[expect(
+              clippy::cast_possible_truncation,
+              reason = "declaration files are under 4 GiB"
+            )]
+            let at = span.start + i as u32;
+            if own.start <= at && at < own.end {
+              continue;
+            }
+            if !c.spans.iter().any(|s| s.start <= at && at < s.end) {
+              return false;
+            }
+            inside = true;
+          }
+        }
+        inside
+      })
+      .cloned()
+      .collect()
   }
 
   fn callback_masks_of(&self, sigs: &[Sig<'_>], nparams: usize) -> Vec<u8> {
@@ -608,7 +750,7 @@ impl Dts {
         shape,
         self.generic_of_sigs(&inner, nargs),
         self.callback_masks_of(&inner, nargs),
-        self.prim_returns_of(&inner, nargs),
+        self.free_returns_of(&inner, nargs),
       )
     });
     self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
@@ -1750,11 +1892,58 @@ mod tests {
     )
     .unwrap();
     let dts = Dts::default();
-    assert_eq!(dts.callback_prim_returns(&path, "exists", 2), Some(vec![false, true]));
-    assert_eq!(dts.callback_prim_returns(&path, "mixed", 2), Some(vec![false, false]));
-    assert_eq!(dts.callback_prim_returns(&path, "opaque", 1), Some(vec![false]));
-    assert_eq!(dts.callback_prim_returns(&path, "generic", 1), Some(vec![false]));
-    assert_eq!(dts.callback_prim_returns(&path, "object", 1), Some(vec![false]));
+    assert_eq!(dts.callback_free_returns(&path, "exists", 2), Some(vec![false, true]));
+    assert_eq!(dts.callback_free_returns(&path, "mixed", 2), Some(vec![false, false]));
+    assert_eq!(dts.callback_free_returns(&path, "opaque", 1), Some(vec![false]));
+    assert_eq!(dts.callback_free_returns(&path, "generic", 1), Some(vec![false]));
+    assert_eq!(dts.callback_free_returns(&path, "object", 1), Some(vec![false]));
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A type parameter a callback returns holds no service only if it leaves the call inside a
+  /// Schedule and nowhere else (assumption 4): not beside one, not into another callback, and
+  /// not when it leaves the call not at all. An `Effect` succeeding with one is the same.
+  #[test]
+  fn callback_free_returns_through_a_schedule_only() {
+    let dir = std::env::temp_dir()
+      .join(format!("rolldown-effect-dts-{}-schedule-returns", std::process::id()))
+      .join("dist");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+      dir.join("Effect.d.ts"),
+      "export interface Effect<A, E = never> { a: A; e: E }\n",
+    )
+    .unwrap();
+    let path = dir.join("Schedule.d.ts");
+    std::fs::write(
+      &path,
+      [
+        "import type { Effect } from \"./Effect.js\";",
+        "export interface Schedule<Output, Input = unknown> { o: Output; i: Input }",
+        "export interface Duration { millis: number }",
+        "export declare const map: {",
+        "  <O2>(f: (o: number) => O2 | Effect<O2>): <I>(self: Schedule<number, I>) => Schedule<O2, I>;",
+        "  <I, O2>(self: Schedule<number, I>, f: (o: number) => O2 | Effect<O2>): Schedule<O2, I>;",
+        "};",
+        "export declare const beside: <O2>(f: () => O2) => [Schedule<O2>, O2];",
+        "export declare const handed: <O2>(f: () => O2, g: (o: O2) => void) => Schedule<O2>;",
+        "export declare const dropped: <X>(f: () => Effect<X>) => Schedule<number>;",
+        "export declare const delay: (f: () => Effect<Duration>) => Schedule<number>;",
+        "export declare const cond: (f: () => boolean | Effect<boolean>) => Schedule<number>;",
+        "",
+      ]
+      .join("\n"),
+    )
+    .unwrap();
+    let dts = Dts::default();
+    assert_eq!(dts.callback_free_returns(&path, "map", 1), Some(vec![true]));
+    assert_eq!(dts.callback_free_returns(&path, "map", 2), Some(vec![false, true]));
+    assert_eq!(dts.callback_free_returns(&path, "beside", 1), Some(vec![false]));
+    // `g` returns `void`; `f`'s value goes on into `g`.
+    assert_eq!(dts.callback_free_returns(&path, "handed", 2), Some(vec![false, true]));
+    assert_eq!(dts.callback_free_returns(&path, "dropped", 1), Some(vec![false]));
+    assert_eq!(dts.callback_free_returns(&path, "delay", 1), Some(vec![false]));
+    assert_eq!(dts.callback_free_returns(&path, "cond", 1), Some(vec![true]));
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
   }
 }
