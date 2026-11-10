@@ -43,12 +43,25 @@ impl LinkStage<'_> {
   }
 
   #[tracing::instrument(level = "debug", skip_all)]
-  #[expect(clippy::too_many_lines, reason = "one orchestration: bind, generate, solve, prune")]
   pub(super) fn effect_service_shaking(&mut self) {
     if !self.options.experimental.is_effect_service_shaking_enabled() {
       return;
     }
     let start = std::time::Instant::now();
+    // Each solve that finds a service, a key or a provider in a module hole analyses those
+    // modules in the next one (`module_holes`). The set only grows, so this ends.
+    let mut analysed_holes: FxHashSet<ModuleIdx> = FxHashSet::default();
+    while self.effect_service_shaking_with(start, &mut analysed_holes) {}
+  }
+
+  /// One solve with the module holes `module_holes` leaves after `analysed_holes`. Returns
+  /// true, without pruning, when a hole has to be analysed: it is then in `analysed_holes`.
+  #[expect(clippy::too_many_lines, reason = "one orchestration: bind, generate, solve, prune")]
+  fn effect_service_shaking_with(
+    &mut self,
+    start: std::time::Instant,
+    analysed_holes: &mut FxHashSet<ModuleIdx>,
+  ) -> bool {
     let debug = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_DEBUG").is_some();
     let report_enabled = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some();
     macro_rules! phase {
@@ -183,18 +196,18 @@ impl LinkStage<'_> {
       self.warn_effect_service_shaking(
         "`effect` is external, so no Effect primitive can be recognised".to_string(),
       );
-      return;
+      return false;
     }
     if !effect_found {
       // No `effect` in the bundle: no service key can exist.
-      return;
+      return false;
     }
     if let Some(version) = unsupported_version {
       self.warn_effect_service_shaking(format!(
         "`effect` {version} is not a supported version (the model covers {}.x)",
         effect::SUPPORTED_MAJOR
       ));
-      return;
+      return false;
     }
     let missing: Vec<String> = public_modules
       .iter()
@@ -212,7 +225,7 @@ impl LinkStage<'_> {
         "`effect` does not match the model, missing exports: {}",
         missing.join(", ")
       ));
-      return;
+      return false;
     }
     // == declarations: `effect`'s modules are modelled from the `.d.ts` next to each (design
     // principle 11). Without them there is nothing to model `effect` by, so one warning says
@@ -246,7 +259,7 @@ impl LinkStage<'_> {
         self.warn_effect_service_shaking(format!(
           "`effect`'s declarations are needed to model it, and {problem}; every method is kept"
         ));
-        return;
+        return false;
       }
     }
     let mut modelled: FxHashSet<ModuleIdx> = public_modules.iter().map(|(m, _)| *m).collect();
@@ -496,6 +509,12 @@ impl LinkStage<'_> {
       }
     }
 
+    // == module holes (reachability scoping, Tim's 10 Nov decision): a module whose static
+    // imports never reach `effect` is not analysed. Its exports are its opaque value, what it
+    // references from analysed modules and the globals crosses into it, as into a class hole.
+    let holes = self.module_holes(&order, &is_effect_module, analysed_holes);
+    let mut hole_modules: FxHashMap<heap::ObjId, ModuleIdx> = FxHashMap::default();
+
     // == per-module facts and constraint generation
     let mut module_fns = vec![];
     for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
@@ -506,6 +525,11 @@ impl LinkStage<'_> {
         continue;
       }
       let scoping = self.symbols[normal.idx].as_ref().expect("module symbols").scoping();
+      if holes.contains(&normal.idx) {
+        let class = self.module_hole(&mut a, &mut sh, normal.idx, &holes);
+        hole_modules.insert(class, normal.idx);
+        continue;
+      }
       let mut external_imports = FxHashMap::default();
       let mut cjs_imports = FxHashSet::default();
       for (sym, import) in &normal.ecma_view.named_imports {
@@ -645,6 +669,27 @@ impl LinkStage<'_> {
     }
     phase!("solving");
     a.solve();
+    // Refinement: a module hole that a service, a key or a provider reached is analysed in the
+    // next solve, so that it keeps no more methods than its code reads.
+    let reached: Vec<ModuleIdx> = {
+      let mut v: Vec<ModuleIdx> =
+        a.bailing_holes().iter().filter_map(|c| hole_modules.get(c).copied()).collect();
+      v.sort_unstable();
+      v.dedup();
+      v
+    };
+    if !reached.is_empty() {
+      if report_enabled || debug {
+        let names: Vec<&str> =
+          reached.iter().map(|m| self.module_table[*m].id().as_str()).collect();
+        eprintln!(
+          "[effect-service-shaking] {} module holes reached by a service, analysed in the next solve: {names:?}",
+          reached.len()
+        );
+      }
+      analysed_holes.extend(reached);
+      return true;
+    }
     if debug {
       eprintln!(
         "[effect-service-shaking] type bounds: {} exported functions resolved, {} not called, {} default exports bounded; {} .d.ts files, {} ms",
@@ -876,6 +921,108 @@ impl LinkStage<'_> {
         eprintln!("[effect-service-shaking] removed {name} at {module}:{start}");
       }
     }
+    false
+  }
+
+  /// The modules left as holes: those whose static imports, followed transitively, never reach a
+  /// module of `effect`. Entries and Rolldown's runtime are always analysed.
+  fn module_holes(
+    &self,
+    order: &[ModuleIdx],
+    is_effect_module: &dyn Fn(ModuleIdx) -> bool,
+    analysed_holes: &FxHashSet<ModuleIdx>,
+  ) -> FxHashSet<ModuleIdx> {
+    let mut importers: FxHashMap<ModuleIdx, Vec<ModuleIdx>> = FxHashMap::default();
+    for m in order.iter().copied() {
+      if let Module::Normal(n) = &self.module_table.modules[m] {
+        for t in n.ecma_view.import_records.iter().filter_map(|r| r.resolved_module) {
+          importers.entry(t).or_default().push(m);
+        }
+      }
+    }
+    let mut reaches: FxHashSet<ModuleIdx> =
+      order.iter().copied().filter(|m| is_effect_module(*m)).collect();
+    let mut stack: Vec<ModuleIdx> = order.iter().copied().filter(|m| reaches.contains(m)).collect();
+    while let Some(t) = stack.pop() {
+      for i in importers.get(&t).into_iter().flatten() {
+        if reaches.insert(*i) {
+          stack.push(*i);
+        }
+      }
+    }
+    if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_NO_HOLES").is_some() {
+      return FxHashSet::default();
+    }
+    order
+      .iter()
+      .copied()
+      .filter(|m| {
+        matches!(self.module_table.modules[*m], Module::Normal(_))
+          && !reaches.contains(m)
+          && !analysed_holes.contains(m)
+          && *m != self.runtime.id()
+          && !self.user_defined_entry_modules.contains(m)
+          && self.ast_table[*m].is_some()
+      })
+      .collect()
+  }
+
+  /// A module left as a hole (`module_holes`): its body is not generated. It is a class hole
+  /// without heritage (`Analysis::hole`): each export it declares is the hole's opaque value,
+  /// and the bindings it imports from analysed modules and the globals it names cross into it.
+  fn module_hole(
+    &self,
+    a: &mut Analysis,
+    sh: &mut Shared<'_>,
+    module: ModuleIdx,
+    holes: &FxHashSet<ModuleIdx>,
+  ) -> heap::ObjId {
+    let Module::Normal(normal) = &self.module_table.modules[module] else {
+      unreachable!("a module hole is a normal module")
+    };
+    let site = heap::Site { module, start: 0, sub: 0 };
+    let proto = a.alloc(ObjKind::Object, Some(site));
+    let prototype = a.var();
+    a.seed(prototype, proto);
+    let class = a.alloc(ObjKind::Class { ctor: None, heritage: None, prototype }, Some(site));
+    a.hole(class, proto);
+    let op = a.opaque(class);
+    for (_, symbol) in self.sorted_exports(module) {
+      if self.symbols.canonical_ref_for(symbol).owner == module {
+        let v = sh.symbol_var(a, symbol);
+        a.seed(v, op);
+      }
+    }
+    let default = normal.ecma_view.default_export_ref;
+    if self.symbols.canonical_ref_for(default).owner == module {
+      let v = sh.symbol_var(a, default);
+      a.seed(v, op);
+    }
+    let mut imports: Vec<SymbolRef> = normal
+      .ecma_view
+      .named_imports
+      .iter()
+      .filter(|(_, import)| {
+        normal.ecma_view.import_records[import.record_idx]
+          .resolved_module
+          .is_some_and(|t| !holes.contains(&t))
+      })
+      .map(|(sym, _)| *sym)
+      .collect();
+    imports.sort_unstable_by_key(|s| s.symbol);
+    for sym in imports {
+      let v = sh.symbol_var(a, sym);
+      a.constrain(v, Constraint::ClassRef(class, vec![]));
+    }
+    let scoping = self.symbols[module].as_ref().expect("module symbols").scoping();
+    let mut globals: Vec<&str> =
+      scoping.root_unresolved_references().keys().map(oxc_str::Ident::as_str).collect();
+    globals.sort_unstable();
+    for name in globals {
+      let v = (sh.resolve_global)(a, &mut sh.globals, name);
+      a.constrain(v, Constraint::ClassRef(class, vec![]));
+    }
+    class
   }
 
   /// A module's exports in name order: `resolved_exports` is a hash map whose iteration order

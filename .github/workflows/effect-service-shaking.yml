@@ -58,5 +58,8 @@ jobs:
       - name: Effect service fixtures
         run: cargo test --profile effect-verify -p rolldown --test integration -- tree_shaking__effect_service
 
+      # Bounded: an acceptance program that runs away fails here instead of
+      # holding the job for its full timeout.
       - name: Acceptance set
+        timeout-minutes: 10
         run: cargo test --profile effect-verify -p rolldown --test integration -- effect_service_acceptance --nocapture

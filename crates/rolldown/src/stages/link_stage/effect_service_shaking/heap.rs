@@ -6080,6 +6080,44 @@ impl Analysis {
     bailed
   }
 
+  /// The class holes a service, a key or a provider reached during the solve: those behind
+  /// `hole_bails`, and those holding effect's key constructor.
+  pub fn bailing_holes(&self) -> FxHashSet<ObjId> {
+    let mut out = FxHashSet::default();
+    for (k, v) in &self.key_values {
+      if self.never_prune.contains(k) {
+        continue;
+      }
+      for o in &self.vars[*v].pts {
+        let holder = matches!(
+          self.objs[*o].kind,
+          ObjKind::Object | ObjKind::Array | ObjKind::Class { .. } | ObjKind::Closure(_)
+        );
+        if let Some(&(c, _)) = self.class_escaped.get(o).filter(|_| holder) {
+          out.insert(c);
+        } else if let Some(&c) = self.opaque_class.get(o) {
+          out.insert(c);
+        }
+      }
+    }
+    for (o, (c, _)) in &self.class_escaped {
+      match self.objs[*o].kind {
+        ObjKind::Key { strings, .. } => {
+          if self.vars[strings].pts.iter().any(|st| {
+            matches!(&self.objs[*st].kind, ObjKind::Str(name) if self.key_values.contains_key(name))
+          }) {
+            out.insert(*c);
+          }
+        }
+        ObjKind::Builtin { rule, .. } if self.key_constructor(rule) => {
+          out.insert(*c);
+        }
+        _ => {}
+      }
+    }
+    out
+  }
+
   /// The keys the class holes bailed during the solve, with how each crossed into class code.
   fn hole_bails(&self) -> Vec<(ArcStr, String)> {
     let site = |c: ObjId| self.objs[c].site;
