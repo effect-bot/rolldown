@@ -313,14 +313,20 @@ mod tests {
   }
 
   #[test]
-  #[cfg_attr(target_os = "macos", ignore = "macOS has no unprivileged containment (effect_fixture)")]
+  #[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no unprivileged containment; its fallback policy is undecided (effect_fixture)"
+  )]
   fn a_detached_child_of_a_hung_test_script_is_stopped() {
     require_containment();
     check_hung("effect_fixture_detached_hangs");
   }
 
   #[test]
-  #[cfg_attr(target_os = "macos", ignore = "macOS has no unprivileged containment (effect_fixture)")]
+  #[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no unprivileged containment; its fallback policy is undecided (effect_fixture)"
+  )]
   fn a_detached_child_left_by_a_finished_test_script_is_stopped() {
     require_containment();
     check_left_child("effect_fixture_detached_leaves_child");

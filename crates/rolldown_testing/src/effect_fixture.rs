@@ -33,23 +33,26 @@
 //!   leads a new process group, which Node and anything it starts join. The
 //!   group is signalled while the child is still unreaped, so its id cannot
 //!   have been reused. A process that leaves the group (`setsid`) is not
-//!   stopped, and the harness says so instead of reporting every process
-//!   stopped.
+//!   stopped. The harness says so on every path: a timeout message names
+//!   only the group, and a fixture that passes is reported, once per test
+//!   process on stderr, as having had only its group stopped. Group-only
+//!   cleanup is not whole-tree cleanup; whether it is acceptable on such
+//!   hosts is undecided.
 //! - On Windows the child is put in a job object before it starts anything
 //!   (it waits for its stdin to close, [`wait_until_owned`]). Processes it
 //!   starts belong to the job too, and closing the job kills whatever is left.
 //!
 //! The parent stops the tree when the child exits, at the deadline, and when
 //! the parent unwinds from a panic. A failure to stop it fails the test and
-//! says so. The parent's own destruction (`SIGKILL`, or an abort that does not
-//! unwind) runs none of that. On Linux with the namespace the supervisor and
-//! PID 1 die with the parent's thread (`PR_SET_PDEATHSIG`), which ends the
-//! namespace; with a process group nothing stops it. Windows's job is closed,
-//! and its processes killed, when the parent exits for any reason.
+//! says so. That is the whole guarantee on Unix: the parent's own destruction
+//! (`SIGKILL`, or an abort that does not unwind) runs none of it, and the
+//! fixture's processes, namespace or group, may then keep running. On Windows
+//! the job is closed, and its processes killed, when the parent exits for any
+//! reason; that has not been run on a Windows host.
 
 use std::{
   fs::File,
-  io::{self, Read},
+  io::{self, Read, Write},
   process::{Child, Command, ExitStatus, Stdio},
   sync::atomic::{AtomicU64, Ordering},
   time::{Duration, Instant},
@@ -97,7 +100,8 @@ pub fn wait_until_owned() {
 
 /// Runs the fixture `name` by running the libtest test `test` of this binary in a
 /// child process, and panics with the child's output if the test fails, is still running at
-/// `limit`, or leaves processes that cannot be stopped.
+/// `limit`, or leaves processes that cannot be stopped. When it passes on a host that cannot
+/// contain its processes, that is reported ([`Passed::GroupOnly`]).
 pub fn run_in_child(name: &str, test: &str, limit: Duration) {
   static NEXT: AtomicU64 = AtomicU64::new(0);
   let log_path = std::env::temp_dir().join(format!(
@@ -116,8 +120,10 @@ pub fn run_in_child(name: &str, test: &str, limit: Duration) {
   let finished = run_with_deadline(command, limit);
   let output = std::fs::read_to_string(&log_path).unwrap_or_default();
   let _ = std::fs::remove_file(&log_path);
-  if let Err(message) = verdict(name, limit, started.elapsed(), &finished, &output) {
-    panic!("{message}");
+  match verdict(name, limit, started.elapsed(), &finished, &output) {
+    Ok(Passed::Everything) => {}
+    Ok(Passed::GroupOnly(note)) => report_group_only(&note),
+    Err(message) => panic!("{message}"),
   }
 }
 
@@ -133,6 +139,39 @@ pub struct Finished {
   pub containment: Result<(), String>,
 }
 
+/// What was stopped after a fixture passed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Passed {
+  /// Every process it started.
+  Everything,
+  /// Only its process group: this host cannot contain the fixture's processes, so one that left
+  /// the group may still be running. The reason to report.
+  GroupOnly(String),
+}
+
+/// What the harness stopped when the fixture's processes are not contained (`reason`).
+fn group_only(reason: &str) -> String {
+  format!(
+    "stopped its process group, but not any process that left the group (`setsid`, Node's \
+     `detached: true`), which may still be running: {reason}"
+  )
+}
+
+/// Reports, once per test process, that fixtures pass here with only their process group
+/// stopped. It writes to stderr directly, past libtest's capture, which hides a passing test's
+/// output.
+fn report_group_only(note: &str) {
+  static REPORTED: std::sync::Once = std::sync::Once::new();
+  REPORTED.call_once(|| {
+    let _ = writeln!(
+      io::stderr(),
+      "\nrolldown effect fixtures: this host cannot contain a fixture's processes, so a fixture \
+       that passes has had only its process group stopped, not every process it started. The \
+       harness {note}"
+    );
+  });
+}
+
 /// The test's result, from how its child process ended and what it printed.
 fn verdict(
   name: &str,
@@ -140,15 +179,22 @@ fn verdict(
   elapsed: Duration,
   finished: &Finished,
   output: &str,
-) -> Result<(), String> {
+) -> Result<Passed, String> {
   let not_stopped = |err: &io::Error| {
     format!(
       "the harness could not stop the processes it started ({err}), so they may still be running"
     )
   };
   match (finished.status, &finished.stopped) {
-    (Some(status), Ok(())) if status.success() && output.contains(" 1 passed;") => Ok(()),
-    (Some(status), Ok(())) => Err(format!("{name} failed in its child process ({status}):\n{output}")),
+    (Some(status), Ok(())) if status.success() && output.contains(" 1 passed;") => {
+      Ok(match &finished.containment {
+        Ok(()) => Passed::Everything,
+        Err(reason) => Passed::GroupOnly(group_only(reason)),
+      })
+    }
+    (Some(status), Ok(())) => {
+      Err(format!("{name} failed in its child process ({status}):\n{output}"))
+    }
     (Some(status), Err(err)) => Err(format!(
       "{name} exited from its child process ({status}), but {}. Its output:\n{output}",
       not_stopped(err)
@@ -161,10 +207,7 @@ fn verdict(
       match (stopped, &finished.containment) {
         (Err(err), _) => not_stopped(err),
         (Ok(()), Ok(())) => "stopped it and every process it started".into(),
-        (Ok(()), Err(reason)) => format!(
-          "stopped its process group, but not any process that left the group (`setsid`, Node's \
-           `detached: true`), which may still be running: {reason}"
-        ),
+        (Ok(()), Err(reason)) => group_only(reason),
       },
     )),
   }
@@ -273,7 +316,10 @@ mod tree {
   }
 
   impl Tree {
-    #[expect(clippy::unnecessary_wraps, reason = "the group is made at spawn; Windows can fail here")]
+    #[expect(
+      clippy::unnecessary_wraps,
+      reason = "the group is made at spawn; Windows can fail here"
+    )]
     pub fn adopt(child: &Child) -> io::Result<Self> {
       Ok(Self { group: pid(child), contained: containment().is_ok() })
     }
@@ -396,9 +442,9 @@ mod namespace {
     match (libc::WIFEXITED(status), libc::WEXITSTATUS(status)) {
       (true, 0) => Ok(()),
       (true, code) => Err(format!(
-        "unprivileged user and PID namespaces are not available ({}); they need \
-         user.max_user_namespaces > 0 and, on Ubuntu 23.10 and later, \
-         kernel.apparmor_restrict_unprivileged_userns = 0",
+        "this host does not let an unprivileged process create user and PID namespaces ({}); \
+         the kernel (`user.max_user_namespaces`) or a security policy such as AppArmor's \
+         user namespace restriction can withhold them",
         io::Error::from_raw_os_error(code)
       )),
       _ => Err(format!("the namespace probe ended abnormally ({status})")),
@@ -407,14 +453,13 @@ mod namespace {
 
   /// Makes the spawned process the supervisor of a new PID namespace.
   pub fn supervise(command: &mut Command) {
-    let watchdog = libc::pid_t::try_from(std::process::id()).expect("pid fits pid_t");
     // SAFETY: neither call can fail.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let uid_map = format!("{uid} {uid} 1").into_bytes();
     let gid_map = format!("{gid} {gid} 1").into_bytes();
     // SAFETY: `supervisor` makes only async-signal-safe calls, as the forked child of a
     // multithreaded process must.
-    unsafe { command.pre_exec(move || supervisor(watchdog, &uid_map, &gid_map)) };
+    unsafe { command.pre_exec(move || supervisor(&uid_map, &gid_map)) };
   }
 
   /// PID 1, as the supervisor sees it.
@@ -447,14 +492,12 @@ mod namespace {
 
   /// Runs in the spawned process between `fork` and `exec`. Returns only in PID 1, which then
   /// execs the test binary; the supervisor waits for PID 1 and exits with its status.
-  fn supervisor(watchdog: libc::pid_t, uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+  ///
+  /// Nothing here ties the supervisor or PID 1 to the harness: if the harness is destroyed
+  /// without unwinding, the namespace can outlive it (see the module docs).
+  fn supervisor(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
     // SAFETY: async-signal-safe calls only, on memory this process owns.
     unsafe {
-      // The supervisor dies with the harness thread that spawned it.
-      check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
-      if libc::getppid() != watchdog {
-        libc::_exit(1);
-      }
       check(libc::unshare(FLAGS))?;
       write(c"/proc/self/uid_map", uid_map)?;
       write(c"/proc/self/setgroups", b"deny")?;
@@ -470,14 +513,16 @@ mod namespace {
         return Err(io::Error::last_os_error());
       }
       if init == 0 {
-        // PID 1. It dies with the supervisor, which ends the namespace.
-        check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
+        // PID 1.
         libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
         return Ok(());
       }
       INIT.store(init, Ordering::Relaxed);
       let mut action: libc::sigaction = std::mem::zeroed();
-      #[expect(clippy::fn_to_numeric_cast_any, reason = "`sigaction` takes the handler as an address")]
+      #[expect(
+        clippy::fn_to_numeric_cast_any,
+        reason = "`sigaction` takes the handler as an address"
+      )]
       let handler = kill_init as extern "C" fn(libc::c_int) as libc::sighandler_t;
       action.sa_sigaction = handler;
       libc::sigaction(libc::SIGTERM, &raw const action, std::ptr::null_mut());
@@ -594,7 +639,7 @@ mod tests {
   use std::os::windows::process::ExitStatusExt as _;
   use std::{io, process::ExitStatus, time::Duration};
 
-  use super::{Finished, verdict};
+  use super::{Finished, Passed, verdict};
 
   const PASSED: &str = "test result: ok. 1 passed; 0 failed";
 
@@ -603,7 +648,7 @@ mod tests {
     stopped: io::Result<()>,
     containment: Result<(), String>,
     output: &str,
-  ) -> Result<(), String> {
+  ) -> Result<Passed, String> {
     let finished = Finished { status, stopped, containment };
     verdict("fixture", Duration::from_secs(2), Duration::from_secs(2), &finished, output)
   }
@@ -622,7 +667,10 @@ mod tests {
   fn a_stopped_tree_is_reported() {
     let timed_out = verdict_of(None, Ok(()), Ok(()), "").unwrap_err();
     assert!(timed_out.contains("stopped it and every process it started"), "{timed_out}");
-    assert_eq!(verdict_of(Some(ExitStatus::from_raw(0)), Ok(()), Ok(()), PASSED), Ok(()));
+    assert_eq!(
+      verdict_of(Some(ExitStatus::from_raw(0)), Ok(()), Ok(()), PASSED),
+      Ok(Passed::Everything)
+    );
   }
 
   /// Without containment, a stopped process group is not reported as every process stopped.
@@ -631,5 +679,15 @@ mod tests {
     let timed_out = verdict_of(None, Ok(()), Err("no namespaces".into()), "").unwrap_err();
     assert!(!timed_out.contains("every process"), "{timed_out}");
     assert!(timed_out.contains("may still be running: no namespaces"), "{timed_out}");
+  }
+
+  /// Without containment, a fixture that passes says that only its process group was stopped.
+  #[test]
+  fn a_pass_without_containment_reports_group_only_cleanup() {
+    let passed =
+      verdict_of(Some(ExitStatus::from_raw(0)), Ok(()), Err("no namespaces".into()), PASSED);
+    let Ok(Passed::GroupOnly(note)) = passed else { panic!("{passed:?}") };
+    assert!(!note.contains("every process"), "{note}");
+    assert!(note.contains("may still be running: no namespaces"), "{note}");
   }
 }
