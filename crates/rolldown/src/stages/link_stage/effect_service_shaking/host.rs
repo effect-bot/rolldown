@@ -186,12 +186,14 @@ fn descriptor_accessors(a: &mut Analysis, desc: ObjId, values: VarId, site: Site
 }
 
 /// The values an enumeration of the objects in `o` hands out: every field, through the
-/// admission filter (`Analysis::admitted_values`).
+/// admission filter. The program's own functions pass as themselves
+/// (`Analysis::admitted_callables`): an enumerated namespace or table of handlers is called
+/// by the program, not by effect code.
 fn enumerated(a: &mut Analysis, o: VarId) -> VarId {
   a.constrain(o, Constraint::Enumerate);
   let values = a.var();
   a.constrain(o, Constraint::Load { key: Key::Unknown, dst: values });
-  a.admitted_values(values)
+  a.admitted_callables(values)
 }
 
 pub fn new_array(a: &mut Analysis, site: Site, tag: u8) -> (ObjId, VarId, VarId) {
@@ -538,24 +540,16 @@ pub fn register(a: &mut Analysis) {
     }
     a.copy(v, c.ret);
   });
-  for name in [
-    "Array.prototype.push",
-    "Array.prototype.unshift",
-    "Array.prototype.add",
-    "Array.prototype.fill",
-  ] {
+  // `push`/`unshift` return the new length; `add`/`fill` return the receiver.
+  for name in ["Array.prototype.push", "Array.prototype.unshift"] {
     a.rule(name, |a, c| {
-      let this = c_this(a, c);
-      let elem = a.var();
-      for x in args_from(a, c, 0) {
-        match x {
-          Arg::Var(x) => a.copy(x, elem),
-          Arg::Spread(x) => a.constrain(x, Constraint::ElemOf(elem)),
-        }
-      }
-      a.constrain(this, Constraint::Store { key: Key::Unknown, src: elem });
+      store_args(a, c);
+    });
+  }
+  for name in ["Array.prototype.add", "Array.prototype.fill"] {
+    a.rule(name, |a, c| {
+      let this = store_args(a, c);
       a.copy(this, c.ret);
-      a.seed(c.ret, a.prim);
     });
   }
   a.rule("Array.prototype.set", |a, c| {
@@ -640,8 +634,9 @@ pub fn register(a: &mut Analysis) {
   a.rule("Array.prototype.map", |a, c| {
     let this = c_this(a, c);
     let f = arg(a, c, 0);
+    // The callback gets the elements as they are, as `forEach`'s does: a function among them
+    // is called by the program's own code, not handed to effect's.
     let items = elem_of(a, this);
-    let items = a.admitted_values(items);
     let p = prim_var(a);
     let r = invoke(a, c.site, f, None, vec![items, p, this]);
     let r = a.admitted_values(r);
@@ -1336,4 +1331,24 @@ pub fn external_module(a: &mut Analysis, specifier: &str) -> ObjId {
     a.seed(f, format);
   }
   obj
+}
+
+/// The arguments of `c` stored as elements of its receiver, as an index store (`arr[i] = x`):
+/// they never become a named property such as `push` or `map`. The call returns a
+/// primitive. Returns the receiver.
+fn store_args(a: &mut Analysis, c: &Call) -> VarId {
+  let this = c_this(a, c);
+  let elem = a.var();
+  for x in args_from(a, c, 0) {
+    match x {
+      Arg::Var(x) => a.copy(x, elem),
+      Arg::Spread(x) => a.constrain(x, Constraint::ElemOf(elem)),
+    }
+  }
+  let index = a.var();
+  let n = a.num(0);
+  a.seed(index, n);
+  a.constrain(index, Constraint::StoreThrough { base: this, src: elem });
+  a.seed(c.ret, a.prim);
+  this
 }

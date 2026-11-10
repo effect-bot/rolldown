@@ -935,6 +935,12 @@ pub struct Analysis {
   prefixes: FxHashMap<ObjId, ArcStr>,
   prefix_hosts: FxHashMap<ArcStr, ObjId>,
   prefix_lookups: Vec<(ArcStr, VarId)>,
+  /// The variables `admitted_values` filters into: they hold `top_effect` once something
+  /// is held back from them, and primitives as themselves.
+  filter_vars: FxHashSet<VarId>,
+  /// The filter variables of `admitted_callables`.
+  callable_filter_vars: FxHashSet<VarId>,
+  callable_filters: FxHashMap<VarId, VarId>,
   /// Widening (`widen`): the set size past which a variable is widened, the boundary, the
   /// number of variables widened, and how many variables the analysis starts with.
   pub widen_limit: usize,
@@ -1218,6 +1224,9 @@ impl Analysis {
       prefixes: FxHashMap::default(),
       prefix_hosts: FxHashMap::default(),
       prefix_lookups: Vec::new(),
+      filter_vars: FxHashSet::default(),
+      callable_filter_vars: FxHashSet::default(),
+      callable_filters: FxHashMap::default(),
       max_entries: Self::MAX_ENTRIES,
       widen_limit: std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_WIDEN")
         .ok()
@@ -4029,13 +4038,25 @@ impl Analysis {
   /// `admit_typed`; a function that goes to effect's code goes without its return when `ret`
   /// is false (`escape_with`).
   fn admit_typed_with(&mut self, obj: ObjId, dst: VarId, ret: bool) {
+    let filter = self.filter_vars.contains(&dst);
     if matches!(
       self.objs[obj].kind,
       ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim | ObjKind::AllKeys
     ) {
+      // A host builtin's filter (`admitted_values`) hands primitives out as they are.
+      if filter {
+        self.seed(dst, obj);
+      }
       return;
     }
-    if self.may_hold(obj) {
+    // A boundary's opaque value is one object standing for code that is not analysed (a class
+    // body, a module hole): calling it with a service promotes or bails that code, which is
+    // what holding it back to effect's code would lose.
+    if self.may_hold(obj)
+      || self.opaque_class.contains_key(&obj)
+      || (self.callable_filter_vars.contains(&dst)
+        && matches!(self.objs[obj].kind, ObjKind::Closure(_)))
+    {
       self.admission_stats.0 += 1;
       self.seed(dst, obj);
       return;
@@ -4048,6 +4069,9 @@ impl Analysis {
     if !matches!(self.objs[obj].kind, ObjKind::Effect { .. } | ObjKind::Promise { .. }) {
       self.admission_stats.1 += 1;
       self.hold_back(obj, ret);
+      if filter {
+        self.seed(dst, self.top_effect);
+      }
       return;
     }
     if self.held_admissions_seen.insert((obj, dst)) {
@@ -4091,9 +4115,12 @@ impl Analysis {
     if self.held_admissions.is_empty() {
       return false;
     }
-    for (obj, _) in std::mem::take(&mut self.held_admissions) {
+    for (obj, dst) in std::mem::take(&mut self.held_admissions) {
       self.admission_stats.1 += 1;
       self.hold_back(obj, true);
+      if self.filter_vars.contains(&dst) {
+        self.seed(dst, self.top_effect);
+      }
     }
     true
   }
@@ -4157,7 +4184,20 @@ impl Analysis {
     }
     let v = self.var();
     self.unknown_store_filters.insert(src, v);
-    self.seed(v, self.top_effect);
+    self.filter_vars.insert(v);
+    self.constrain(src, Constraint::AdmitTyped(v, false));
+    v
+  }
+
+  /// `admitted_values`, letting the program's functions through as themselves.
+  pub fn admitted_callables(&mut self, src: VarId) -> VarId {
+    if let Some(v) = self.callable_filters.get(&src) {
+      return *v;
+    }
+    let v = self.var();
+    self.callable_filters.insert(src, v);
+    self.filter_vars.insert(v);
+    self.callable_filter_vars.insert(v);
     self.constrain(src, Constraint::AdmitTyped(v, false));
     v
   }

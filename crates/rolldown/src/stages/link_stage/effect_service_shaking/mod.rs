@@ -527,7 +527,7 @@ impl LinkStage<'_> {
     let holes = self.module_holes(&order, &is_effect_module, analysed_holes);
     let mut hole_modules: FxHashMap<heap::ObjId, ModuleIdx> = FxHashMap::default();
     for module in order.iter().copied().filter(|m| holes.contains(m)) {
-      let (class, value) = self.module_hole(&mut a, &mut sh, module, &holes);
+      let (class, value) = self.module_hole(&mut a, &mut sh, module, &holes, &mut lazy_roots);
       hole_modules.insert(class, module);
       sh.hole_values.insert(module, value);
     }
@@ -1016,6 +1016,7 @@ impl LinkStage<'_> {
     sh: &mut Shared<'_>,
     module: ModuleIdx,
     holes: &FxHashSet<ModuleIdx>,
+    lazy_roots: &mut Vec<SymbolRef>,
   ) -> (heap::ObjId, heap::ObjId) {
     let Module::Normal(normal) = &self.module_table.modules[module] else {
       unreachable!("a module hole is a normal module")
@@ -1051,6 +1052,9 @@ impl LinkStage<'_> {
       .collect();
     imports.sort_unstable_by_key(|s| s.symbol);
     for sym in imports {
+      // The module's own top-level code runs when it loads and may call what it imports, so
+      // the statements declaring those bindings run too (`lazy_statements`).
+      lazy_roots.push(sym);
       let v = sh.symbol_var(a, sym);
       a.constrain(v, Constraint::ClassRef(class, vec![]));
     }
