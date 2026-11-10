@@ -21,19 +21,31 @@
 //! filtered to the same test ([`run_in_child`]), and owns every process the
 //! child starts:
 //!
-//! - On Unix the child leads a new process group, which Node and anything it
-//!   starts join. The group is signalled while the child is still unreaped, so
-//!   its id cannot have been reused.
+//! - On Linux the child runs in a PID namespace of its own, as its first
+//!   process (PID 1), under a small supervisor process ([`namespace`]). When
+//!   PID 1 exits or is killed, the kernel kills every other process in the
+//!   namespace, and a process cannot leave it: `setsid` (Node's
+//!   `detached: true`) does not. The supervisor exits only after that, so its
+//!   exit confirms the namespace is empty. Creating the namespace needs
+//!   unprivileged user namespaces; [`containment`] says whether this host has
+//!   them.
+//! - On other Unix systems, and on Linux without user namespaces, the child
+//!   leads a new process group, which Node and anything it starts join. The
+//!   group is signalled while the child is still unreaped, so its id cannot
+//!   have been reused. A process that leaves the group (`setsid`) is not
+//!   stopped, and the harness says so instead of reporting every process
+//!   stopped.
 //! - On Windows the child is put in a job object before it starts anything
 //!   (it waits for its stdin to close, [`wait_until_owned`]). Processes it
 //!   starts belong to the job too, and closing the job kills whatever is left.
 //!
-//! The parent stops the whole tree when the child exits, at the deadline, and
-//! when the parent unwinds from a panic, so a process the fixture started does
-//! not outlive it. A failure to stop the tree fails the test and says so. Two
-//! ways out remain on Unix: a process that leaves the group (`setsid`, which
-//! Node's `detached: true` calls), and a parent killed by `SIGKILL`, which cannot
-//! stop anything.
+//! The parent stops the tree when the child exits, at the deadline, and when
+//! the parent unwinds from a panic. A failure to stop it fails the test and
+//! says so. The parent's own destruction (`SIGKILL`, or an abort that does not
+//! unwind) runs none of that. On Linux with the namespace the supervisor and
+//! PID 1 die with the parent's thread (`PR_SET_PDEATHSIG`), which ends the
+//! namespace; with a process group nothing stops it. Windows's job is closed,
+//! and its processes killed, when the parent exits for any reason.
 
 use std::{
   fs::File,
@@ -68,6 +80,12 @@ pub fn time_limit() -> Option<Duration> {
 /// Whether this process is the child that runs one fixture ([`run_in_child`]).
 pub fn is_child() -> bool {
   std::env::var_os(CHILD_ENV).is_some()
+}
+
+/// `Ok` when every process a fixture starts stays in its process tree, so stopping the tree stops
+/// all of them; otherwise why not.
+pub fn containment() -> Result<(), String> {
+  tree::containment()
 }
 
 /// Called by the child before it starts anything: returns once the parent has closed the
@@ -111,6 +129,8 @@ pub struct Finished {
   /// Whether its process tree was stopped: the processes it left when it exited, or all of
   /// them at the deadline.
   pub stopped: io::Result<()>,
+  /// [`containment`] for the tree that was stopped.
+  pub containment: Result<(), String>,
 }
 
 /// The test's result, from how its child process ended and what it printed.
@@ -138,7 +158,14 @@ fn verdict(
        ({TIME_LIMIT_ENV}); after {:.2} s {}. Its output:\n{output}",
       limit.as_secs_f64(),
       elapsed.as_secs_f64(),
-      stopped.as_ref().map_or_else(not_stopped, |()| "stopped it and its child processes".into()),
+      match (stopped, &finished.containment) {
+        (Err(err), _) => not_stopped(err),
+        (Ok(()), Ok(())) => "stopped it and every process it started".into(),
+        (Ok(()), Err(reason)) => format!(
+          "stopped its process group, but not any process that left the group (`setsid`, Node's \
+           `detached: true`), which may still be running: {reason}"
+        ),
+      },
     )),
   }
 }
@@ -149,17 +176,18 @@ fn verdict(
 pub fn run_with_deadline(mut command: Command, limit: Duration) -> Finished {
   tree::prepare(&mut command);
   command.stdin(Stdio::piped());
+  let containment = tree::containment();
   let mut owned = Owned::adopt(command.spawn().expect("failed to start the fixture's process"));
   let deadline = Instant::now() + limit;
   loop {
     if tree::exited(&mut owned.child).expect("failed to wait for the fixture's process") {
       let (stopped, status) = owned.stop();
       let status = status.expect("failed to reap the fixture's process");
-      return Finished { status: Some(status), stopped };
+      return Finished { status: Some(status), stopped, containment };
     }
     if Instant::now() >= deadline {
       let (stopped, status) = owned.stop();
-      return Finished { status: None, stopped: stopped.and(status.map(drop)) };
+      return Finished { status: None, stopped: stopped.and(status.map(drop)), containment };
     }
     std::thread::sleep(Duration::from_millis(5));
   }
@@ -218,45 +246,85 @@ mod tree {
     io,
     os::unix::process::CommandExt,
     process::{Child, Command},
+    time::{Duration, Instant},
   };
 
-  /// The child's process group.
+  /// The child's process group, and whether the child runs in a PID namespace ([`super::namespace`]).
   pub struct Tree {
     group: libc::pid_t,
+    contained: bool,
   }
 
-  /// Makes the child the leader of a new process group, whose id is the child's pid.
+  pub fn containment() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return super::namespace::available();
+    #[cfg(not(target_os = "linux"))]
+    Err("this platform has no PID namespaces".into())
+  }
+
+  /// Makes the child the leader of a new process group, whose id is the child's pid, and on
+  /// Linux the supervisor of a PID namespace.
   pub fn prepare(command: &mut Command) {
     command.process_group(0);
+    #[cfg(target_os = "linux")]
+    if containment().is_ok() {
+      super::namespace::supervise(command);
+    }
   }
 
   impl Tree {
     #[expect(clippy::unnecessary_wraps, reason = "the group is made at spawn; Windows can fail here")]
     pub fn adopt(child: &Child) -> io::Result<Self> {
-      Ok(Self { group: pid(child) })
+      Ok(Self { group: pid(child), contained: containment().is_ok() })
     }
 
-    /// Kills every process in the group. The leader is still unreaped, so the group still
-    /// exists and its id is still its own.
+    /// Kills every process in the tree.
+    ///
+    /// In a PID namespace the supervisor kills PID 1 on `SIGTERM` and exits once the kernel has
+    /// killed everything else in the namespace, so its exit is the confirmation. Otherwise every
+    /// process in the group is killed; the leader is still unreaped, so the group still exists
+    /// and its id is still its own.
     pub fn kill(&self) -> io::Result<()> {
-      // SAFETY: a negative pid signals the process group.
-      if unsafe { libc::kill(-self.group, libc::SIGKILL) } == 0 {
+      if self.contained {
+        signal(self.group, libc::SIGTERM)?;
+        let started = Instant::now();
+        while !exited_pid(self.group)? {
+          if started.elapsed() > Duration::from_secs(5) {
+            return Err(io::Error::new(
+              io::ErrorKind::TimedOut,
+              "the fixture's PID namespace still had processes 5 s after it was stopped",
+            ));
+          }
+          std::thread::sleep(Duration::from_millis(5));
+        }
         return Ok(());
       }
-      let err = io::Error::last_os_error();
-      // No process is left in the group (macOS does not count a zombie leader).
-      if err.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(err) }
+      signal(-self.group, libc::SIGKILL)
     }
+  }
+
+  fn signal(pid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: plain `kill(2)`; a negative pid signals the process group.
+    if unsafe { libc::kill(pid, signal) } == 0 {
+      return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    // Nothing is left to signal (macOS does not count a zombie leader).
+    if err.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(err) }
   }
 
   /// Whether the child has exited, leaving it unreaped (`WNOWAIT`): its pid, which is also
   /// the group's id, cannot be reused before the group is killed.
   #[expect(clippy::needless_pass_by_ref_mut, reason = "Windows's `try_wait` needs it")]
   pub fn exited(child: &mut Child) -> io::Result<bool> {
+    exited_pid(pid(child))
+  }
+
+  fn exited_pid(pid: libc::pid_t) -> io::Result<bool> {
     // SAFETY: an all-zero `siginfo_t` is valid, and `waitid` fills it in.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     #[expect(clippy::cast_sign_loss)]
-    let id = pid(child) as libc::id_t;
+    let id = pid as libc::id_t;
     // SAFETY: `info` outlives the call.
     let result = unsafe {
       libc::waitid(libc::P_PID, id, &raw mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
@@ -272,6 +340,169 @@ mod tree {
 
   fn pid(child: &Child) -> libc::pid_t {
     child.id() as libc::pid_t
+  }
+}
+
+/// The Linux PID namespace a fixture runs in.
+///
+/// The process the harness spawns becomes a supervisor: before `exec` it creates a user and PID
+/// namespace, forks the namespace's first process (PID 1), which goes on to exec the test binary,
+/// and waits for it. The kernel kills every other process in a namespace once its PID 1 has
+/// exited, before the exit is reported, so the supervisor's own exit means the namespace is
+/// empty. `SIGTERM` to the supervisor kills PID 1. The user namespace maps only the caller's own
+/// uid and gid, so files and permissions look the same inside it.
+#[cfg(target_os = "linux")]
+mod namespace {
+  use std::{
+    ffi::CStr,
+    io,
+    os::unix::process::CommandExt,
+    process::Command,
+    sync::{
+      OnceLock,
+      atomic::{AtomicI32, Ordering},
+    },
+  };
+
+  const FLAGS: libc::c_int = libc::CLONE_NEWUSER | libc::CLONE_NEWPID;
+
+  /// Whether this host lets an unprivileged process create the namespaces, checked once.
+  pub fn available() -> Result<(), String> {
+    static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+    PROBE.get_or_init(probe).clone()
+  }
+
+  fn probe() -> Result<(), String> {
+    // SAFETY: the forked process only makes system calls before `_exit`.
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+      return Err(format!("fork failed: {}", io::Error::last_os_error()));
+    }
+    if pid == 0 {
+      // SAFETY: as above.
+      unsafe {
+        let code = if libc::unshare(FLAGS) == 0 { 0 } else { *libc::__errno_location() };
+        libc::_exit(code & 0xff);
+      }
+    }
+    let mut status = 0;
+    // SAFETY: `status` outlives the call.
+    while unsafe { libc::waitpid(pid, &raw mut status, 0) } == -1 {
+      let err = io::Error::last_os_error();
+      if err.kind() != io::ErrorKind::Interrupted {
+        return Err(format!("waitpid failed: {err}"));
+      }
+    }
+    match (libc::WIFEXITED(status), libc::WEXITSTATUS(status)) {
+      (true, 0) => Ok(()),
+      (true, code) => Err(format!(
+        "unprivileged user and PID namespaces are not available ({}); they need \
+         user.max_user_namespaces > 0 and, on Ubuntu 23.10 and later, \
+         kernel.apparmor_restrict_unprivileged_userns = 0",
+        io::Error::from_raw_os_error(code)
+      )),
+      _ => Err(format!("the namespace probe ended abnormally ({status})")),
+    }
+  }
+
+  /// Makes the spawned process the supervisor of a new PID namespace.
+  pub fn supervise(command: &mut Command) {
+    let watchdog = libc::pid_t::try_from(std::process::id()).expect("pid fits pid_t");
+    // SAFETY: neither call can fail.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let uid_map = format!("{uid} {uid} 1").into_bytes();
+    let gid_map = format!("{gid} {gid} 1").into_bytes();
+    // SAFETY: `supervisor` makes only async-signal-safe calls, as the forked child of a
+    // multithreaded process must.
+    unsafe { command.pre_exec(move || supervisor(watchdog, &uid_map, &gid_map)) };
+  }
+
+  /// PID 1, as the supervisor sees it.
+  static INIT: AtomicI32 = AtomicI32::new(0);
+
+  extern "C" fn kill_init(_: libc::c_int) {
+    let init = INIT.load(Ordering::Relaxed);
+    if init > 0 {
+      // SAFETY: `kill` is async-signal-safe.
+      unsafe { libc::kill(init, libc::SIGKILL) };
+    }
+  }
+
+  fn check(result: libc::c_int) -> io::Result<()> {
+    if result == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
+  }
+
+  /// Writes `content` to the file at `path` in one `write`, as the id map files require.
+  fn write(path: &CStr, content: &[u8]) -> io::Result<()> {
+    // SAFETY: `path` is NUL-terminated and `content` outlives the write.
+    unsafe {
+      let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+      check(fd)?;
+      let written = libc::write(fd, content.as_ptr().cast(), content.len());
+      let err = io::Error::last_os_error();
+      libc::close(fd);
+      if written == -1 { Err(err) } else { Ok(()) }
+    }
+  }
+
+  /// Runs in the spawned process between `fork` and `exec`. Returns only in PID 1, which then
+  /// execs the test binary; the supervisor waits for PID 1 and exits with its status.
+  fn supervisor(watchdog: libc::pid_t, uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+    // SAFETY: async-signal-safe calls only, on memory this process owns.
+    unsafe {
+      // The supervisor dies with the harness thread that spawned it.
+      check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
+      if libc::getppid() != watchdog {
+        libc::_exit(1);
+      }
+      check(libc::unshare(FLAGS))?;
+      write(c"/proc/self/uid_map", uid_map)?;
+      write(c"/proc/self/setgroups", b"deny")?;
+      write(c"/proc/self/gid_map", gid_map)?;
+      // A `SIGTERM` that comes before the handler is installed waits for it.
+      let mut term: libc::sigset_t = std::mem::zeroed();
+      let mut old: libc::sigset_t = std::mem::zeroed();
+      libc::sigemptyset(&raw mut term);
+      libc::sigaddset(&raw mut term, libc::SIGTERM);
+      libc::pthread_sigmask(libc::SIG_BLOCK, &raw const term, &raw mut old);
+      let init = libc::fork();
+      if init == -1 {
+        return Err(io::Error::last_os_error());
+      }
+      if init == 0 {
+        // PID 1. It dies with the supervisor, which ends the namespace.
+        check(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL))?;
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
+        return Ok(());
+      }
+      INIT.store(init, Ordering::Relaxed);
+      let mut action: libc::sigaction = std::mem::zeroed();
+      #[expect(clippy::fn_to_numeric_cast_any, reason = "`sigaction` takes the handler as an address")]
+      let handler = kill_init as extern "C" fn(libc::c_int) as libc::sighandler_t;
+      action.sa_sigaction = handler;
+      libc::sigaction(libc::SIGTERM, &raw const action, std::ptr::null_mut());
+      // The supervisor never execs, so it closes what `exec` would: the harness waits for the
+      // pipe that tells it the exec succeeded to close, and only PID 1's copy closes at exec.
+      if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
+        for fd in 3..4096 {
+          libc::close(fd);
+        }
+      }
+      libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut());
+      let mut status = 0;
+      while libc::waitpid(init, &raw mut status, 0) != init {
+        if *libc::__errno_location() != libc::EINTR {
+          libc::_exit(127);
+        }
+      }
+      if libc::WIFEXITED(status) {
+        libc::_exit(libc::WEXITSTATUS(status));
+      }
+      let signal = libc::WTERMSIG(status);
+      libc::signal(signal, libc::SIG_DFL);
+      libc::raise(signal);
+      libc::_exit(128 + signal)
+    }
   }
 }
 
@@ -299,6 +530,12 @@ mod tree {
   }
 
   pub fn prepare(_command: &mut Command) {}
+
+  /// A process cannot leave the job: the job does not allow breakaway.
+  #[expect(clippy::unnecessary_wraps, reason = "Unix hosts may lack containment")]
+  pub fn containment() -> Result<(), String> {
+    Ok(())
+  }
 
   fn check(ok: i32) -> io::Result<()> {
     if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
@@ -361,25 +598,38 @@ mod tests {
 
   const PASSED: &str = "test result: ok. 1 passed; 0 failed";
 
-  fn verdict_of(status: Option<ExitStatus>, stopped: io::Result<()>, output: &str) -> Result<(), String> {
-    let finished = Finished { status, stopped };
+  fn verdict_of(
+    status: Option<ExitStatus>,
+    stopped: io::Result<()>,
+    containment: Result<(), String>,
+    output: &str,
+  ) -> Result<(), String> {
+    let finished = Finished { status, stopped, containment };
     verdict("fixture", Duration::from_secs(2), Duration::from_secs(2), &finished, output)
   }
 
   #[test]
   fn a_tree_that_cannot_be_stopped_is_reported() {
     let denied = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
-    let timed_out = verdict_of(None, denied(), "").unwrap_err();
+    let timed_out = verdict_of(None, denied(), Ok(()), "").unwrap_err();
     assert!(timed_out.contains("could not stop"), "{timed_out}");
     assert!(!timed_out.contains("stopped it"), "{timed_out}");
-    let passed = verdict_of(Some(ExitStatus::from_raw(0)), denied(), PASSED).unwrap_err();
+    let passed = verdict_of(Some(ExitStatus::from_raw(0)), denied(), Ok(()), PASSED).unwrap_err();
     assert!(passed.contains("could not stop"), "{passed}");
   }
 
   #[test]
   fn a_stopped_tree_is_reported() {
-    let timed_out = verdict_of(None, Ok(()), "").unwrap_err();
-    assert!(timed_out.contains("stopped it and its child processes"), "{timed_out}");
-    assert_eq!(verdict_of(Some(ExitStatus::from_raw(0)), Ok(()), PASSED), Ok(()));
+    let timed_out = verdict_of(None, Ok(()), Ok(()), "").unwrap_err();
+    assert!(timed_out.contains("stopped it and every process it started"), "{timed_out}");
+    assert_eq!(verdict_of(Some(ExitStatus::from_raw(0)), Ok(()), Ok(()), PASSED), Ok(()));
+  }
+
+  /// Without containment, a stopped process group is not reported as every process stopped.
+  #[test]
+  fn a_stopped_group_is_not_reported_as_every_process() {
+    let timed_out = verdict_of(None, Ok(()), Err("no namespaces".into()), "").unwrap_err();
+    assert!(!timed_out.contains("every process"), "{timed_out}");
+    assert!(timed_out.contains("may still be running: no namespaces"), "{timed_out}");
   }
 }

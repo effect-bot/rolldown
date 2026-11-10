@@ -256,12 +256,22 @@ mod tests {
     let _ = std::fs::remove_file(fixture.join("dist/beat"));
   }
 
+  /// What a timed-out fixture says it stopped: every process where they are contained, otherwise
+  /// only the process group, and that a process outside it may still be running.
+  fn stopped_message() -> &'static str {
+    if effect_fixture::containment().is_ok() {
+      "stopped it and every process it started"
+    } else {
+      "stopped its process group, but not any process that left the group"
+    }
+  }
+
   /// A fixture whose `_test.mjs` hangs: the harness stops it, and the child it started.
   fn check_hung(name: &str) {
     let fixture = fixture(name);
     clear_beat(&fixture);
     let message = run(fixture.clone(), vec![]).expect("the hung fixture passed");
-    assert!(message.contains("stopped it and its child processes"), "{message}");
+    assert!(message.contains(stopped_message()), "{message}");
     assert_stopped(&fixture);
   }
 
@@ -294,13 +304,25 @@ mod tests {
     check_left_child("effect_fixture_leaves_child");
   }
 
+  /// A process that leaves its process group can only be stopped where the fixture's processes
+  /// are contained (`effect_fixture::containment`): a PID namespace on Linux, a job on Windows.
+  fn require_containment() {
+    if let Err(reason) = effect_fixture::containment() {
+      panic!("this host can't stop a process that leaves the fixture's process group: {reason}");
+    }
+  }
+
   #[test]
+  #[cfg_attr(target_os = "macos", ignore = "macOS has no unprivileged containment (effect_fixture)")]
   fn a_detached_child_of_a_hung_test_script_is_stopped() {
+    require_containment();
     check_hung("effect_fixture_detached_hangs");
   }
 
   #[test]
+  #[cfg_attr(target_os = "macos", ignore = "macOS has no unprivileged containment (effect_fixture)")]
   fn a_detached_child_left_by_a_finished_test_script_is_stopped() {
+    require_containment();
     check_left_child("effect_fixture_detached_leaves_child");
   }
 
@@ -332,6 +354,6 @@ mod tests {
   fn a_build_that_never_yields_is_stopped() {
     let message = run(fixture("effect_fixture_build_hangs"), vec![Pluginable::new_shared(Spin)])
       .expect("the fixture whose build never yields passed");
-    assert!(message.contains("stopped it and its child processes"), "{message}");
+    assert!(message.contains(stopped_message()), "{message}");
   }
 }
