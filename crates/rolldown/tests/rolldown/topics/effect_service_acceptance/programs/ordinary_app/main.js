@@ -28,13 +28,23 @@ minEngine: ">=18.0.0"
 `;
 
 // The one Effect service: a key-value store with three methods, of which the
-// program only ever calls `get`.
+// program only ever calls `get`. Each body is a named function, so the test can
+// tell this provider's methods from any other `put` or `del` in the bundle.
 class Store extends Context.Service()('app/Store') {}
 
 const StoreLive = Layer.succeed(Store, {
-  get: (key) => Effect.sync(() => memory.get(key)),
-  put: (key, value) => Effect.sync(() => void memory.set(key, value)),
-  del: (key) => Effect.sync(() => memory.delete(key)),
+  get: (key) =>
+    Effect.sync(function storeGetBody() {
+      return memory.get(key);
+    }),
+  put: (key, value) =>
+    Effect.sync(function storePutBody() {
+      memory.set(key, value);
+    }),
+  del: (key) =>
+    Effect.sync(function storeDelBody() {
+      return memory.delete(key);
+    }),
 });
 const memory = new Map([['greeting', 'hello']]);
 

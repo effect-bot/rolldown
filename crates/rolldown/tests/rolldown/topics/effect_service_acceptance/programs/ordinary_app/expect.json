@@ -1,3 +1,5 @@
 {
+  "keep": ["storeGetBody"],
+  "remove": ["storePutBody", "storeDelBody"],
   "removeProperties": ["put", "del"]
 }

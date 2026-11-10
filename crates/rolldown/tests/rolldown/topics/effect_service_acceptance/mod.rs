@@ -54,7 +54,7 @@ struct Expect {
   /// Names that must still be in the enabled bundle.
   #[serde(default)]
   keep: Vec<String>,
-  /// Names that must not be in the enabled bundle.
+  /// Names that must not be in the enabled bundle, and must be in the disabled one.
   #[serde(default)]
   remove: Vec<String>,
   /// Object-literal property names whose definition count must decrease.
@@ -212,7 +212,11 @@ async fn check(name: &str) {
       failures.push(format!("`{keep}` should be kept"));
     }
   }
+  let off_code = without_comments(&std::fs::read_to_string(&off.bundle).unwrap());
   for remove in &expect.remove {
+    if !word(remove).is_match(&off_code) {
+      failures.push(format!("`{remove}` is not in the bundle with the pass off"));
+    }
     if word(remove).is_match(&code) {
       failures.push(format!("`{remove}` should be removed"));
     }
@@ -286,9 +290,11 @@ async fn mixed_library_bundled_effect_external() {
 
 /// 5. An ordinary application: a CLI on commander, zod, yaml, nanoid, semver
 /// and picomatch, with one three-method Effect service of which only `get` is
-/// called. Most of the bundle is plain JavaScript from those packages, which the
-/// pass analyses as ordinary code. `put` and `del` are common names elsewhere
-/// in the bundle, so the check counts their object-literal definitions.
+/// called. Most of the bundle is plain JavaScript from those packages, which
+/// never import `effect` and stay module holes. `put` and `del` are common
+/// names elsewhere in the bundle, so each Store method's body is a named function
+/// and the check looks for those names, as well as counting the object-literal
+/// definitions of `put` and `del`.
 #[tokio::test]
 async fn ordinary_app() {
   check("ordinary_app").await;
