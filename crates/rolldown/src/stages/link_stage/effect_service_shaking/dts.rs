@@ -103,8 +103,9 @@ pub struct RetShape {
   pub unknown: bool,
 }
 
-/// What `Dts::returned_call` reads: bounds, return shape, generic positions and callback masks.
-pub type ReturnedCall = (Bounds, RetShape, (Vec<bool>, bool), Vec<u8>);
+/// What `Dts::returned_call` reads: bounds, return shape, generic positions, callback masks and
+/// which parameters take callbacks that return only primitives.
+pub type ReturnedCall = (Bounds, RetShape, (Vec<bool>, bool), Vec<u8>, Vec<bool>);
 
 /// The bounds of one exported function: a type per parameter, the elements of its rest
 /// parameter, and the return type (`None` is open).
@@ -362,6 +363,74 @@ impl Dts {
     Some(out)
   }
 
+  /// For a call with `nparams` arguments: per parameter, whether every callback its declared
+  /// type admits is declared to return only primitives (`Predicate<A>`'s `(a: A) => boolean`),
+  /// in every signature the call may match. A type parameter, an options object, or a callback
+  /// whose return is open, `unknown` or holds an object type is not.
+  pub fn callback_prim_returns(
+    &self,
+    path: &Path,
+    name: &str,
+    nparams: usize,
+  ) -> Option<Vec<bool>> {
+    let start = std::time::Instant::now();
+    let sigs = self.signatures(path, name)?;
+    let out = self.prim_returns_of(&sigs, nparams);
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    Some(out)
+  }
+
+  fn prim_returns_of(&self, sigs: &[Sig<'_>], nparams: usize) -> Vec<bool> {
+    let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
+    let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
+    let mut out = vec![!matching.is_empty(); nparams];
+    for sig in matching {
+      for (i, prim) in out.iter_mut().enumerate() {
+        let t = sig.params.get(i).or_else(|| sig.params.last().filter(|(_, r)| *r));
+        *prim &= match t {
+          Some((Some(t), _)) => self.returns_prim(sig.file, t, &sig.tparams, 0),
+          _ => false,
+        };
+      }
+    }
+    out
+  }
+
+  /// Whether `t` is a callback type, or a union of them and primitives, whose every call
+  /// signature returns only primitives.
+  fn returns_prim(&self, f: usize, t: &TSType<'_>, tp: &[String], depth: u32) -> bool {
+    if depth > 6 {
+      return false;
+    }
+    match t {
+      TSType::TSParenthesizedType(p) => self.returns_prim(f, &p.type_annotation, tp, depth + 1),
+      TSType::TSUnionType(u) => {
+        let callable = |x: &TSType<'_>| !self.classify(f, x, tp, depth + 1).prim_only();
+        u.types.iter().any(callable)
+          && u.types.iter().all(|x| !callable(x) || self.returns_prim(f, x, tp, depth + 1))
+      }
+      TSType::TSTypeReference(r)
+        if matches!(&r.type_name, TSTypeName::IdentifierReference(id)
+          if tp.iter().any(|p| p == id.name.as_str())) =>
+      {
+        false
+      }
+      _ => {
+        let mut sigs = vec![];
+        self.sigs_of_type(f, t, &mut sigs, depth + 1);
+        !sigs.is_empty()
+          && sigs.iter().all(|s| {
+            s.ret.is_some_and(|r| {
+              let mut tps = s.tparams.clone();
+              tps.extend(tp.iter().cloned());
+              let c = self.classify(s.file, r, &tps, 0);
+              c.prim_only() && !c.ignored
+            })
+          })
+      }
+    }
+  }
+
   fn callback_masks_of(&self, sigs: &[Sig<'_>], nparams: usize) -> Vec<u8> {
     let same: Vec<&Sig<'_>> = sigs.iter().filter(|s| s.params.len() == nparams).collect();
     let matching: Vec<&Sig<'_>> = if same.is_empty() { sigs.iter().collect() } else { same };
@@ -534,7 +603,13 @@ impl Dts {
           None => shape.unknown = true,
         }
       }
-      (bounds, shape, self.generic_of_sigs(&inner, nargs), self.callback_masks_of(&inner, nargs))
+      (
+        bounds,
+        shape,
+        self.generic_of_sigs(&inner, nargs),
+        self.callback_masks_of(&inner, nargs),
+        self.prim_returns_of(&inner, nargs),
+      )
     });
     self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
     out
@@ -1641,6 +1716,45 @@ mod tests {
     assert_eq!(dts.callback_masks(&path, "loose", 1), Some(vec![0xFF]));
     // A callback declared with a concrete parameter type still receives nothing.
     assert_eq!(dts.callback_masks(&path, "plain", 1), Some(vec![0]));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// A callback's return is filtered only where every signature the call may match declares
+  /// it returns primitives: a predicate or refinement, not a type parameter, `unknown`, an
+  /// object, or a callback type given as a type parameter.
+  #[test]
+  fn callback_prim_returns_need_a_primitive_return() {
+    let dir =
+      std::env::temp_dir().join(format!("rolldown-effect-dts-{}-prim-returns", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("index.d.ts");
+    std::fs::write(
+      &path,
+      [
+        "export interface Predicate<in A> { (a: A): boolean }",
+        "export interface Refinement<in A, out B extends A> { (a: A): a is B }",
+        "export declare const exists: {",
+        "  <A, B extends A>(self: A, refinement: Refinement<A, B>): boolean;",
+        "  <A>(self: A, predicate: Predicate<A>): boolean;",
+        "};",
+        "export declare const mixed: {",
+        "  <A>(self: A, predicate: Predicate<A>): boolean;",
+        "  <A, B>(self: A, f: (a: A) => B): B;",
+        "};",
+        "export declare const opaque: (f: (a: string) => unknown) => void;",
+        "export declare const generic: <F extends () => boolean>(f: F) => void;",
+        "export declare const object: (f: () => { a: string }) => void;",
+        "",
+      ]
+      .join("\n"),
+    )
+    .unwrap();
+    let dts = Dts::default();
+    assert_eq!(dts.callback_prim_returns(&path, "exists", 2), Some(vec![false, true]));
+    assert_eq!(dts.callback_prim_returns(&path, "mixed", 2), Some(vec![false, false]));
+    assert_eq!(dts.callback_prim_returns(&path, "opaque", 1), Some(vec![false]));
+    assert_eq!(dts.callback_prim_returns(&path, "generic", 1), Some(vec![false]));
+    assert_eq!(dts.callback_prim_returns(&path, "object", 1), Some(vec![false]));
     let _ = std::fs::remove_dir_all(&dir);
   }
 }

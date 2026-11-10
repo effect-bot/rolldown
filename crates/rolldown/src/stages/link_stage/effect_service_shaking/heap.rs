@@ -97,6 +97,9 @@ struct TypedSig {
   /// Per parameter: which parameters of the callbacks it holds take values of a type parameter
   /// (`Dts::callback_masks`).
   masks: Vec<u8>,
+  /// Per parameter: every callback it admits is declared to return only primitives
+  /// (`Dts::callback_prim_returns`).
+  prim_returns: Vec<bool>,
 }
 
 /// A stand-in for the service-free values a type-modelled call site is handed (direction 2's
@@ -471,8 +474,9 @@ pub enum Constraint {
   /// protocol method loaded into the variable).
   Witness(ObjId, VarId),
   /// An argument of a call into type-modelled `effect` code (`Analysis::typed_arg`): what it
-  /// contributes to the call's slot.
-  TypedArg(VarId, VarId, Site, u8),
+  /// contributes to the call's slot. The flag: a callback among it is declared to return only
+  /// primitives.
+  TypedArg(VarId, VarId, Site, u8, bool),
   /// Values entering a type-modelled value's slot (`Analysis::slot_in`); the object is the
   /// stand-in for what the admission filter holds back.
   SlotIn(VarId, ObjId),
@@ -490,7 +494,7 @@ pub enum Constraint {
   /// `pool_route` does.
   TypedNested(VarId, VarId, Site, u8),
   /// Direction 2's admission filter at a type-modelled call (`Analysis::admit_typed`).
-  AdmitTyped(VarId),
+  AdmitTyped(VarId, bool),
   /// An argument at a concrete position of a call into type-modelled code (its declared type,
   /// interned, mentions no type parameter; `u32::MAX` if unknown): it joins no slot, but its
   /// callbacks run and its declared members are read (`Analysis::typed_concrete`).
@@ -585,10 +589,12 @@ impl Constraint {
       C::Witness(obj, dst) => C::Witness(*obj, v(*dst)),
       C::ThenableBail(obj) => C::ThenableBail(*obj),
       C::ThenableAwait(dst) => C::ThenableAwait(v(*dst)),
-      C::TypedArg(slot, back, site, mask) => C::TypedArg(v(*slot), v(*back), *site, *mask),
+      C::TypedArg(slot, back, site, mask, prim) => {
+        C::TypedArg(v(*slot), v(*back), *site, *mask, *prim)
+      }
       C::SlotIn(dst, stand_in) => C::SlotIn(v(*dst), *stand_in),
       C::TypedConcrete(ty, site) => C::TypedConcrete(*ty, *site),
-      C::AdmitTyped(dst) => C::AdmitTyped(v(*dst)),
+      C::AdmitTyped(dst, prim) => C::AdmitTyped(v(*dst), *prim),
       C::TypedNested(slot, back, site, mask) => C::TypedNested(v(*slot), v(*back), *site, *mask),
       C::EscapeOut => C::EscapeOut,
       C::ProtocolCall(call) => match C::Call(call.clone()).remap(v, s) {
@@ -910,6 +916,9 @@ pub struct Analysis {
   pub hole_related: FxHashMap<ObjId, ObjId>,
   /// Objects escaped into effect's code, and into code the pass can't see (`escape`).
   effect_escaped: FxHashSet<ObjId>,
+  /// Functions handed to effect's code so far only where their return is declared primitive
+  /// (`escape_with`): their return goes over at the first escape that hands it.
+  ret_withheld: FxHashSet<ObjId>,
   genuine_escaped: FxHashSet<ObjId>,
   /// Keys handed across a boundary (`hand_key`): the objects handed, the key names they carry,
   /// whether one names every key, and the lookups through keys from a boundary.
@@ -941,7 +950,7 @@ pub struct Analysis {
   /// Each call's handed-values variable, translated for slots (`slot_in`).
   typed_backs: FxHashMap<VarId, VarId>,
   /// (object, slot) pairs `typed_arg` has handled.
-  typed_args_seen: FxHashSet<(ObjId, VarId)>,
+  typed_args_seen: FxHashSet<(ObjId, VarId, bool)>,
   /// The method summary read off a type-modelled value.
   typed_methods: FxHashMap<ObjId, ObjId>,
   /// The module each type-modelled call result comes from, for its container pool.
@@ -1183,6 +1192,7 @@ impl Analysis {
       pending_receivers: FxHashMap::default(),
       hole_related: FxHashMap::default(),
       effect_escaped: FxHashSet::default(),
+      ret_withheld: FxHashSet::default(),
       genuine_escaped: FxHashSet::default(),
       handed: FxHashSet::default(),
       handed_names: FxHashSet::default(),
@@ -2235,11 +2245,11 @@ impl Analysis {
           self.seed(*dst, t);
         }
       }
-      Constraint::TypedArg(slot, back, site, mask) => {
-        self.typed_arg(obj, *slot, *back, *site, *mask);
+      Constraint::TypedArg(slot, back, site, mask, prim) => {
+        self.typed_arg(obj, *slot, *back, *site, *mask, *prim);
       }
       Constraint::SlotIn(dst, stand_in) => self.slot_in(obj, *dst, *stand_in),
-      Constraint::AdmitTyped(dst) => self.admit_typed(obj, *dst),
+      Constraint::AdmitTyped(dst, prim) => self.admit_typed_with(obj, *dst, !*prim),
       Constraint::TypedConcrete(ty, site) => self.typed_concrete(obj, *ty, *site),
       Constraint::CallFn(call) => self.call_fn_only(obj, call),
       Constraint::ProtocolCall(call) => self.protocol_method_call(obj, call),
@@ -2661,7 +2671,7 @@ impl Analysis {
       }
       // A value written onto a summary joins what it holds through the admission filter.
       ObjKind::Typed { slot: inner, .. } => {
-        self.constrain(src, Constraint::AdmitTyped(inner));
+        self.constrain(src, Constraint::AdmitTyped(inner, false));
       }
       ObjKind::Wrap(inner) => self.copy(src, inner),
       // The only writable public member of a container is `ManagedRuntime.cachedContext`: the
@@ -2734,7 +2744,7 @@ impl Analysis {
       ObjKind::Typed { .. } if self.is_stand_in(obj) => self.taint_by(obj, "unknown store"),
       // A value written onto a summary joins what it holds through the admission filter.
       ObjKind::Typed { slot: inner, .. } => {
-        self.constrain(src, Constraint::AdmitTyped(inner));
+        self.constrain(src, Constraint::AdmitTyped(inner, false));
       }
       ObjKind::Wrap(inner) => self.copy(src, inner),
       ObjKind::Context { .. }
@@ -3259,7 +3269,7 @@ impl Analysis {
       Some(outer) => {
         let (dts, name) = (e.dts.clone(), e.name.clone());
         self.dts.returned_call(&dts, &name, origin.1, nargs).map(
-          |(b, ret, (generic, rest_generic), masks)| {
+          |(b, ret, (generic, rest_generic), masks, prim_returns)| {
             let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
             let rest = b.rest.map(|t| self.intern_ty(t));
             TypedSig {
@@ -3271,6 +3281,7 @@ impl Analysis {
               generic,
               rest_generic,
               masks,
+              prim_returns,
             }
           },
         )
@@ -3296,9 +3307,12 @@ impl Analysis {
     let (generic, rest_generic) =
       self.dts.generic_positions(&dts, &name, nargs).unwrap_or((vec![true; nargs], true));
     let masks = self.dts.callback_masks(&dts, &name, nargs).unwrap_or_else(|| vec![0xFF; nargs]);
+    let prim_returns =
+      self.dts.callback_prim_returns(&dts, &name, nargs).unwrap_or_else(|| vec![false; nargs]);
     let params = b.params.into_iter().map(|t| t.map(|t| self.intern_ty(t))).collect();
     let rest = b.rest.map(|t| self.intern_ty(t));
-    let sig = TypedSig { params, rest, ret, stores, reads, generic, rest_generic, masks };
+    let sig =
+      TypedSig { params, rest, ret, stores, reads, generic, rest_generic, masks, prim_returns };
     self.typed_sigs.insert((export, nargs), sig.clone());
     Some(sig)
   }
@@ -3480,7 +3494,7 @@ impl Analysis {
     if export == NO_EXPORT {
       if let Some(this) = call.this {
         // A method call has no signature: it bails what it reaches (below).
-        self.constrain(this, Constraint::TypedArg(slot, back, call.site, 0));
+        self.constrain(this, Constraint::TypedArg(slot, back, call.site, 0, false));
       }
     }
     let sig = if export != NO_EXPORT {
@@ -3567,11 +3581,13 @@ impl Analysis {
         Some(t) => self.typed_filtered_arg(v, t),
       };
       if generic {
-        self.constrain(arg, Constraint::AdmitTyped(handed));
+        // A callback declared to return only primitives goes over without its return.
+        let prim = sig.as_ref().is_some_and(|s| s.prim_returns.get(i).copied().unwrap_or(false));
+        self.constrain(arg, Constraint::AdmitTyped(handed, prim));
         // Without a signature, the call hands what it holds to unseen code (below), so its
         // callbacks run with unknown arguments.
         let mask = sig.as_ref().map_or(0, |s| s.masks.get(i).copied().unwrap_or(0xFF));
-        self.constrain(arg, Constraint::TypedArg(slot, back, call.site, mask));
+        self.constrain(arg, Constraint::TypedArg(slot, back, call.site, mask, prim));
       } else {
         self.constrain(arg, Constraint::TypedConcrete(ty.unwrap_or(u32::MAX), call.site));
       }
@@ -3861,7 +3877,7 @@ impl Analysis {
       let v = match a {
         Arg::Var(v) | Arg::Spread(v) => *v,
       };
-      self.constrain(v, Constraint::TypedArg(returns, returns, call.site, 0xFF));
+      self.constrain(v, Constraint::TypedArg(returns, returns, call.site, 0xFF, false));
     }
     self.seed(call.ret, stand_in);
     self.copy(returns, call.ret);
@@ -3926,6 +3942,12 @@ impl Analysis {
   /// includes `top_ext` for these (`typed_call`), so whatever the caller does with one is what
   /// it would do with a value from unseen code. Primitives hold nothing and are covered by it.
   fn admit_typed(&mut self, obj: ObjId, dst: VarId) {
+    self.admit_typed_with(obj, dst, true);
+  }
+
+  /// `admit_typed`; a function that goes to effect's code goes without its return when `ret`
+  /// is false (`escape_with`).
+  fn admit_typed_with(&mut self, obj: ObjId, dst: VarId, ret: bool) {
     if matches!(
       self.objs[obj].kind,
       ObjKind::Str(_) | ObjKind::Num(_) | ObjKind::Prim | ObjKind::AllKeys
@@ -3948,7 +3970,7 @@ impl Analysis {
       | ObjKind::Builtin { .. }
       | ObjKind::Typed { .. }
       | ObjKind::Wrap(_) => {
-        self.escape(obj, Flavour::Ext, Some(EFFECT_ESCAPE));
+        self.escape_with(obj, Flavour::Ext, Some(EFFECT_ESCAPE), ret);
       }
       ObjKind::Effect { success, .. } => self.constrain(success, Constraint::EscapeOut),
       ObjKind::Promise { value } => self.constrain(value, Constraint::EscapeOut),
@@ -3995,7 +4017,7 @@ impl Analysis {
     let v = self.var();
     self.unknown_store_filters.insert(src, v);
     self.seed(v, self.top_effect);
-    self.constrain(src, Constraint::AdmitTyped(v));
+    self.constrain(src, Constraint::AdmitTyped(v, false));
     v
   }
 
@@ -4396,7 +4418,7 @@ impl Analysis {
         self.admit_typed(obj, dst);
         if self.typed_slot_fns.insert((obj, dst)) {
           let back = self.var();
-          self.typed_callback(obj, dst, back, protocol_site(6), 0xFF);
+          self.typed_callback(obj, dst, back, protocol_site(6), 0xFF, false);
         }
       }
       _ => {
@@ -4411,9 +4433,10 @@ impl Analysis {
   /// its value; a key or class handed over keeps every method; functions run with the slot as
   /// callbacks, and a record's or array's handlers do too (effect code reads them by name).
   /// The value itself enters the slot only if it may hold a service (`admit_typed`).
-  fn typed_arg(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site, mask: u8) {
-    // Once per (object, slot): a callback's result feeds the same slot back.
-    if !self.typed_args_seen.insert((obj, slot)) {
+  fn typed_arg(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site, mask: u8, prim: bool) {
+    // Once per (object, slot, flag): a callback's result feeds the same slot back. A callback
+    // handed where its return is open is not skipped for having been handed where it is not.
+    if !self.typed_args_seen.insert((obj, slot, prim)) {
       return;
     }
     let top = self.top_effect;
@@ -4431,8 +4454,8 @@ impl Analysis {
         self.constrain(inner, Constraint::SlotIn(slot, top));
       }
       ObjKind::Closure(_) | ObjKind::Builtin { .. } => {
-        self.admit_typed(obj, slot);
-        self.typed_callback(obj, slot, back, site, mask);
+        self.admit_typed_with(obj, slot, !prim);
+        self.typed_callback(obj, slot, back, site, mask, prim);
       }
       ObjKind::Key { strings, .. } => {
         self.seed(slot, obj);
@@ -4450,7 +4473,7 @@ impl Analysis {
           self.seed(slot, obj);
           if matches!(self.objs[obj].kind, ObjKind::Array) {
             let elem = self.elem(obj);
-            self.constrain(elem, Constraint::AdmitTyped(slot));
+            self.constrain(elem, Constraint::AdmitTyped(slot, false));
           }
         } else {
           self.admit_typed(obj, slot);
@@ -4561,7 +4584,20 @@ impl Analysis {
   /// service it returns; a parameter of a concrete type receives nothing the call holds. Running
   /// callbacks with the slot instead (`ROLLDOWN_EFFECT_SERVICE_SHAKING_TRACKED_CALLBACKS=1`, a
   /// diagnostic) merges every call's slot into every callback and does not finish on the gates.
-  fn typed_callback(&mut self, f: ObjId, slot: VarId, back: VarId, site: Site, mask: u8) {
+  ///
+  /// A callback declared to return only primitives (`prim`, `Predicate<A>`) hands effect's
+  /// code nothing it returns: a value at a position whose declared type admits only primitives
+  /// holds no service (direction 2, as for arguments at concrete positions). Its return goes to
+  /// that code only if the same function is also handed over where its return is open.
+  fn typed_callback(
+    &mut self,
+    f: ObjId,
+    slot: VarId,
+    back: VarId,
+    site: Site,
+    mask: u8,
+    prim: bool,
+  ) {
     if self.debug {
       self.callback_log.push((site.module.raw(), site.start, mask, slot, f));
     }
@@ -4569,7 +4605,11 @@ impl Analysis {
       if mask != 0 {
         self.constrain(slot, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
       }
-      self.escape(f, Flavour::Ext, Some(EFFECT_ESCAPE));
+      self.escape_with(f, Flavour::Ext, Some(EFFECT_ESCAPE), !prim);
+      if prim {
+        let _ = (back, site);
+        return;
+      }
       // What it returns may come back out of the call wrapped in an Effect or a promise (a
       // `decode` succeeding with a service): what those succeed with goes to unseen code too.
       if let ObjKind::Closure(fid) = self.objs[f].kind {
@@ -4607,7 +4647,7 @@ impl Analysis {
           self.seed(r, arr);
         }
         self.seed(this, self.top_host);
-        self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF));
+        self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF, false));
         return;
       }
     }
@@ -4620,7 +4660,7 @@ impl Analysis {
       (0..4).map(|j| Arg::Var(if mask & (1 << j) != 0 { slot } else { unknown })).collect();
     let call = Call { site: call_site, this: None, args, ret, is_new: false, builtin: None };
     self.constrain(callee, Constraint::Call(Box::new(call)));
-    self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF));
+    self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF, false));
   }
 
   /// The callbacks inside an options object or array handed to type-modelled code.
@@ -4707,7 +4747,7 @@ impl Analysis {
   fn typed_nested(&mut self, obj: ObjId, slot: VarId, back: VarId, site: Site, mask: u8) {
     if Self::function_kind(&self.objs[obj].kind) {
       if self.typed_slot_fns.insert((obj, slot)) {
-        self.typed_callback(obj, slot, back, site, mask);
+        self.typed_callback(obj, slot, back, site, mask, false);
       }
     } else if matches!(self.objs[obj].kind, ObjKind::Typed { .. }) && !self.is_stand_in(obj) {
       self.pool_route(obj, back);
@@ -6020,21 +6060,37 @@ impl Analysis {
 
   /// A value handed to code the pass cannot see.
   pub fn escape(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>) {
+    self.escape_with(obj, flavour, site, true);
+  }
+
+  /// `escape`. With `ret` false, a function that goes to effect's code goes without what it
+  /// returns (`typed_callback`'s callbacks declared to return only primitives); the first
+  /// escape that hands its return over, whenever it comes, does.
+  fn escape_with(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>, ret: bool) {
     // An escape into effect's code runs once; one into code the pass can't see runs once too,
     // even after the first (it hands over more: values from unseen code may be anything).
     let into_effect = flavour == Flavour::Ext && site == Some(EFFECT_ESCAPE);
+    // Only a function has a return to hold back.
+    let ret = ret || !into_effect || !matches!(self.objs[obj].kind, ObjKind::Closure(_));
     self.hand_key(obj, false);
-    if into_effect {
-      if self.objs[obj].escaped.is_some() || !self.effect_escaped.insert(obj) {
-        return;
+    let repeat = if into_effect {
+      self.objs[obj].escaped.is_some() || !self.effect_escaped.insert(obj)
+    } else {
+      self.objs[obj].escaped.is_some()
+        && !(flavour == Flavour::Ext
+          && self.effect_escaped.contains(&obj)
+          && self.objs[obj].escaped == Some(Flavour::Ext)
+          && self.genuine_escaped.insert(obj))
+    };
+    if repeat {
+      // A later escape that hands over a return held back so far (whatever its order).
+      if ret && self.ret_withheld.remove(&obj) {
+        self.release_ret(obj);
       }
-    } else if self.objs[obj].escaped.is_some()
-      && !(flavour == Flavour::Ext
-        && self.effect_escaped.contains(&obj)
-        && self.objs[obj].escaped == Some(Flavour::Ext)
-        && self.genuine_escaped.insert(obj))
-    {
       return;
+    }
+    if !ret {
+      self.ret_withheld.insert(obj);
     }
     if !into_effect && flavour == Flavour::Ext {
       self.genuine_escaped.insert(obj);
@@ -6063,14 +6119,12 @@ impl Analysis {
         }
         let elem = self.elem(obj);
         self.constrain(elem, Constraint::Escape(flavour, site));
-        if external {
-          // Fields written from outside may hold anything (what effect's code made, for it).
+        // Fields written from outside may hold anything (what effect's code made, for it). A
+        // function handed only where it is declared a callback that returns primitives has no
+        // properties by that type: effect's code writes none (`release_ret` adds them).
+        if external && ret {
           let top = if into_effect { self.top_effect } else { self.top_ext };
-          self.seed(elem, top);
-          if !self.objs[obj].unknown_stores.contains(&elem) {
-            self.objs[obj].unknown_stores.push(elem);
-            self.recheck_tree(obj);
-          }
+          self.unknown_store(obj, elem, top);
         }
         let sources = self.objs[obj].spread_from.clone();
         for src in sources {
@@ -6090,7 +6144,10 @@ impl Analysis {
           }
         }
         if let ObjKind::Closure(f) = self.objs[obj].kind {
-          self.escape_fn(f, flavour, site);
+          if ret {
+            self.ret_withheld.remove(&obj);
+          }
+          self.escape_fn_with(f, flavour, site, ret);
         }
       }
       // A stand-in's values escape themselves (`apply` hands the escape to `held_var`).
@@ -6130,7 +6187,31 @@ impl Analysis {
     }
   }
 
+  /// Fields written from outside: `elem` may hold `top`.
+  fn unknown_store(&mut self, obj: ObjId, elem: VarId, top: ObjId) {
+    self.seed(elem, top);
+    if !self.objs[obj].unknown_stores.contains(&elem) {
+      self.objs[obj].unknown_stores.push(elem);
+      self.recheck_tree(obj);
+    }
+  }
+
+  /// The rest of an escape into effect's code held back for a function handed over so far only
+  /// without its return (`escape_with`): its return goes there, and effect's code may write
+  /// into it.
+  fn release_ret(&mut self, obj: ObjId) {
+    let ObjKind::Closure(f) = self.objs[obj].kind else { return };
+    let elem = self.elem(obj);
+    self.unknown_store(obj, elem, self.top_effect);
+    let r = self.fns[f].ret;
+    self.constrain(r, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
+  }
+
   fn escape_fn(&mut self, f: FnId, flavour: Flavour, site: Option<Site>) {
+    self.escape_fn_with(f, flavour, site, true);
+  }
+
+  fn escape_fn_with(&mut self, f: FnId, flavour: Flavour, site: Option<Site>, ret_escapes: bool) {
     self.activate(f);
     let (params, rest, this, ret) = {
       let i = &self.fns[f];
@@ -6151,7 +6232,9 @@ impl Analysis {
       self.seed(r, arr);
     }
     self.seed(this, t);
-    self.constrain(ret, Constraint::Escape(flavour, site));
+    if ret_escapes {
+      self.constrain(ret, Constraint::Escape(flavour, site));
+    }
   }
 
   // == queries used after solving
@@ -6428,5 +6511,57 @@ mod tests {
   #[test]
   fn crossed_then_widened_fn_late_return_names_any_key() {
     assert!(crossed_then_widened_fn(true));
+  }
+
+  /// A function that returns an object is handed to effect's code twice: once without its
+  /// return (a callback declared to return primitives) and once by `second`. Each step is
+  /// solved before the next, in the order given. Returns whether the object it returns went to
+  /// effect's code.
+  fn withheld_return(withheld_first: bool, second: Option<fn(&mut Analysis, ObjId)>) -> bool {
+    let mut a = Analysis::new();
+    let vars = [a.var(), a.var(), a.var(), a.var(), a.var()];
+    let f = a.fns.push(FnInfo::new(ModuleIdx::from_raw_unchecked(0), 0, FnKind::Arrow, vars));
+    let closure = a.alloc(ObjKind::Closure(f), None);
+    a.fns[f].closure = Some(closure);
+    let returned = a.alloc(ObjKind::Object, None);
+    let ret = a.fns[f].ret;
+    a.seed(ret, returned);
+    let withhold = |a: &mut Analysis| {
+      a.escape_with(closure, Flavour::Ext, Some(EFFECT_ESCAPE), false);
+      a.solve();
+    };
+    if withheld_first {
+      withhold(&mut a);
+    }
+    if let Some(second) = second {
+      second(&mut a, closure);
+      a.solve();
+    }
+    if !withheld_first {
+      withhold(&mut a);
+    }
+    a.objs[returned].escaped.is_some()
+  }
+
+  /// Withholding a callback's return depends on no order: a later or earlier handover that
+  /// passes the return (into effect's code, unseen code or a host builtin) sends it, and only a
+  /// function never handed over with its return keeps it.
+  #[test]
+  fn withheld_return_is_order_independent() {
+    let effect: fn(&mut Analysis, ObjId) = |a, f| a.escape(f, Flavour::Ext, Some(EFFECT_ESCAPE));
+    let unseen: fn(&mut Analysis, ObjId) = |a, f| a.escape(f, Flavour::Ext, None);
+    let host: fn(&mut Analysis, ObjId) = |a, f| a.escape(f, Flavour::Host, None);
+    let constrained: fn(&mut Analysis, ObjId) = |a, f| {
+      let v = a.var();
+      a.seed(v, f);
+      a.constrain(v, Constraint::Escape(Flavour::Ext, Some(EFFECT_ESCAPE)));
+    };
+    for (name, second) in
+      [("effect", effect), ("unseen", unseen), ("host", host), ("var", constrained)]
+    {
+      assert!(withheld_return(true, Some(second)), "{name} after the withheld handover");
+      assert!(withheld_return(false, Some(second)), "{name} before the withheld handover");
+    }
+    assert!(!withheld_return(true, None), "only withheld: the return stays");
   }
 }
