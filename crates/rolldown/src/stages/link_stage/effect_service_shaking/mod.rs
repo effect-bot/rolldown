@@ -370,8 +370,16 @@ impl LinkStage<'_> {
                   continue;
                 }
                 if typed_modules.contains(&module) {
-                  let dts = declarations(module).expect("checked with the declarations");
-                  let obj = a.typed_export(dts, name.clone(), module);
+                  // A constant key (`Equal.symbol`, `Redactable.symbolRedactable`) is that key:
+                  // a summary of it would make every computed member written with it a store
+                  // under an unknown name.
+                  let obj = match chain.iter().find_map(|sym| self.constant_key_of(*sym)) {
+                    Some(key) => a.str(&key),
+                    None => {
+                      let dts = declarations(module).expect("checked with the declarations");
+                      a.typed_export(dts, name.clone(), module)
+                    }
+                  };
                   for (i, sym) in chain.into_iter().enumerate() {
                     let claim = match bind_rank.get(&sym) {
                       None => true,
@@ -971,6 +979,35 @@ impl LinkStage<'_> {
     None
   }
 
+  /// The property key a top-level `const` holds when its initialiser is a string literal or
+  /// `Symbol.for` of one, named as the model names it (`"@@for:..."` for a registered symbol,
+  /// as the `Symbol.for` rule does).
+  fn constant_key_of(&self, symbol: SymbolRef) -> Option<String> {
+    let ast = self.ast_table[symbol.owner].as_ref()?;
+    let scoping = self.symbols[symbol.owner].as_ref()?.scoping();
+    let init = find_top_level_const_init(ast.program(), symbol.symbol)?;
+    match init.without_parentheses() {
+      Expression::StringLiteral(s) => Some(s.value.as_str()?.to_string()),
+      Expression::CallExpression(call) => {
+        let Expression::StaticMemberExpression(callee) = &call.callee else { return None };
+        let Expression::Identifier(object) = &callee.object else { return None };
+        // The global `Symbol`, not a binding of that name.
+        let global =
+          object.reference_id.get().is_some_and(|r| scoping.get_reference(r).symbol_id().is_none());
+        if !global || object.name != "Symbol" || callee.property.name != "for" {
+          return None;
+        }
+        match call.arguments.as_slice() {
+          [oxc::ast::ast::Argument::StringLiteral(s)] => {
+            Some(format!("@@for:{}", s.value.as_str()?))
+          }
+          _ => None,
+        }
+      }
+      _ => None,
+    }
+  }
+
   /// The symbol a top-level `const x = y` or `const x = ns.y` declaration aliases.
   fn alias_target(&self, symbol: SymbolRef) -> Option<SymbolRef> {
     let module = symbol.owner;
@@ -1025,6 +1062,34 @@ impl PipeKind for ObjKind {
   fn pipe_kind(self) -> String {
     format!("{self:?}").split([' ', '(', '{']).next().unwrap_or("").to_string()
   }
+}
+
+/// The initialiser of a top-level `const` declaring `symbol`.
+fn find_top_level_const_init<'a>(
+  program: &'a oxc::ast::ast::Program<'a>,
+  symbol: oxc::semantic::SymbolId,
+) -> Option<&'a Expression<'a>> {
+  for stmt in &program.body {
+    let decl = match stmt {
+      Statement::VariableDeclaration(d) => d,
+      Statement::ExportDeclaration(e) => match &e.declaration {
+        oxc::ast::ast::Declaration::VariableDeclaration(d) => d,
+        _ => continue,
+      },
+      _ => continue,
+    };
+    if decl.kind != oxc::ast::ast::VariableDeclarationKind::Const {
+      continue;
+    }
+    for declarator in &decl.declarations {
+      if let oxc::ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
+        if id.symbol_id.get() == Some(symbol) {
+          return declarator.init.as_ref();
+        }
+      }
+    }
+  }
+  None
 }
 
 fn find_top_level_init<'a>(

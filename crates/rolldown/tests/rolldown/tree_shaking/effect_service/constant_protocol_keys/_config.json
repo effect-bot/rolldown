@@ -1,0 +1,10 @@
+{
+  "_comment": "A service whose own protocol methods are keyed by effect's constants (`Equal.symbol` and `Hash.symbol`, string constants, and `Redactable.symbolRedactable`, a `Symbol.for` symbol) and read sibling methods through `this`. Only effect calls them (`Equal.equals`, `Hash.hash`, `Redactable.redact`). The keys name those members, so the walks find them: the methods they read stay, and the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
