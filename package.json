@@ -25,14 +25,20 @@
     "@oxc-project/runtime": "catalog:",
     "@types/node": "catalog:",
     "cjs-module-lexer": "^2.3.0",
+    "commander": "14.0.3",
     "effect": "4.1.2",
     "knip": "^6.44.0",
+    "nanoid": "6.0.2",
+    "picomatch": "4.0.7",
     "playwright-chromium": "^1.63.0",
     "publint": "^0.3.21",
     "remove-unused-vars": "^0.0.16",
     "rolldown": "workspace:*",
+    "semver": "7.8.6",
     "typescript": "catalog:",
-    "vite-plus": "^1.0.0"
+    "vite-plus": "^1.0.0",
+    "yaml": "2.9.1",
+    "zod": "4.6.7"
   },
   "engines": {
     "node": "^20.19.0 || >=22.12.0"

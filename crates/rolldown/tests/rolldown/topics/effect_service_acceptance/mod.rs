@@ -284,6 +284,16 @@ async fn mixed_library_bundled_effect_external() {
   check("mixed_library_bundled_effect_external").await;
 }
 
+/// 5. An ordinary application: a CLI on commander, zod, yaml, nanoid, semver
+/// and picomatch, with one three-method Effect service of which only `get` is
+/// called. Most of the bundle is plain JavaScript from those packages, which the
+/// pass analyses as ordinary code. `put` and `del` are common names elsewhere
+/// in the bundle, so the check counts their object-literal definitions.
+#[tokio::test]
+async fn ordinary_app() {
+  check("ordinary_app").await;
+}
+
 /// What the copy of `effect` in `declarations` has beside each module.
 #[derive(Clone, Copy)]
 enum Declarations {
