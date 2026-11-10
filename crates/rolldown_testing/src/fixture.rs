@@ -306,30 +306,39 @@ mod tests {
 
   /// A process that leaves its process group can only be stopped where the fixture's processes
   /// are contained (`effect_fixture::containment`): a PID namespace on Linux, a job on Windows.
-  fn require_containment() {
-    if let Err(reason) = effect_fixture::containment() {
-      panic!("this host can't stop a process that leaves the fixture's process group: {reason}");
+  /// Elsewhere the accepted policy is group-only cleanup with a warning, so the test is skipped:
+  /// it returns `false` after writing the reason to stderr directly, past libtest's capture.
+  fn has_containment(test: &str) -> bool {
+    use std::io::Write as _;
+    let Err(reason) = effect_fixture::containment() else { return true };
+    let _ = writeln!(
+      std::io::stderr(),
+      "\nskipped {test}: this host can't stop a process that leaves the fixture's process group, \
+       and the harness falls back to group-only cleanup with a warning: {reason}"
+    );
+    false
+  }
+
+  #[test]
+  #[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS has no unprivileged containment; group-only cleanup with a warning is its accepted policy (effect_fixture)"
+  )]
+  fn a_detached_child_of_a_hung_test_script_is_stopped() {
+    if has_containment("a_detached_child_of_a_hung_test_script_is_stopped") {
+      check_hung("effect_fixture_detached_hangs");
     }
   }
 
   #[test]
   #[cfg_attr(
     target_os = "macos",
-    ignore = "macOS has no unprivileged containment; its fallback policy is undecided (effect_fixture)"
-  )]
-  fn a_detached_child_of_a_hung_test_script_is_stopped() {
-    require_containment();
-    check_hung("effect_fixture_detached_hangs");
-  }
-
-  #[test]
-  #[cfg_attr(
-    target_os = "macos",
-    ignore = "macOS has no unprivileged containment; its fallback policy is undecided (effect_fixture)"
+    ignore = "macOS has no unprivileged containment; group-only cleanup with a warning is its accepted policy (effect_fixture)"
   )]
   fn a_detached_child_left_by_a_finished_test_script_is_stopped() {
-    require_containment();
-    check_left_child("effect_fixture_detached_leaves_child");
+    if has_containment("a_detached_child_left_by_a_finished_test_script_is_stopped") {
+      check_left_child("effect_fixture_detached_leaves_child");
+    }
   }
 
   /// Blocks its thread in the build, as a runaway analysis would.

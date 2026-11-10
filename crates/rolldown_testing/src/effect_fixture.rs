@@ -35,12 +35,28 @@
 //!   have been reused. A process that leaves the group (`setsid`) is not
 //!   stopped. The harness says so on every path: a timeout message names
 //!   only the group, and a fixture that passes is reported, once per test
-//!   process on stderr, as having had only its group stopped. Group-only
-//!   cleanup is not whole-tree cleanup; whether it is acceptable on such
-//!   hosts is undecided.
+//!   process on stderr, as having had only its group stopped.
 //! - On Windows the child is put in a job object before it starts anything
 //!   (it waits for its stdin to close, [`wait_until_owned`]). Processes it
 //!   starts belong to the job too, and closing the job kills whatever is left.
+//!
+//! The contract (Tim's decision, 2026-11-10): where the fixture's processes
+//! are contained (a Linux PID namespace, a Windows job) the harness stops the
+//! whole process tree. Elsewhere (macOS, Linux without unprivileged user
+//! namespaces) it stops the process group and warns that a process which
+//! left the group may still be running. Group-only cleanup is not whole-tree
+//! cleanup; it is accepted because no integration fixture starts a detached
+//! child and the bundler stays in the group. A future fixture that detaches a
+//! child could leave it running on those hosts, with only the warning.
+//! Detached children are not forbidden, and the harness needs no host
+//! configuration change. The two tests for detached children
+//! (`fixture::tests`) are skipped, with the reason, where there is no
+//! containment, and ignored on macOS.
+//!
+//! Evidence: the Linux namespace and process-group paths are run by the
+//! tests on Linux. The macOS process-group path and the Windows job path are
+//! compiled and linted for those targets, but have not been run on a macOS
+//! or Windows host.
 //!
 //! The parent stops the tree when the child exits, at the deadline, and when
 //! the parent unwinds from a panic. A failure to stop it fails the test and
@@ -48,7 +64,7 @@
 //! (`SIGKILL`, or an abort that does not unwind) runs none of it, and the
 //! fixture's processes, namespace or group, may then keep running. On Windows
 //! the job is closed, and its processes killed, when the parent exits for any
-//! reason; that has not been run on a Windows host.
+//! reason (not run on a Windows host, as above).
 
 use std::{
   fs::File,
