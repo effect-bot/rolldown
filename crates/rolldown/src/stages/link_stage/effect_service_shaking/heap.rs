@@ -996,6 +996,9 @@ pub struct Analysis {
   pub budget_exceeded: bool,
   /// Set when the budget ran out generating a deferred body (`solve_with`), for the report.
   pub budget_exceeded_generating: bool,
+  /// Where generation found the budget run out and stopped (`Gen::checkpoint`), leaving the
+  /// statement it was in partial. The solve then stops at once, keeping everything.
+  pub generation_stopped: Option<Site>,
   /// Objects each walk pool has walked.
   walked: FxHashSet<(VarId, ObjId)>,
   /// The program-wide pools of the protocol and hashing walks (`Walk`).
@@ -1288,6 +1291,7 @@ impl Analysis {
       rejected: FxHashMap::default(),
       budget_exceeded: false,
       budget_exceeded_generating: false,
+      generation_stopped: None,
       walked: FxHashSet::default(),
       ignored_pool: None,
       prim_arg: None,
@@ -2047,7 +2051,7 @@ impl Analysis {
 
   /// Checked on every turn of the solve loop, so the environment overrides are read once, in
   /// `new` (`EnvLimits`).
-  fn over_budget(&self) -> bool {
+  pub(super) fn over_budget(&self) -> bool {
     self.objs.len() > self.env_limits.objects
       || self.vars.len() > self.env_limits.vars
       || self.total_pts + self.total_copies > self.env_limits.entries.unwrap_or(self.max_entries)
@@ -2164,10 +2168,12 @@ impl Analysis {
 
   /// Solves to a fixpoint. `generate` fills a deferred body's `pending` when the body is first
   /// installed: its constraints, and the activations its references add. It runs between the
-  /// solver's steps, never inside one, and the budget is checked after each body it generates.
+  /// solver's steps, never inside one. The generator checks the budget as it goes and stops
+  /// part way through a statement when it runs out (`Gen::checkpoint`); the solve then stops
+  /// before installing anything of it, terminally (every method kept, no retry).
   pub fn solve_with(&mut self, generate: &mut dyn FnMut(&mut Analysis, FnId)) {
     'solve: loop {
-      if self.over_budget() {
+      if self.over_budget() || self.generation_stopped.is_some() {
         self.budget_exceeded = true;
         if self.debug {
           self.report_demand_at_stop();
@@ -2183,9 +2189,9 @@ impl Analysis {
         if self.fns[f].deferred {
           self.fns[f].deferred = false;
           generate(self, f);
-          // A large body must not run past the budget until the queue drains: the loop's start
-          // stops the solve, before the body's constraints are installed.
-          if self.over_budget() {
+          // A body generated part way, or one that ran past the budget, is never installed: the
+          // loop's start stops the solve.
+          if self.generation_stopped.is_some() || self.over_budget() {
             self.budget_exceeded_generating = true;
             continue 'solve;
           }

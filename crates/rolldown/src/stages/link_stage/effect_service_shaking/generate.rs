@@ -192,6 +192,9 @@ pub struct Gen<'a, 'l, 's> {
   seq: u32,
   /// Key symbols this top-level statement declared so far (`key_heritage`).
   stmt_keys: Vec<SymbolRef>,
+  /// The allocation budget ran out (`checkpoint`): every statement and expression from here on
+  /// returns at once, and loops over a node's children stop.
+  stopped: bool,
 }
 
 /// A lazy top-level statement whose generation is deferred to its first activation: its body,
@@ -233,6 +236,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     next_case: u32,
   ) -> Self {
     let this = a.fns[module_fn].this;
+    let stopped = a.generation_stopped.is_some();
     Self {
       a,
       sh,
@@ -249,6 +253,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       try_throws: vec![],
       seq: 0,
       stmt_keys: vec![],
+      stopped,
     }
   }
 
@@ -297,6 +302,18 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   fn seed(&mut self, var: VarId, obj: ObjId) {
     self.emit(Pending::Seed(var, obj));
+  }
+
+  /// Checks the allocation budget before a statement or expression at `start` is generated.
+  /// Once it has run out, generation stops for the rest of the solve: what was generated stays
+  /// partial, and the solve ends at once keeping everything (`Analysis::solve_with`), so no
+  /// partial body is ever pruned against.
+  fn checkpoint(&mut self, start: u32) -> bool {
+    if !self.stopped && self.a.over_budget() {
+      self.stopped = true;
+      self.a.generation_stopped = Some(self.site(start));
+    }
+    self.stopped
   }
 
   fn fresh(&mut self) -> VarId {
@@ -571,11 +588,17 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   fn statements(&mut self, stmts: &[Statement<'_>]) {
     for s in stmts {
+      if self.stopped {
+        break;
+      }
       self.statement(s);
     }
   }
 
   fn statement(&mut self, stmt: &Statement<'_>) {
+    if self.checkpoint(oxc::span::GetSpan::span(stmt).start) {
+      return;
+    }
     match stmt {
       Statement::BlockStatement(b) => self.statements(&b.body),
       Statement::DoWhileStatement(s) => {
@@ -647,6 +670,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       Statement::SwitchStatement(s) => {
         self.expr(&s.discriminant);
         for case in &s.cases {
+          if self.stopped {
+            break;
+          }
           if let Some(t) = &case.test {
             self.expr(t);
           }
@@ -794,6 +820,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     match left {
       ForStatementLeft::VariableDeclaration(d) => {
         for decl in &d.declarations {
+          if self.stopped {
+            break;
+          }
           self.bind_pattern(&decl.id, value, decl_kind(d.kind));
         }
       }
@@ -831,6 +860,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   fn variable_declaration(&mut self, d: &VariableDeclaration<'_>) {
     let kind = decl_kind(d.kind);
     for decl in &d.declarations {
+      if self.stopped {
+        break;
+      }
       // A binding bound to a model rule keeps the rule and skips its initialiser.
       if let Some((id, sym)) = self.bound_to_rule(decl) {
         self.record_decl(id, kind);
@@ -861,6 +893,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
       BindingPattern::ObjectPattern(p) => {
         for prop in &p.properties {
+          if self.stopped {
+            break;
+          }
           let key = self.property_key(&prop.key, prop.computed);
           let v = self.load(src, key);
           self.bind_pattern(&prop.value, v, kind);
@@ -875,6 +910,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let elem = self.fresh();
         self.constrain(src, Constraint::ElemOf(elem));
         for e in p.elements.iter().flatten() {
+          if self.stopped {
+            break;
+          }
           self.bind_pattern(e, elem, kind);
         }
         if let Some(rest) = &p.rest {
@@ -1118,6 +1156,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let saved = self.tdz_until.replace(params.span.end);
     let mut vars = vec![];
     for p in &params.items {
+      if self.stopped {
+        break;
+      }
       let v = self.fresh();
       vars.push(v);
       let bound = if let Some(init) = &p.initializer {
@@ -1270,6 +1311,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     self.class_stack.push(heritage);
     for element in &c.body.body {
+      if self.stopped {
+        break;
+      }
       match element {
         ClassElement::MethodDefinition(m) => {
           let fv = self.function(&m.value, FnKind::Normal);
@@ -1518,6 +1562,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   #[expect(clippy::too_many_lines, reason = "one match over expression kinds")]
   pub fn expr(&mut self, expr: &Expression<'_>) -> VarId {
+    if self.checkpoint(oxc::span::GetSpan::span(expr).start) {
+      return self.sh.prim;
+    }
     if matches!(expr, Expression::CallExpression(_)) {
       if let Some(s) = self.const_string(expr) {
         return self.str_var(&s);
@@ -1552,6 +1599,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
           return self.str_var(&s);
         }
         for e in &t.expressions {
+          if self.stopped {
+            break;
+          }
           let v = self.expr(e);
           self.constrain(v, Constraint::Protocol(Protocol::Primitive));
         }
@@ -1563,6 +1613,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let (obj, v) = self.alloc(ObjKind::Array, arr.span.start);
         let elem = self.a.elem(obj);
         for e in &arr.elements {
+          if self.stopped {
+            break;
+          }
           match e {
             ArrayExpressionElement::SpreadElement(s) => {
               let sv = self.expr(&s.argument);
@@ -1693,6 +1746,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       Expression::SequenceExpression(s) => {
         let mut last = self.sh.prim;
         for e in &s.expressions {
+          if self.stopped {
+            break;
+          }
           last = self.expr(e);
         }
         last
@@ -1705,6 +1761,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         self.copy(top, elem);
         let mut args = vec![Arg::Var(sv)];
         for e in &t.quasi.expressions {
+          if self.stopped {
+            break;
+          }
           args.push(Arg::Var(self.expr(e)));
         }
         self.call(callee, this, args, t.span, false)
@@ -1787,6 +1846,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let (obj, v) = self.alloc(ObjKind::Object, o.span.start);
     let mut props = vec![];
     for p in &o.properties {
+      if self.stopped {
+        break;
+      }
       match p {
         ObjectPropertyKind::SpreadProperty(s) => {
           let sv = self.expr(&s.argument);
@@ -1988,6 +2050,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let elem = self.fresh();
         self.constrain(value, Constraint::ElemOf(elem));
         for e in p.elements.iter().flatten() {
+          if self.stopped {
+            break;
+          }
           self.assign_target_maybe_default(e, elem);
         }
         if let Some(rest) = &p.rest {
@@ -1999,6 +2064,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
       AssignmentTarget::ObjectAssignmentTarget(p) => {
         for prop in &p.properties {
+          if self.stopped {
+            break;
+          }
           match prop {
             AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(i) => {
               let v = self.load(value, Key::Name(ArcStr::from(i.binding.name.as_str())));

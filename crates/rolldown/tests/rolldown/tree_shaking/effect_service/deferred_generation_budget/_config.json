@@ -1,5 +1,5 @@
 {
-  "_comment": "Deferred generation (B1): the budget runs out while a deferred statement is generated, on its first activation: the 2000-member table's own allocations take the analysis past the limit the config sets, which the rest of the program stays under. The solve stops right after generating it, before installing its constraints, and every method is kept, as eager generation decides (it goes over before solving). deferred_generation_matches_eager checks where the deferred solve stopped.",
+  "_comment": "Deferred generation (B1): the budget runs out while a deferred statement is generated, on its first activation, part way through its one initializer: the 2000-member table's own allocations take the analysis past the limit the config sets, which the rest of the program stays under. Generation checks the budget at each statement and expression (Gen::checkpoint) and stops inside the table; the solve then stops before installing any of it, and every method is kept, as eager generation decides (it goes over before solving). deferred_generation_matches_eager checks where generation stopped.",
   "config": {
     "experimental": {
       "effectServiceShaking": true,

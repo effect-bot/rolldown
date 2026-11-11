@@ -319,10 +319,24 @@ async fn deferred_generation_matches_eager() {
     );
     assert!(built.record.lines().any(|l| l.contains("references Context.getOrUndefinedUnsafe")));
   }
-  // Guard: the budget runs out generating a deferred statement.
+  // Guard: the budget runs out generating a deferred statement, part way through its one
+  // initializer: generation stops there and the rest of the table is not generated. Eager
+  // generation completes under the budget and the solve stops before its first step.
   let (_, eager, deferred) = find("deferred_generation_budget");
   assert_eq!(field(deferred, "budget_exceeded_generating"), "true");
   assert_eq!(field(eager, "budget_exceeded_generating"), "false");
+  assert_eq!(field(eager, "generation_stopped"), "");
+  assert_eq!(field(eager, "steps"), "0");
+  let lib = Path::new(FIXTURES).join("deferred_generation_budget/lib.js");
+  let source = std::fs::read_to_string(&lib).expect("the fixture's lib.js");
+  let first = source.find("entry0:").expect("the table's first member") as u64;
+  let last = source.find("entry1999:").expect("the table's last member") as u64;
+  let stopped = field(deferred, "generation_stopped");
+  eprintln!("deferred generation: the budget ran out generating {stopped}, table {first}..{last}");
+  let (module, at) = stopped.rsplit_once(':').expect("generation stopped part way");
+  assert!(module.ends_with("deferred_generation_budget/lib.js"), "stopped in {stopped}");
+  let at: u64 = at.parse().expect("an offset");
+  assert!(first < at && at < last, "generation should stop inside the table, at {at}");
   // Guard: both solves of a refinement generate on activation, each in a fresh analysis.
   let refined = records
     .iter()

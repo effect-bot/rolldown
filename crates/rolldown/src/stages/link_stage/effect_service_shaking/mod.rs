@@ -1113,6 +1113,11 @@ impl LinkStage<'_> {
       };
       a.solve_with(&mut generate);
     }
+    // Fail closed: a statement generated part way keeps everything.
+    assert!(
+      a.generation_stopped.is_none() || (a.budget_exceeded && a.bail_all),
+      "a solve whose generation stopped part way must keep every method"
+    );
     drop(deferred_modules);
     rounds.phases.lap(3);
     rounds.phases.moved(3, 8, generation);
@@ -1360,6 +1365,10 @@ impl LinkStage<'_> {
       deferred = rounds.deferred,
       generated = rounds.generated,
       budget_exceeded_generating = a.budget_exceeded_generating,
+      generation_stopped = a
+        .generation_stopped
+        .map(|s| format!("{}:{}", self.module_table.modules[s.module].id(), s.start))
+        .unwrap_or_default(),
       solve_ms = solved.as_millis(),
       active_ms = rounds.active.as_millis(),
       "effect service shaking"
