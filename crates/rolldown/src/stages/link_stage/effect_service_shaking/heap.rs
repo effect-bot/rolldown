@@ -5760,7 +5760,10 @@ impl Analysis {
       // A key is read through its `key` property (a hand-made `{ key: "..." }` works at run
       // time): a record, array or function names the keys its `key` field holds.
       ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Namespace => {
-        let key = self.field(obj, &ArcStr::from("key"));
+        let name = ArcStr::from("key");
+        // A namespace's `key` export is read: the statement declaring it runs (`lazy_exports`).
+        self.touch_namespace(obj, Some(&name));
+        let key = self.field(obj, &name);
         self.constrain(key, Constraint::KeyNameUse(use_.clone()));
       }
       ObjKind::Wrap(inner) => self.constrain(inner, Constraint::KeyUse(use_.clone())),
