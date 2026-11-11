@@ -2051,6 +2051,12 @@ impl Analysis {
 
   /// Checked on every turn of the solve loop, so the environment overrides are read once, in
   /// `new` (`EnvLimits`).
+  /// Sets the variable cap, for tests that run out of variables at a chosen point.
+  #[cfg(test)]
+  pub(super) fn set_var_cap(&mut self, vars: usize) {
+    self.env_limits.vars = vars;
+  }
+
   pub(super) fn over_budget(&self) -> bool {
     self.objs.len() > self.env_limits.objects
       || self.vars.len() > self.env_limits.vars

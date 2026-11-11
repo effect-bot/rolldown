@@ -304,7 +304,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     self.emit(Pending::Seed(var, obj));
   }
 
-  /// Checks the allocation budget before a statement or expression at `start` is generated.
+  /// Checks the allocation budget before a statement, expression or other child node at `start`
+  /// is generated: every loop over a node's children checks it, including the walks that never
+  /// enter an expression (parameters, binding and assignment patterns, class members).
   /// Once it has run out, generation stops for the rest of the solve: what was generated stays
   /// partial, and the solve ends at once keeping everything (`Analysis::solve_with`), so no
   /// partial body is ever pruned against.
@@ -670,7 +672,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       Statement::SwitchStatement(s) => {
         self.expr(&s.discriminant);
         for case in &s.cases {
-          if self.stopped {
+          if self.checkpoint(case.span.start) {
             break;
           }
           if let Some(t) = &case.test {
@@ -820,7 +822,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     match left {
       ForStatementLeft::VariableDeclaration(d) => {
         for decl in &d.declarations {
-          if self.stopped {
+          if self.checkpoint(decl.span.start) {
             break;
           }
           self.bind_pattern(&decl.id, value, decl_kind(d.kind));
@@ -860,7 +862,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   fn variable_declaration(&mut self, d: &VariableDeclaration<'_>) {
     let kind = decl_kind(d.kind);
     for decl in &d.declarations {
-      if self.stopped {
+      if self.checkpoint(decl.span.start) {
         break;
       }
       // A binding bound to a model rule keeps the rule and skips its initialiser.
@@ -893,7 +895,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
       BindingPattern::ObjectPattern(p) => {
         for prop in &p.properties {
-          if self.stopped {
+          if self.checkpoint(prop.span.start) {
             break;
           }
           let key = self.property_key(&prop.key, prop.computed);
@@ -910,7 +912,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let elem = self.fresh();
         self.constrain(src, Constraint::ElemOf(elem));
         for e in p.elements.iter().flatten() {
-          if self.stopped {
+          if self.checkpoint(e.span().start) {
             break;
           }
           self.bind_pattern(e, elem, kind);
@@ -1156,7 +1158,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let saved = self.tdz_until.replace(params.span.end);
     let mut vars = vec![];
     for p in &params.items {
-      if self.stopped {
+      if self.checkpoint(p.span.start) {
         break;
       }
       let v = self.fresh();
@@ -1275,6 +1277,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       );
     }
     for (reference, name, start, path) in refs.refs {
+      if self.checkpoint(start) {
+        break;
+      }
       let v = self.reference_parts(reference, &name, start);
       self.constrain(v, Constraint::ClassRef(class_obj, path));
     }
@@ -1311,7 +1316,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     self.class_stack.push(heritage);
     for element in &c.body.body {
-      if self.stopped {
+      if self.checkpoint(element.span().start) {
         break;
       }
       match element {
@@ -1519,6 +1524,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let symbols: Vec<SymbolRef> =
           self.m.scoping.symbol_ids().map(|s| (self.m.module, s).into()).collect();
         for sym in symbols {
+          if self.checkpoint(c.span.start) {
+            break;
+          }
           let v = self.symbol_var(sym);
           self.constrain(v, Constraint::Escape(Flavour::Host, None));
         }
@@ -1613,7 +1621,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let (obj, v) = self.alloc(ObjKind::Array, arr.span.start);
         let elem = self.a.elem(obj);
         for e in &arr.elements {
-          if self.stopped {
+          if self.checkpoint(e.span().start) {
             break;
           }
           match e {
@@ -1846,7 +1854,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let (obj, v) = self.alloc(ObjKind::Object, o.span.start);
     let mut props = vec![];
     for p in &o.properties {
-      if self.stopped {
+      if self.checkpoint(p.span().start) {
         break;
       }
       match p {
@@ -2050,7 +2058,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         let elem = self.fresh();
         self.constrain(value, Constraint::ElemOf(elem));
         for e in p.elements.iter().flatten() {
-          if self.stopped {
+          if self.checkpoint(e.span().start) {
             break;
           }
           self.assign_target_maybe_default(e, elem);
@@ -2064,7 +2072,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       }
       AssignmentTarget::ObjectAssignmentTarget(p) => {
         for prop in &p.properties {
-          if self.stopped {
+          if self.checkpoint(prop.span().start) {
             break;
           }
           match prop {
@@ -2258,5 +2266,147 @@ impl<'a> oxc::ast_visit::Visit<'a> for FreeRefs<'_> {
       }
     }
     oxc::ast_visit::walk::walk_computed_member_expression(self, it);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use oxc::allocator::Allocator;
+  use oxc::parser::Parser;
+  use oxc::semantic::{Scoping, SemanticBuilder};
+  use oxc::span::SourceType;
+  use oxc_index::IndexVec;
+  use rolldown_common::{ModuleIdx, SymbolRefDb, SymbolRefDbForModule};
+  use rustc_hash::{FxHashMap, FxHashSet};
+
+  use super::{Gen, ModuleFacts, Shared};
+  use crate::stages::link_stage::effect_service_shaking::heap::{Analysis, ObjKind};
+
+  fn scoping(allocator: &Allocator, source: &str) -> Scoping {
+    let program = Parser::new(allocator, source, SourceType::mjs()).parse().program;
+    SemanticBuilder::new().build(allocator.alloc(program)).semantic.into_scoping()
+  }
+
+  /// What generating a module's top level did when the variable cap was `headroom` variables
+  /// above what the analysis held when the walk began.
+  struct Walked {
+    /// Where generation stopped (its offset), if it did.
+    stopped: Option<u32>,
+    /// The names whose declarations were generated.
+    declared: FxHashSet<String>,
+    /// Closures allocated.
+    closures: usize,
+  }
+
+  /// Generates `source` as the only module, eagerly. `key` names a binding that counts as a
+  /// key constructor declared by an earlier statement, so a class extending it is generated
+  /// member by member (`Gen::class`) rather than as a hole.
+  fn walk(source: &str, headroom: usize, key: Option<&str>) -> Walked {
+    let module = ModuleIdx::from_raw_unchecked(0);
+    let allocator = Allocator::default();
+    let program =
+      allocator.alloc(Parser::new(&allocator, source, SourceType::mjs()).parse().program);
+    let scoping = SemanticBuilder::new().build(program).semantic.into_scoping();
+    let db_scoping = self::scoping(&allocator, source);
+    let root = db_scoping.root_scope_id();
+    let mut symbols = SymbolRefDb::new();
+    symbols.store_local_db(module, SymbolRefDbForModule::new(db_scoping, module, root));
+    let mut a = Analysis::new();
+    let [prim, top_host, top_ext, thrown] = std::array::from_fn(|_| a.var());
+    a.seed(prim, a.prim);
+    a.seed(top_host, a.top_host);
+    a.seed(top_ext, a.top_ext);
+    let mut sh = Shared {
+      symbols: &symbols,
+      symbol_vars: FxHashMap::default(),
+      namespace_syms: FxHashMap::default(),
+      namespace_objs: FxHashMap::default(),
+      rule_symbols: FxHashMap::default(),
+      externals: FxHashMap::default(),
+      globals: FxHashMap::default(),
+      literals: FxHashMap::default(),
+      decls: FxHashMap::default(),
+      thrown,
+      prim,
+      top_host,
+      top_ext,
+      module_fns: IndexVec::from_vec(vec![None]),
+      cjs_modules: FxHashSet::default(),
+      lazy_decls: FxHashMap::default(),
+      lazy_refs: vec![],
+      lazy_by_module: FxHashMap::default(),
+      resolve_global: |a, _, _| a.var(),
+      key_symbols: FxHashMap::default(),
+      statements: 1,
+      lazy_spans: vec![],
+      kept_eager: 0,
+      scan_time: std::time::Duration::ZERO,
+      key_ctor_symbols: FxHashSet::default(),
+      key_ctor_members: FxHashSet::default(),
+      hole_values: FxHashMap::default(),
+    };
+    let name_of = |name: &str| scoping.symbol_ids().find(|s| scoping.symbol_name(*s) == name);
+    if let Some(key) = key {
+      let sym = name_of(key).expect("the key binding");
+      sh.key_symbols.insert((module, sym).into(), 0);
+    }
+    let facts = ModuleFacts {
+      module,
+      scoping: &scoping,
+      external_imports: FxHashMap::default(),
+      cjs_imports: FxHashSet::default(),
+      dynamic_imports: FxHashMap::default(),
+      default_export: (module, scoping.symbol_ids().next().expect("a symbol")).into(),
+      lazy_stmts: FxHashMap::default(),
+    };
+    let mut g = Gen::new(&mut a, &mut sh, &facts);
+    let cap = g.a.vars.len() + headroom;
+    g.a.set_var_cap(cap);
+    g.program(program, false);
+    let declared = sh.decls.keys().map(|s| scoping.symbol_name(s.symbol).to_string()).collect();
+    let closures = a.objs.iter().filter(|o| matches!(o.kind, ObjKind::Closure(_))).count();
+    Walked { stopped: a.generation_stopped.map(|s| s.start), declared, closures }
+  }
+
+  /// `n` comma-separated names, `prefix0` to `prefix{n-1}`.
+  fn names(prefix: &str, n: usize) -> String {
+    (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>().join(", ")
+  }
+
+  /// Asserts that generation stopped part way through `source`, after `first` and before
+  /// `last` (both searched for in it).
+  fn stopped_between(walked: &Walked, source: &str, first: &str, last: &str) {
+    let first = u32::try_from(source.find(first).expect("first")).unwrap();
+    let last = u32::try_from(source.find(last).expect("last")).unwrap();
+    let at = walked.stopped.expect("generation stopped");
+    assert!(first < at && at < last, "stopped at {at}, not inside {first}..{last}");
+  }
+
+  /// Guard: walks that never enter an expression or a statement check the budget per child.
+  /// A parameter list, a destructuring pattern and a key class's members, none with an
+  /// expression in them, each take the analysis past a low variable cap: generation stops
+  /// inside them, and the later siblings are never generated. Under a cap they stay within,
+  /// they are generated whole.
+  #[test]
+  fn generation_stops_inside_expression_free_walks() {
+    let n = 300;
+    let params = format!("function wide({}) {{}}", names("p", n));
+    let pattern = format!("function wide({{ {} }}) {{}}", names("d", n));
+    let methods: Vec<String> = (0..n).map(|i| format!("m{i}() {{}}")).collect();
+    let class = format!("const K = 0;\nclass C extends K {{ {} }}", methods.join(" "));
+    for (source, prefix, key) in [(&params, "p", None), (&pattern, "d", None)] {
+      let whole = walk(source, 100_000, key);
+      assert_eq!(whole.stopped, None);
+      assert!(whole.declared.contains(&format!("{prefix}{}", n - 1)));
+      let walked = walk(source, 100, key);
+      stopped_between(&walked, source, &format!("{prefix}1,"), &format!("{prefix}{}", n - 1));
+      assert!(walked.declared.contains(&format!("{prefix}0")), "{source:.40}");
+      assert!(!walked.declared.contains(&format!("{prefix}{}", n - 1)), "{source:.40}");
+    }
+    let whole = walk(&class, 100_000, Some("K"));
+    assert_eq!((whole.stopped, whole.closures), (None, n));
+    let walked = walk(&class, 100, Some("K"));
+    stopped_between(&walked, &class, "m1()", &format!("m{}()", n - 1));
+    assert!(walked.closures > 0 && walked.closures < n / 2, "{} closures", walked.closures);
   }
 }
