@@ -57,6 +57,8 @@ struct Rounds {
   loaded: Option<LoadTime>,
   /// From the pass's start to the end of pruning, before the final drops.
   active: std::time::Duration,
+  /// The last solve's analysis, being freed on a thread of its own (`AnalysisDrop`).
+  analysis_drop: Option<AnalysisDrop>,
   /// Printing this report, which the complete time leaves out.
   printing: std::time::Duration,
   /// Deferred generation (implementation.md), over all solves: statements registered for it,
@@ -327,6 +329,48 @@ impl EffectDeclarations {
   }
 }
 
+/// The last solve's `Analysis`, freed on a thread of its own while the build goes on, and joined
+/// when this is dropped. `LinkStage::link` hands it to `Bundle::bundle_up`, which holds it until it
+/// returns, so the free ends inside the build on success, on error and when every method is kept,
+/// and never outlives the build's write. A solve whose result is discarded (a refinement round)
+/// frees its analysis in place, and so do targets without threads.
+pub struct AnalysisDrop {
+  #[cfg(not(target_family = "wasm"))]
+  handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AnalysisDrop {
+  fn spawn(a: Analysis) -> Option<Self> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+      // A failed spawn drops the closure, and with it `a`, here.
+      let handle = std::thread::Builder::new()
+        .name("effect-service-shaking-drop".to_string())
+        .spawn(move || drop(a))
+        .ok()?;
+      Some(Self { handle: Some(handle) })
+    }
+    #[cfg(target_family = "wasm")]
+    {
+      drop(a);
+      None
+    }
+  }
+}
+
+impl Drop for AnalysisDrop {
+  fn drop(&mut self) {
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(handle) = self.handle.take() {
+      if let Err(panic) = handle.join() {
+        if !std::thread::panicking() {
+          std::panic::resume_unwind(panic);
+        }
+      }
+    }
+  }
+}
+
 /// The phases of one solve, as the report's `phases` line names them.
 const PHASES: [&str; 9] = [
   "declarations",
@@ -411,9 +455,13 @@ impl LinkStage<'_> {
   }
 
   #[tracing::instrument(level = "debug", skip_all)]
-  pub(super) fn effect_service_shaking(&mut self, declarations: Option<EffectDeclarations>) {
+  /// Returns the last solve's analysis while it is freed (`AnalysisDrop`), for the caller to join.
+  pub(super) fn effect_service_shaking(
+    &mut self,
+    declarations: Option<EffectDeclarations>,
+  ) -> Option<AnalysisDrop> {
     if !self.options.experimental.is_effect_service_shaking_enabled() {
-      return;
+      return None;
     }
     let start = std::time::Instant::now();
     // Each solve that finds a service, a key or a provider in a module hole analyses those
@@ -438,6 +486,7 @@ impl LinkStage<'_> {
       eprintln!("[effect-service-shaking] time: {}", rounds.time_report(complete));
       eprintln!("[effect-service-shaking] {}", rounds.deferred_report());
     }
+    rounds.analysis_drop.take()
   }
 
   /// One solve with the module holes `module_holes` leaves after `analysed_holes`. Returns
@@ -1441,9 +1490,11 @@ impl LinkStage<'_> {
     // The report's own printing is neither a phase nor part of the complete time.
     rounds.printing += printing.elapsed();
     rounds.phases.start();
-    drop(a);
     drop(decls);
     drop(edits);
+    // The last solve's analysis is freed while the build goes on, and joined before the build
+    // returns (`AnalysisDrop`). Its free is then in no phase.
+    rounds.analysis_drop = AnalysisDrop::spawn(a);
     rounds.phases.lap(7);
     false
   }

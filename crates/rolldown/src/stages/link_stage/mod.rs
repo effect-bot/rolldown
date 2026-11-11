@@ -38,6 +38,7 @@ mod create_exports_for_ecma_modules;
 mod cross_module_optimization;
 mod determine_module_exports_kind;
 mod effect_service_shaking;
+pub use effect_service_shaking::AnalysisDrop;
 mod generate_lazy_export;
 mod patch_module_dependencies;
 mod reference_needed_symbols;
@@ -264,7 +265,11 @@ impl<'a> LinkStage<'a> {
   }
 
   #[tracing::instrument(level = "debug", skip_all)]
-  pub fn link(mut self) -> (LinkStageOutput, IndexEcmaAst, UsedSymbolRefsBuilder) {
+  /// The last element is the effect service shaking pass's analysis while it is freed: the caller
+  /// holds it until the build is done, and dropping it joins the free (`AnalysisDrop`).
+  pub fn link(
+    mut self,
+  ) -> (LinkStageOutput, IndexEcmaAst, UsedSymbolRefsBuilder, Option<AnalysisDrop>) {
     let effect_declarations = self.preload_effect_declarations();
     self.sort_modules();
     self.compute_tla();
@@ -280,7 +285,7 @@ impl<'a> LinkStage<'a> {
     // The passes above only relax statement flags. Module verdicts must follow before
     // `reference_needed_symbols` derives import flags from them.
     self.recompute_analyzed_side_effects();
-    self.effect_service_shaking(effect_declarations);
+    let analysis_drop = self.effect_service_shaking(effect_declarations);
     self.reference_needed_symbols();
     self.include_statements(&unreachable_import_expression_node_ids);
     self.check_lazy_barrel_uncertain_bindings();
@@ -319,6 +324,7 @@ impl<'a> LinkStage<'a> {
       },
       self.ast_table,
       self.used_symbol_refs_builder,
+      analysis_drop,
     )
   }
 
