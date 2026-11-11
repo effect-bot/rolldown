@@ -22,6 +22,8 @@ mod heap;
 mod host;
 mod prune;
 
+use std::cell::{OnceCell, RefCell};
+
 use arcstr::ArcStr;
 use oxc::ast::ast::{ClassElement, Expression, Statement};
 use oxc_index::IndexVec;
@@ -86,6 +88,7 @@ impl LinkStage<'_> {
       };
     }
     let mut a = Analysis::new();
+    let decls = Decls::default();
     if let Some(limit) = self.options.experimental.effect_service_shaking_widen {
       a.widen_limit = limit as usize;
     }
@@ -296,7 +299,7 @@ impl LinkStage<'_> {
     for (module, specs) in &public_modules {
       for (name, export) in &self.metas[*module].resolved_exports {
         if specs.iter().any(|(n, _)| *n == name.as_str()) {
-          for sym in self.alias_chain(export.symbol_ref) {
+          for sym in self.alias_chain(&decls, export.symbol_ref) {
             modelled.insert(sym.owner);
           }
         }
@@ -331,9 +334,9 @@ impl LinkStage<'_> {
             continue;
           };
           let key = self
-            .alias_chain(export.symbol_ref)
+            .alias_chain(&decls, export.symbol_ref)
             .into_iter()
-            .find_map(|sym| self.key_declaration_of(sym).map(|k| (k, sym.owner)));
+            .find_map(|sym| self.key_declaration_of(&decls, sym).map(|k| (k, sym.owner)));
           let Some(((Some(key_name), _), owner)) = key else { continue };
           if !is_effect_module(owner) {
             continue;
@@ -386,7 +389,7 @@ impl LinkStage<'_> {
       for (name, symbol) in exports {
         let spec =
           specs.and_then(|specs| specs.iter().find(|(n, _)| *n == name.as_str()).map(|(_, s)| *s));
-        let chain = self.alias_chain(symbol);
+        let chain = self.alias_chain(&decls, symbol);
         // Only declarations inside modelled modules take a model object: an export that aliases
         // ordinary code is that code (`export const x = internalRecord.x`).
         let generic_target = chain.iter().copied().find(|sym| !modelled.contains(&sym.owner));
@@ -395,7 +398,9 @@ impl LinkStage<'_> {
         let (obj, rank) = match spec {
           Some(spec) => (effect::spec_object(&mut a, spec), BindRank::Rule),
           None => {
-            match chain.iter().find_map(|sym| self.key_declaration_of(*sym).map(|k| (k, sym.owner)))
+            match chain
+              .iter()
+              .find_map(|sym| self.key_declaration_of(&decls, *sym).map(|k| (k, sym.owner)))
             {
               Some(((key_name, reference), owner)) => {
                 // A key declared inside type-modelled `effect` code: that code uses its service
@@ -445,12 +450,7 @@ impl LinkStage<'_> {
                 let callbacks = a.dts.callback_bounds(&dts, name.as_str()).map(|b| {
                   b.into_iter().map(|t| t.map(|t| a.intern_ty(t))).collect::<Vec<_>>()
                 });
-                let ignored: Vec<Vec<bool>> = (0..=4)
-                  .map(|n| {
-                    let b = a.dts.bounds(&dts, name.as_str(), n);
-                    b.params.iter().map(|t| t.as_ref().is_some_and(|t| t.ignored && t.prim_only())).collect()
-                  })
-                  .collect();
+                let ignored = a.dts.ignored_params(&dts, name.as_str(), 4);
                 if callbacks.is_none() && ignored.iter().all(|v| v.iter().all(|x| !x)) {
                   return None;
                 }
@@ -495,7 +495,7 @@ impl LinkStage<'_> {
       for (name, spec) in *specs {
         let Some(export) = self.metas[*module].resolved_exports.get(*name) else { continue };
         let obj = effect::spec_object(&mut a, *spec);
-        for sym in self.alias_chain(export.symbol_ref) {
+        for sym in self.alias_chain(&decls, export.symbol_ref) {
           if sym.owner == *module {
             sh.rule_symbols.insert(sym, obj);
           }
@@ -1144,7 +1144,7 @@ impl LinkStage<'_> {
   /// A public export and the declarations it aliases: `export const map = internal.map`
   /// binds the rule to `internal.map`'s declaration too, so a call that reaches the declaration
   /// another way (from a module analysed under the service-constructor exception) hits it.
-  fn alias_chain(&self, symbol: SymbolRef) -> Vec<SymbolRef> {
+  fn alias_chain(&self, decls: &Decls, symbol: SymbolRef) -> Vec<SymbolRef> {
     let mut chain = vec![];
     let mut current = self.symbols.canonical_ref_for(symbol);
     for _ in 0..8 {
@@ -1152,41 +1152,25 @@ impl LinkStage<'_> {
         break;
       }
       chain.push(current);
-      let Some(next) = self.alias_target(current) else { break };
+      let Some(next) = self.alias_target(decls, current) else { break };
       current = self.symbols.canonical_ref_for(next);
     }
     chain
   }
 
   /// Whether the symbol's top-level declaration creates a service key.
-  fn key_declaration_of(&self, symbol: SymbolRef) -> Option<(Option<String>, bool)> {
+  fn key_declaration_of(&self, decls: &Decls, symbol: SymbolRef) -> Option<(Option<String>, bool)> {
     let module = symbol.owner;
     let ast = self.ast_table[module].as_ref()?;
     let program = ast.program();
-    if let Some(init) = find_top_level_init(program, symbol.symbol) {
+    if let Some(init) = decls.init(program, module, symbol.symbol) {
       return effect::key_declaration(init);
     }
     // `class K extends Context.Service<..>()("key") {}`
-    for stmt in &program.body {
-      let class = match stmt {
-        Statement::ClassDeclaration(c) => c,
-        Statement::ExportDeclaration(e) => match &e.declaration {
-          oxc::ast::ast::Declaration::ClassDeclaration(c) => c,
-          _ => continue,
-        },
-        Statement::ExportDefaultDeclaration(d) => match &d.declaration {
-          oxc::ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => c,
-          _ => continue,
-        },
-        _ => continue,
-      };
-      if class.id.as_ref().and_then(|id| id.symbol_id.get()) == Some(symbol.symbol) {
-        let heritage = class.heritage.as_ref()?;
-        let _: &[ClassElement<'_>] = &class.body.body;
-        return effect::key_declaration(&heritage.expression);
-      }
-    }
-    None
+    let class = decls.class(program, module, symbol.symbol)?;
+    let heritage = class.heritage.as_ref()?;
+    let _: &[ClassElement<'_>] = &class.body.body;
+    effect::key_declaration(&heritage.expression)
   }
 
   /// The key an export holds through its chain of value aliases (`alias_chain`, which already
@@ -1235,12 +1219,12 @@ impl LinkStage<'_> {
   }
 
   /// The symbol a top-level `const x = y` or `const x = ns.y` declaration aliases.
-  fn alias_target(&self, symbol: SymbolRef) -> Option<SymbolRef> {
+  fn alias_target(&self, decls: &Decls, symbol: SymbolRef) -> Option<SymbolRef> {
     let module = symbol.owner;
     let Module::Normal(normal) = &self.module_table.modules[module] else { return None };
     let ast = self.ast_table[module].as_ref()?;
     let scoping = self.symbols[module].as_ref()?.scoping();
-    let init = find_top_level_init(ast.program(), symbol.symbol)?;
+    let init = decls.init(ast.program(), module, symbol.symbol)?;
     match init {
       Expression::Identifier(id) => {
         let reference = id.reference_id.get()?;
@@ -1253,14 +1237,19 @@ impl LinkStage<'_> {
         let target = scoping.get_reference(reference).symbol_id()?;
         let ns_symbol = self.symbols.canonical_ref_for((module, target).into());
         // A namespace import: find the module whose namespace symbol this is.
-        let ns_module = self.module_table.modules.iter().find_map(|m| match m {
-          Module::Normal(n)
-            if self.symbols.canonical_ref_for(n.ecma_view.namespace_object_ref) == ns_symbol =>
-          {
-            Some(n.idx)
-          }
-          _ => None,
-        })?;
+        let ns_module = *decls
+          .namespaces
+          .get_or_init(|| {
+            let mut by_symbol = FxHashMap::default();
+            for m in &self.module_table.modules {
+              if let Module::Normal(n) = m {
+                let ns = self.symbols.canonical_ref_for(n.ecma_view.namespace_object_ref);
+                by_symbol.entry(ns).or_insert(n.idx);
+              }
+            }
+            by_symbol
+          })
+          .get(&ns_symbol)?;
         let _ = normal;
         self.metas[ns_module]
           .resolved_exports
@@ -1318,28 +1307,102 @@ fn find_top_level_const_init<'a>(
   None
 }
 
-fn find_top_level_init<'a>(
-  program: &'a oxc::ast::ast::Program<'a>,
-  symbol: oxc::semantic::SymbolId,
-) -> Option<&'a Expression<'a>> {
-  for stmt in &program.body {
-    let decl = match stmt {
-      Statement::VariableDeclaration(d) => d,
-      Statement::ExportDeclaration(e) => match &e.declaration {
-        oxc::ast::ast::Declaration::VariableDeclaration(d) => d,
-        _ => continue,
-      },
-      _ => continue,
-    };
-    for declarator in &decl.declarations {
-      if let oxc::ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
-        if id.symbol_id.get() == Some(symbol) {
-          return declarator.init.as_ref();
+/// Top-level declarations by symbol, indexed per module on first use, and modules by their
+/// canonical namespace symbol. `alias_chain` and `key_declaration_of` ask about every export of
+/// a module, so scanning its body (or every module) for each would be quadratic.
+#[derive(Default)]
+struct Decls {
+  modules: RefCell<FxHashMap<ModuleIdx, ModuleDecls>>,
+  namespaces: OnceCell<FxHashMap<SymbolRef, ModuleIdx>>,
+}
+
+#[derive(Default)]
+struct ModuleDecls {
+  /// The first top-level `var`, `let` or `const` declarator binding the symbol, as (statement,
+  /// declarator).
+  vars: FxHashMap<oxc::semantic::SymbolId, (usize, usize)>,
+  /// The first top-level class declaration naming the symbol, by statement.
+  classes: FxHashMap<oxc::semantic::SymbolId, usize>,
+}
+
+impl Decls {
+  fn of<R>(
+    &self,
+    program: &oxc::ast::ast::Program<'_>,
+    module: ModuleIdx,
+    f: impl FnOnce(&ModuleDecls) -> R,
+  ) -> R {
+    let mut modules = self.modules.borrow_mut();
+    f(modules.entry(module).or_insert_with(|| {
+      let mut decls = ModuleDecls::default();
+      for (i, stmt) in program.body.iter().enumerate() {
+        if let Some(decl) = top_level_var(stmt) {
+          for (j, declarator) in decl.declarations.iter().enumerate() {
+            if let oxc::ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
+              if let Some(symbol) = id.symbol_id.get() {
+                decls.vars.entry(symbol).or_insert((i, j));
+              }
+            }
+          }
+        } else if let Some(symbol) =
+          top_level_class(stmt).and_then(|c| c.id.as_ref()).and_then(|id| id.symbol_id.get())
+        {
+          decls.classes.entry(symbol).or_insert(i);
         }
       }
-    }
+      decls
+    }))
   }
-  None
+
+  /// The initialiser of the symbol's top-level `var`, `let` or `const` declaration, if any.
+  fn init<'a>(
+    &self,
+    program: &'a oxc::ast::ast::Program<'a>,
+    module: ModuleIdx,
+    symbol: oxc::semantic::SymbolId,
+  ) -> Option<&'a Expression<'a>> {
+    let (i, j) = self.of(program, module, |d| d.vars.get(&symbol).copied())?;
+    top_level_var(&program.body[i])?.declarations[j].init.as_ref()
+  }
+
+  /// The symbol's top-level class declaration, if any.
+  fn class<'a>(
+    &self,
+    program: &'a oxc::ast::ast::Program<'a>,
+    module: ModuleIdx,
+    symbol: oxc::semantic::SymbolId,
+  ) -> Option<&'a oxc::ast::ast::Class<'a>> {
+    let i = self.of(program, module, |d| d.classes.get(&symbol).copied())?;
+    top_level_class(&program.body[i])
+  }
+}
+
+fn top_level_var<'a>(
+  stmt: &'a Statement<'a>,
+) -> Option<&'a oxc::ast::ast::VariableDeclaration<'a>> {
+  match stmt {
+    Statement::VariableDeclaration(d) => Some(d),
+    Statement::ExportDeclaration(e) => match &e.declaration {
+      oxc::ast::ast::Declaration::VariableDeclaration(d) => Some(d),
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+fn top_level_class<'a>(stmt: &'a Statement<'a>) -> Option<&'a oxc::ast::ast::Class<'a>> {
+  match stmt {
+    Statement::ClassDeclaration(c) => Some(c),
+    Statement::ExportDeclaration(e) => match &e.declaration {
+      oxc::ast::ast::Declaration::ClassDeclaration(c) => Some(c),
+      _ => None,
+    },
+    Statement::ExportDefaultDeclaration(d) => match &d.declaration {
+      oxc::ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => Some(c),
+      _ => None,
+    },
+    _ => None,
+  }
 }
 
 /// A function: its span start and parameter count.

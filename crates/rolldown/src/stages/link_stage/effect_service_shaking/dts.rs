@@ -14,6 +14,7 @@
 //! section 8.
 
 use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use append_only_vec::AppendOnlyVec;
@@ -25,7 +26,7 @@ use oxc::ast::ast::{
 };
 use oxc::parser::Parser;
 use oxc::span::SourceType;
-use rolldown_utils::rayon::{IntoParallelRefIterator, ParallelIterator};
+use rolldown_utils::rayon::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::FxHashMap;
 use self_cell::self_cell;
 use sugar_path::SugarPath;
@@ -211,7 +212,9 @@ struct Sig<'a> {
 #[derive(Default)]
 pub struct Dts {
   files: AppendOnlyVec<DtsFile>,
-  by_path: RefCell<FxHashMap<PathBuf, Option<usize>>>,
+  /// By the path's bytes: a `Path` key hashes and compares component by component, and every
+  /// file is stored under its normalized path anyway (`Dts::file`).
+  by_path: RefCell<FxHashMap<OsString, Option<usize>>>,
   /// Time spent parsing and resolving, for the debug report.
   pub resolve_ns: Cell<u128>,
   pub files_parsed: Cell<usize>,
@@ -1183,6 +1186,50 @@ impl Dts {
     out
   }
 
+  /// For each parameter count up to `max`, which parameters of the function exported as `name`
+  /// its `.d.ts` ignores with a primitive-only type (`unknown`, `any`): `bounds(path, name, n)`'s
+  /// parameters that are `ignored && prim_only()`, with each declared parameter classified once
+  /// rather than once per count.
+  pub fn ignored_params(&self, path: &Path, name: &str, max: usize) -> Vec<Vec<bool>> {
+    let start = std::time::Instant::now();
+    let sigs = self.signatures(path, name).unwrap_or_default();
+    let internal = path.components().any(|c| c.as_os_str() == "internal");
+    let mut classified: FxHashMap<(usize, usize), Ty> = FxHashMap::default();
+    let out = (0..=max)
+      .map(|nparams| {
+        if sigs.is_empty() || internal {
+          // No signature leaves every parameter open; `internal_open` reopens ignored ones.
+          return vec![false; nparams];
+        }
+        let same: Vec<usize> =
+          (0..sigs.len()).filter(|s| sigs[*s].params.len() == nparams).collect();
+        let matching: Vec<usize> = if same.is_empty() { (0..sigs.len()).collect() } else { same };
+        (0..nparams)
+          .map(|i| {
+            let mut acc: Option<Ty> = None;
+            for &s in &matching {
+              let sig = &sigs[s];
+              let t = match sig.params.get(i) {
+                Some((Some(t), false)) => classified
+                  .entry((s, i))
+                  .or_insert_with(|| self.classify(sig.file, t, &sig.tparams, 0))
+                  .clone(),
+                _ => Ty::open(),
+              };
+              match &mut acc {
+                Some(x) => x.join(t),
+                None => acc = Some(t),
+              }
+            }
+            acc.is_some_and(|t| !t.open && t.ignored && t.prim_only())
+          })
+          .collect()
+      })
+      .collect();
+    self.resolve_ns.set(self.resolve_ns.get() + start.elapsed().as_nanos());
+    out
+  }
+
   fn bounds_inner(&self, path: &Path, name: &str, nparams: usize) -> Bounds {
     let sigs = self.signatures(path, name).unwrap_or_default();
     self.bounds_of_sigs(&sigs, nparams)
@@ -1266,19 +1313,19 @@ impl Dts {
   }
 
   fn file(&self, path: &Path) -> Option<usize> {
-    if let Some(f) = self.by_path.borrow().get(path) {
+    if let Some(f) = self.by_path.borrow().get(path.as_os_str()) {
       return *f;
     }
     // Relative specifiers resolve lexically, so `dist/http/../Effect.d.ts` is `dist/Effect.d.ts`:
     // each file is parsed once, under its normalized path, whichever way it was reached.
     let normalized = path.normalize();
-    if normalized != path {
+    if normalized.as_os_str() != path.as_os_str() {
       let f = self.file(&normalized);
-      self.by_path.borrow_mut().insert(path.to_path_buf(), f);
+      self.by_path.borrow_mut().insert(path.as_os_str().to_owned(), f);
       return f;
     }
     let parsed = std::fs::read_to_string(path).ok().map(|source| self.add(parse(path, source)));
-    self.by_path.borrow_mut().insert(path.to_path_buf(), parsed);
+    self.by_path.borrow_mut().insert(path.as_os_str().to_owned(), parsed);
     parsed
   }
 
@@ -1293,6 +1340,8 @@ impl Dts {
   pub fn preload(&self, paths: &[PathBuf]) -> Vec<Read> {
     let reads: Vec<(PathBuf, Result<DtsFile, Read>)> = paths
       .par_iter()
+      // One task per file: a few large files (`Effect.d.ts`) take most of the time.
+      .with_max_len(1)
       .map(|path| {
         let path = path.normalize().into_owned();
         let read = if path.is_file() {
@@ -1309,9 +1358,9 @@ impl Dts {
       .into_iter()
       .map(|(path, read)| match read {
         Ok(file) => {
-          if !self.by_path.borrow().contains_key(&path) {
+          if !self.by_path.borrow().contains_key(path.as_os_str()) {
             let f = self.add(file);
-            self.by_path.borrow_mut().insert(path, Some(f));
+            self.by_path.borrow_mut().insert(path.into_os_string(), Some(f));
           }
           Read::Parsed
         }
