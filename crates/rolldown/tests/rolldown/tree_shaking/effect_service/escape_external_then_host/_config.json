@@ -1,0 +1,11 @@
+{
+  "_comment": "A lookup function handed first to an external module (`register`), then to a host builtin (`process.zzHost`) that calls it with a key name: the host escape after the external one must still hand the function any key name, so the method it calls stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./ext/reg.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

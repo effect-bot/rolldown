@@ -1,0 +1,10 @@
+{
+  "_comment": "A lookup function exported from the entry, then handed to a host builtin (`process.zzHost`) that calls it with a key name: the host escape after the export's must still hand the function any key name, so the method it calls stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

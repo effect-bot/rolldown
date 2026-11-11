@@ -1,0 +1,10 @@
+{
+  "_comment": "A service handed to a host builtin (`process.zzHost`, a member of `process`) and also exported from the entry: the host escape comes first, and the entry export's escape to code the pass can't see must still keep every method. The program calls one method and the test calls the other through the export.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

@@ -9203,6 +9203,147 @@ mod tests {
     assert_eq!(late_into_escaped(Escaped::Genuine, LateInput::SpreadThenValue), FOUND);
   }
 
+  /// The three escape obligations: to a host builtin, only into effect's code, and to code the
+  /// pass can't see (genuine).
+  #[derive(Clone, Copy, Debug, PartialEq)]
+  enum Obligation {
+    Host,
+    Effect,
+    Genuine,
+  }
+
+  impl Obligation {
+    /// Escapes `obj` under this obligation and drains the solve.
+    fn escape(self, a: &mut Analysis, obj: ObjId) {
+      match self {
+        Self::Host => a.escape(obj, Flavour::Host, None),
+        Self::Effect => a.escape(obj, Flavour::Ext, Some(EFFECT_ESCAPE)),
+        Self::Genuine => a.escape(obj, Flavour::Ext, None),
+      }
+      a.solve();
+    }
+
+    /// What the obligation hands a function's parameters (`escape_fn_with`).
+    fn top(self, a: &Analysis) -> ObjId {
+      match self {
+        Self::Host => a.top_host,
+        Self::Effect => a.top_effect,
+        Self::Genuine => a.top_ext,
+      }
+    }
+  }
+
+  /// A function of one parameter: its closure and the parameter.
+  fn one_param_fn(a: &mut Analysis) -> (ObjId, VarId) {
+    let vars = [a.var(), a.var(), a.var(), a.var(), a.var()];
+    let f = a.fns.push(FnInfo::new(ModuleIdx::from_raw_unchecked(0), 0, FnKind::Arrow, vars));
+    let closure = a.alloc(ObjKind::Closure(f), None);
+    a.fns[f].closure = Some(closure);
+    let param = a.var();
+    a.fns[f].params.push(param);
+    (closure, param)
+  }
+
+  /// A function escapes under `first`, the solve drains, then under `second`. Each obligation
+  /// runs once whatever came before: returns those whose arguments the parameter is missing,
+  /// and the escaped state stored, which is the strongest of the two.
+  fn obligations_in_order(first: Obligation, second: Obligation) -> (Vec<Obligation>, bool) {
+    let mut a = Analysis::new();
+    let (closure, param) = one_param_fn(&mut a);
+    first.escape(&mut a, closure);
+    second.escape(&mut a, closure);
+    let missing = [first, second].into_iter().filter(|o| !a.pts(param).contains(&o.top(&a)));
+    (missing.collect(), a.objs[closure].escaped == Some(Flavour::Ext))
+  }
+
+  #[test]
+  fn host_then_effect_escape_runs() {
+    assert_eq!(obligations_in_order(Obligation::Host, Obligation::Effect), (vec![], true));
+  }
+
+  #[test]
+  fn host_then_genuine_escape_runs() {
+    assert_eq!(obligations_in_order(Obligation::Host, Obligation::Genuine), (vec![], true));
+  }
+
+  #[test]
+  fn effect_then_host_escape_runs() {
+    assert_eq!(obligations_in_order(Obligation::Effect, Obligation::Host), (vec![], true));
+  }
+
+  /// Guard: green before the marks repair.
+  #[test]
+  fn effect_then_genuine_escape_runs() {
+    assert_eq!(obligations_in_order(Obligation::Effect, Obligation::Genuine), (vec![], true));
+  }
+
+  #[test]
+  fn genuine_then_host_escape_runs() {
+    assert_eq!(obligations_in_order(Obligation::Genuine, Obligation::Host), (vec![], true));
+  }
+
+  #[test]
+  fn genuine_then_effect_escape_runs() {
+    assert_eq!(obligations_in_order(Obligation::Genuine, Obligation::Effect), (vec![], true));
+  }
+
+  /// How a function arrives on an object after the object's escapes drained.
+  #[derive(Clone, Copy, Debug)]
+  enum Arrival {
+    Named,
+    Unknown,
+    Spread,
+  }
+
+  /// An object escapes to a host builtin, then into effect's code, each solve draining; then a
+  /// function arrives on it as `late` says. Returns the obligations whose arguments the
+  /// function's parameter is missing (`store_name`, `store_unknown`, `spread_into`).
+  fn late_after_two_marks(late: Arrival) -> Vec<Obligation> {
+    let mut a = Analysis::new();
+    let target = a.alloc(ObjKind::Object, None);
+    let marks = [Obligation::Host, Obligation::Effect];
+    for mark in marks {
+      mark.escape(&mut a, target);
+    }
+    let (closure, param) = one_param_fn(&mut a);
+    let [tv, src] = [0, 1].map(|_| a.var());
+    a.seed(tv, target);
+    match late {
+      Arrival::Named | Arrival::Unknown => {
+        let key = match late {
+          Arrival::Named => Key::Name(ArcStr::from("late")),
+          _ => Key::Unknown,
+        };
+        a.seed(src, closure);
+        a.constrain(tv, Constraint::Store { key, src });
+      }
+      Arrival::Spread => {
+        let source = a.alloc(ObjKind::Object, None);
+        let field = a.field(source, &ArcStr::from("late"));
+        a.seed(field, closure);
+        a.seed(src, source);
+        a.constrain(tv, Constraint::SpreadTarget(src));
+      }
+    }
+    a.solve();
+    marks.into_iter().filter(|m| !a.pts(param).contains(&m.top(&a))).collect()
+  }
+
+  #[test]
+  fn late_named_store_after_two_marks_escapes_under_each() {
+    assert_eq!(late_after_two_marks(Arrival::Named), vec![]);
+  }
+
+  #[test]
+  fn late_unknown_store_after_two_marks_escapes_under_each() {
+    assert_eq!(late_after_two_marks(Arrival::Unknown), vec![]);
+  }
+
+  #[test]
+  fn late_spread_after_two_marks_escapes_under_each() {
+    assert_eq!(late_after_two_marks(Arrival::Spread), vec![]);
+  }
+
   /// Guard: over the budget, replay and the named-load index stop (`replay_stopped`). A read,
   /// a late element, prototype or spread source adds no row, copy or constraint, and the solve
   /// stops keeping everything even after the totals come back under the cap, as widening may
