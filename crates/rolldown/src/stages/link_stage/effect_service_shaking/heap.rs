@@ -1054,6 +1054,13 @@ pub struct Analysis {
   widen_escaped: FxHashSet<ObjId>,
   pub widened_vars: usize,
   init_vars: usize,
+  /// The member `TypedReceiver` reads off a wrapped value or a string, by receiver and name,
+  /// shared by the call sites that read it (`receiver_member`).
+  receiver_members: FxHashMap<(ObjId, ArcStr), VarId>,
+  /// Test-only: a fresh member at every call site, the construction before `receiver_members`,
+  /// for comparing the two.
+  #[cfg(test)]
+  fresh_receiver_members: bool,
   /// Diagnostic: what created each variable (`var_tag` at the time).
   pub var_origin: Vec<&'static str>,
   pub var_tag: &'static str,
@@ -1343,6 +1350,9 @@ impl Analysis {
       unfollowed_class: None,
       widen_escaped: FxHashSet::default(),
       widened_vars: 0,
+      receiver_members: FxHashMap::default(),
+      #[cfg(test)]
+      fresh_receiver_members: false,
       init_vars,
       var_origin: vec!["init"; init_vars],
       var_tag: "gen",
@@ -2437,7 +2447,8 @@ impl Analysis {
           self.typed_arg(obj, *slot, *back, *site, 0, false, false);
         } else {
           let holder = self.holder(obj);
-          let member = self.var();
+          let member = self.receiver_member(obj, name);
+          // Already registered when the member is shared: the set dedupes it.
           self.constrain(holder, Constraint::Load { key: Key::Name(name.clone()), dst: member });
           self.constrain(member, Constraint::TypedReceiverIf(*callee, obj, *slot, *back, *site));
         }
@@ -2495,6 +2506,41 @@ impl Analysis {
         }
       }
     }
+  }
+
+  /// The variable a `TypedReceiver` site loads `recv.name` into, for its own
+  /// `TypedReceiverIf` check. A site on a wrapped value or a string shares it with the earlier
+  /// sites on the same receiver and name: the load there reads no state that changes during the
+  /// solve, so it subscribes a later site to exactly what a fresh load would. A wrap's load
+  /// copies the wrapped values, demands `name` of them and adds the wrap itself; a string's
+  /// seeds the interned `String.prototype` builtin or host data. Every other receiver gets a
+  /// fresh variable: an object's load reads its prototype only if it has one by then, a
+  /// namespace's activates a lazy export, an external's reads its fields as they are.
+  ///
+  /// A shared member equals a fresh one only while neither it nor the wrapped values have
+  /// widened: a widened variable drops what it held, and a fresh member would hold only what
+  /// remains. From then on a site gets a fresh member, which later sites share.
+  fn receiver_member(&mut self, recv: ObjId, name: &ArcStr) -> VarId {
+    #[cfg(test)]
+    if self.fresh_receiver_members {
+      return self.var();
+    }
+    let shareable = match self.objs[recv].kind {
+      ObjKind::Str(_) => true,
+      ObjKind::Wrap(inner) => !self.vars[inner].widened,
+      _ => false,
+    };
+    if !shareable {
+      return self.var();
+    }
+    if let Some(&member) = self.receiver_members.get(&(recv, name.clone())) {
+      if !self.vars[member].widened {
+        return member;
+      }
+    }
+    let member = self.var();
+    self.receiver_members.insert((recv, name.clone()), member);
+    member
   }
 
   /// A use of a stand-in (`StandIn`): one that only reads what the values it holds hold, or
@@ -7335,5 +7381,385 @@ mod tests {
       }
       assert_eq!(got, vec![false; 3], "big first: {big_first}");
     }
+  }
+
+  // == shared receiver members (`receiver_member`)
+  //
+  // Each case builds the same analysis twice, with a fresh member per call site (the
+  // construction before sharing, `fresh_receiver_members`) and with shared members, under the
+  // same events. It compares what every site's check did, by name rather than by variable:
+  // what reached each site's slot, which values escaped or crossed the widening boundary, what
+  // was demanded of them, and whether the budget stopped the solve.
+
+  /// The objects and variables a receiver case reads its outcome from.
+  #[derive(Default)]
+  struct Probe {
+    objs: Vec<(String, ObjId)>,
+    vars: Vec<(String, VarId)>,
+    slots: Vec<VarId>,
+  }
+
+  impl Probe {
+    fn label(&self, a: &Analysis, o: ObjId) -> String {
+      match self.objs.iter().find(|(_, x)| *x == o) {
+        Some((name, _)) => name.clone(),
+        None => {
+          format!("{:?}", a.objs[o].kind).split([' ', '(', '{']).next().unwrap_or("").to_string()
+        }
+      }
+    }
+
+    fn set(&self, a: &Analysis, v: VarId) -> Vec<String> {
+      let mut labels: Vec<String> = a.vars[v].pts.iter().map(|o| self.label(a, *o)).collect();
+      labels.sort();
+      labels
+    }
+
+    fn outcome(&self, a: &Analysis) -> Vec<String> {
+      let mut out = vec![format!("budget stop {}, bail {}", a.budget_exceeded, a.bail_all)];
+      for (i, slot) in self.slots.iter().enumerate() {
+        // What a site hands a wrapped value's contents to (`typed_arg`).
+        let slot_in: Vec<&str> = self
+          .vars
+          .iter()
+          .filter(|(_, v)| {
+            a.vars[*v]
+              .constraints
+              .iter()
+              .any(|c| matches!(c, Constraint::SlotIn(s, _) if s == slot))
+          })
+          .map(|(n, _)| n.as_str())
+          .collect();
+        out.push(format!(
+          "site {i}: slot {:?}, widened {}, slot-in from {slot_in:?}",
+          self.set(a, *slot),
+          a.vars[*slot].widened
+        ));
+      }
+      for (name, v) in &self.vars {
+        out.push(format!("{name}: {:?}, widened {}", self.set(a, *v), a.vars[*v].widened));
+      }
+      for (name, o) in &self.objs {
+        let obj = &a.objs[*o];
+        let demand = match &obj.demand {
+          Demand::None => String::new(),
+          Demand::All => "all".to_string(),
+          Demand::Names(names) => {
+            let mut names: Vec<&str> = names.iter().map(ArcStr::as_str).collect();
+            names.sort_unstable();
+            names.join(",")
+          }
+        };
+        out.push(format!(
+          "{name}: escaped {:?}, class {:?}, widen-escaped {}, demand [{demand}]",
+          obj.escaped,
+          a.class_escaped.get(o).map(|(_, how)| *how),
+          a.widen_escaped.contains(o)
+        ));
+      }
+      out
+    }
+  }
+
+  /// The variables that hold a `TypedReceiverIf` check: one per site, or per shared member.
+  fn members(a: &Analysis) -> usize {
+    a.vars
+      .iter()
+      .filter(|v| v.constraints.iter().any(|c| matches!(c, Constraint::TypedReceiverIf(..))))
+      .count()
+  }
+
+  fn site(i: usize) -> Site {
+    Site { module: ModuleIdx::from_raw_unchecked(0), start: 1 + u32::try_from(i).unwrap(), sub: 0 }
+  }
+
+  /// A callee summary: what `o.name(...)` calls in type-modelled `effect` code.
+  fn summary(a: &mut Analysis) -> ObjId {
+    let slot = a.var();
+    a.alloc(ObjKind::Typed { slot, export: NO_EXPORT }, None)
+  }
+
+  #[derive(Clone, Copy, Debug)]
+  enum Event {
+    /// Registers a site (`TypedReceiver`).
+    Site(usize),
+    /// The callee summary of sites 0, 2 and 3 arrives.
+    Callee,
+    /// Another value arrives (a filler, toward the widening limit).
+    Fill,
+    /// Excluded-kind cases: the receiver gets a prototype whose `map` holds the callee.
+    Proto,
+    /// The wrapped values widen before a shared member has caught up with them: the window
+    /// between a variable widening and its delta reaching the variables it copies into, in
+    /// which a site's `TypedReceiver` may be applied.
+    WidenWrapped,
+  }
+
+  /// A receiver case: the receiver kind and the sites on it, each `(callee, name)`. Callee 0
+  /// arrives with `Event::Callee`, callee 1 never does.
+  #[derive(Clone, Copy, Debug)]
+  enum Receiver {
+    Wrap,
+    Str,
+    Object,
+    Namespace,
+  }
+
+  const SITES: [(usize, &str); 4] = [(0, "map"), (1, "map"), (0, "map"), (0, "slice")];
+
+  /// Runs `events` (solving after each one, or once at the end) on a receiver of `kind`, with
+  /// the widening limit and entries budget given. Returns the outcome and the member count.
+  fn receiver_case(
+    kind: Receiver,
+    fresh: bool,
+    events: &[Event],
+    solve_each: bool,
+    limit: usize,
+    budget: Option<u64>,
+  ) -> (Vec<String>, usize) {
+    let mut a = Analysis::new();
+    a.fresh_receiver_members = fresh;
+    a.widen_limit = limit;
+    if let Some(budget) = budget {
+      a.max_entries = budget;
+    }
+    let mut p = Probe::default();
+    let callees = [summary(&mut a), summary(&mut a)];
+    p.objs.push(("callee0".into(), callees[0]));
+    p.objs.push(("callee1".into(), callees[1]));
+    let service = a.alloc(ObjKind::Object, None);
+    p.objs.push(("service".into(), service));
+    let fillers: Vec<ObjId> = (0..3).map(|_| a.alloc(ObjKind::Object, None)).collect();
+    for (i, f) in fillers.iter().enumerate() {
+      p.objs.push((format!("filler{i}"), *f));
+    }
+    // Where callee 0 and the fillers arrive: the wrapped values, or the receiver's own `map`.
+    let (recv_obj, arrivals) = match kind {
+      Receiver::Wrap => {
+        let inner = a.var();
+        a.seed(inner, service);
+        p.vars.push(("wrapped".into(), inner));
+        (a.alloc(ObjKind::Wrap(inner), None), Some(inner))
+      }
+      Receiver::Str => (a.str("receiver"), None),
+      Receiver::Object => {
+        let obj = a.alloc(ObjKind::Object, None);
+        let own = a.field(obj, &ArcStr::from("map"));
+        p.vars.push(("own map".into(), own));
+        (obj, Some(own))
+      }
+      Receiver::Namespace => {
+        let ns = a.alloc(ObjKind::Namespace, None);
+        // A lazy export: its body runs once `map` is read, and seeds `ran` with `service`.
+        let [this, ret, yielded_fail, yielded, args] = std::array::from_fn(|_| a.var());
+        let mut f = FnInfo::new(
+          ModuleIdx::from_raw_unchecked(0),
+          0,
+          FnKind::Normal,
+          [this, ret, yielded_fail, yielded, args],
+        );
+        let ran = a.var();
+        f.pending.push(Pending::Seed(ran, service));
+        let f = a.fns.push(f);
+        a.lazy_exports.insert((ns, ArcStr::from("map")), f);
+        p.vars.push(("lazy export ran".into(), ran));
+        (ns, None)
+      }
+    };
+    p.objs.push(("receiver".into(), recv_obj));
+    let recv = a.var();
+    a.seed(recv, recv_obj);
+    p.slots = SITES.iter().map(|_| a.var()).collect();
+    let backs: Vec<VarId> = SITES.iter().map(|_| a.var()).collect();
+    let mut filled = 0;
+    for event in events {
+      match *event {
+        Event::Site(i) => {
+          let (callee, name) = SITES[i];
+          let c = Constraint::TypedReceiver(
+            callees[callee],
+            ArcStr::from(name),
+            p.slots[i],
+            backs[i],
+            site(i),
+          );
+          a.constrain(recv, c);
+        }
+        Event::Callee => a.seed(arrivals.expect("a place to arrive"), callees[0]),
+        Event::Fill => {
+          a.seed(arrivals.expect("a place to arrive"), fillers[filled]);
+          filled += 1;
+        }
+        Event::WidenWrapped => {
+          let wrapped = arrivals.expect("wrapped values");
+          if !a.vars[wrapped].widened {
+            a.widen(wrapped);
+          }
+        }
+        Event::Proto => {
+          let proto = a.alloc(ObjKind::Object, None);
+          let map = a.field(proto, &ArcStr::from("map"));
+          a.seed(map, callees[0]);
+          let src = a.var();
+          a.seed(src, proto);
+          a.constrain(recv, Constraint::SetProto(src));
+        }
+      }
+      if solve_each {
+        a.solve();
+      }
+    }
+    a.solve();
+    (p.outcome(&a), members(&a))
+  }
+
+  /// Every order of `events` (distinct orders only).
+  fn orders(events: &[Event]) -> Vec<Vec<Event>> {
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut out = vec![];
+    let mut idx: Vec<usize> = (0..events.len()).collect();
+    permute(&mut idx, 0, &mut |order| {
+      let events: Vec<Event> = order.iter().map(|i| events[*i]).collect();
+      if seen.insert(format!("{events:?}")) {
+        out.push(events);
+      }
+    });
+    out
+  }
+
+  fn permute(idx: &mut Vec<usize>, k: usize, f: &mut impl FnMut(&[usize])) {
+    if k == idx.len() {
+      f(idx);
+      return;
+    }
+    for i in k..idx.len() {
+      idx.swap(k, i);
+      permute(idx, k + 1, f);
+      idx.swap(k, i);
+    }
+  }
+
+  /// Compares the two constructions over every order of `events`, solving after each event or
+  /// once, under each widening limit. Returns the mismatches and the member counts (fresh,
+  /// shared) summed over the runs.
+  fn compare(kind: Receiver, events: &[Event], limits: &[usize]) -> (Vec<String>, (usize, usize)) {
+    let mut wrong = vec![];
+    let mut counts = (0, 0);
+    for order in orders(events) {
+      for solve_each in [true, false] {
+        for &limit in limits {
+          let (old, old_members) = receiver_case(kind, true, &order, solve_each, limit, None);
+          let (new, new_members) = receiver_case(kind, false, &order, solve_each, limit, None);
+          counts.0 += old_members;
+          counts.1 += new_members;
+          if old != new && wrong.len() < 4 {
+            let diff: Vec<String> = old
+              .iter()
+              .zip(&new)
+              .filter(|(o, n)| o != n)
+              .map(|(o, n)| format!("fresh {o} / shared {n}"))
+              .collect();
+            wrong
+              .push(format!("{kind:?} {order:?} solve each {solve_each} limit {limit}: {diff:#?}"));
+          }
+        }
+      }
+    }
+    (wrong, counts)
+  }
+
+  const ALL_SITES: [Event; 4] = [Event::Site(0), Event::Site(1), Event::Site(2), Event::Site(3)];
+
+  /// Guard 1, late arrival and site isolation. Sites on one wrapped value, registered in every
+  /// order relative to each other and to the callee's arrival: each site's check acts for that
+  /// site alone. A site whose callee never arrives hands nothing over, two sites with the same
+  /// callee each hand the receiver to their own slot, and the shared construction does exactly
+  /// what fresh members did.
+  #[test]
+  fn shared_receiver_member_keeps_sites_apart() {
+    let mut events = ALL_SITES.to_vec();
+    events.push(Event::Callee);
+    let (wrong, (fresh, shared)) = compare(Receiver::Wrap, &events, &[400]);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(shared < fresh, "the members are shared: {shared} of {fresh}");
+    let (outcome, _) = receiver_case(Receiver::Wrap, false, &events, true, 400, None);
+    assert_eq!(
+      outcome[1..=4],
+      [
+        "site 0: slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
+        "site 1: slot [], widened false, slot-in from []",
+        "site 2: slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
+        "site 3: slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
+      ],
+    );
+    // A string's member holds the same builtin or host value for every site.
+    let (wrong, (fresh, shared)) = compare(Receiver::Str, &ALL_SITES, &[400]);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(shared < fresh, "the members are shared: {shared} of {fresh}");
+  }
+
+  /// Guard 1, excluded kinds. An object whose prototype arrives between sites, and a namespace
+  /// with a lazy export: the memo is not consulted (a member per site), and the outcome is the
+  /// fresh construction's.
+  #[test]
+  fn excluded_receivers_keep_fresh_members() {
+    let mut events = vec![Event::Site(0), Event::Site(1), Event::Site(2)];
+    events.extend([Event::Proto, Event::Fill]);
+    let (wrong, (fresh, shared)) = compare(Receiver::Object, &events, &[400]);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(fresh, shared, "a member per site");
+    let (wrong, (fresh, shared)) = compare(Receiver::Namespace, &ALL_SITES, &[400]);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(fresh, shared, "a member per site");
+  }
+
+  /// Guard 2, lookup effects. Reading `map` and `slice` off a wrapped value demands those
+  /// names of the values it wraps, whichever site reads first; an unread name is not demanded.
+  /// A namespace's lazy export runs on the first read, as before.
+  #[test]
+  fn shared_receiver_member_keeps_lookup_effects() {
+    for (events, demand) in [
+      (vec![Event::Site(0), Event::Site(2)], "[map]"),
+      (vec![Event::Site(2), Event::Site(3), Event::Site(0)], "[map,slice]"),
+    ] {
+      let (old, _) = receiver_case(Receiver::Wrap, true, &events, true, 400, None);
+      let (new, _) = receiver_case(Receiver::Wrap, false, &events, true, 400, None);
+      assert_eq!(old, new, "{events:?}");
+      let service = new.iter().find(|l| l.starts_with("service:")).unwrap();
+      assert!(service.ends_with(&format!("demand {demand}")), "{events:?}: {service}");
+    }
+    let (new, _) = receiver_case(Receiver::Namespace, false, &[Event::Site(1)], true, 400, None);
+    assert!(new.contains(&"lazy export ran: [\"service\"], widened false".to_string()), "{new:#?}");
+  }
+
+  /// Guard 3, the widening boundary. The callee and fillers arrive in every order around the
+  /// sites, with limits that widen the shared member, or the wrapped values themselves, before,
+  /// between and after the sites; and the wrapped values widen while a shared member still
+  /// holds what they held. Each site's check sees what it saw with a fresh member: a site that
+  /// comes after the member or the wrapped values widened gets a fresh one.
+  #[test]
+  fn shared_receiver_member_widens_as_fresh_members() {
+    let events =
+      [Event::Site(0), Event::Site(1), Event::Site(2), Event::Callee, Event::Fill, Event::Fill];
+    let (wrong, (fresh, shared)) = compare(Receiver::Wrap, &events, &[1, 2, 3, 4]);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(shared < fresh, "the members are shared: {shared} of {fresh}");
+    let events =
+      [Event::Site(0), Event::Site(1), Event::Site(2), Event::Callee, Event::WidenWrapped];
+    let (wrong, (fresh, shared)) = compare(Receiver::Wrap, &events, &[400]);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(shared < fresh, "the members are shared: {shared} of {fresh}");
+  }
+
+  /// Guard 3, the budget. A budget the analysis exceeds before any site stops both
+  /// constructions the same way: every method kept.
+  #[test]
+  fn shared_receiver_member_budget_stop() {
+    let mut events = ALL_SITES.to_vec();
+    events.push(Event::Callee);
+    let (old, _) = receiver_case(Receiver::Wrap, true, &events, true, 400, Some(1));
+    let (new, _) = receiver_case(Receiver::Wrap, false, &events, true, 400, Some(1));
+    assert_eq!(old, new);
+    assert_eq!(new[0], "budget stop true, bail true");
   }
 }
