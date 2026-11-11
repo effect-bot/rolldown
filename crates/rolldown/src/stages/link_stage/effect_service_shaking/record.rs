@@ -279,6 +279,14 @@ impl Names<'_> {
       ObjKind::Num(n) => format!("num {n}"),
       ObjKind::Builtin { rule, .. } => format!("builtin {}", a.rules[*rule as usize].0),
       ObjKind::External { name, .. } => format!("external {name}"),
+      // The analysis's own unknown values, each with its meaning.
+      ObjKind::Top(_) if o == a.top_ext => "Top ext".to_string(),
+      ObjKind::Top(_) if o == a.top_effect => "Top effect".to_string(),
+      ObjKind::Top(_) if o == a.top_host => "Top host".to_string(),
+      ObjKind::Top(_) => match a.prefixes.get(&o) {
+        Some(prefix) => format!("Top host {prefix:?}+"),
+        None => "Top".to_string(),
+      },
       ObjKind::Closure(f) if depth < MAX_DEPTH => format!("Closure {}", self.body(*f, depth + 1)),
       other => format!("{other:?}").split([' ', '(', '{']).next().unwrap_or("").to_string(),
     };

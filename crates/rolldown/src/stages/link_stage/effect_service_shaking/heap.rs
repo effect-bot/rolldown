@@ -1044,7 +1044,7 @@ pub struct Analysis {
   /// Strings known to start with a constant (`prefixed_host`): each is a host value of its own,
   /// so every rule reads it as host data, except a key's name, which names only the keys with
   /// that prefix. `prefix_lookups` are the lookups through such names, seen by keys named later.
-  prefixes: FxHashMap<ObjId, ArcStr>,
+  pub(super) prefixes: FxHashMap<ObjId, ArcStr>,
   prefix_hosts: FxHashMap<ArcStr, ObjId>,
   prefix_lookups: Vec<(ArcStr, VarId)>,
   /// The variables `admitted_values` filters into: they hold `top_effect` once something
