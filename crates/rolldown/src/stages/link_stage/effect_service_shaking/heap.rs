@@ -68,6 +68,10 @@ impl Site {
 
 pub type Rule = fn(&mut Analysis, &Call);
 
+/// `Analysis::clone_origins`: clone to (template, call site), clone site index to (template
+/// site, clone).
+pub type CloneOrigins = (FxHashMap<FnId, (FnId, Site)>, FxHashMap<u32, (Site, FnId)>);
+
 /// A row of the debug callback census: (module, site, mask) to (runs, largest slot).
 type CallbackRow = ((u32, u32, u8), (usize, usize));
 
@@ -1533,6 +1537,20 @@ impl Analysis {
       .filter(|((_, tag), _)| matches!(tag, 200 | 201 | 204))
       .map(|((site, _), o)| (*o, ObjId::from_usize(site.start as usize)))
       .collect()
+  }
+
+  /// For the decision record: each clone with its template and the call site it was made for
+  /// (`clone_for`'s key), and each clone-tagged site's index with the template's site and the
+  /// clone it belongs to.
+  pub fn clone_origins(&self) -> CloneOrigins {
+    let clones = self.clone_memo.iter().map(|((f, site), c)| (*c, (*f, *site))).collect();
+    let sites = self.clone_site_ids.iter().map(|((site, f), i)| (*i, (*site, *f))).collect();
+    (clones, sites)
+  }
+
+  /// The clone key shared by the calls of wrap callbacks (`clone_for`).
+  pub fn is_wrap_clone_site(site: Site) -> bool {
+    site == WRAP_CLONE_SITE
   }
 
   pub fn site_obj(

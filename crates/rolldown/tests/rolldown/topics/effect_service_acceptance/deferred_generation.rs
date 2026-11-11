@@ -1,20 +1,29 @@
 //! Deferred generation against eager generation (implementation.md, "Deferred
 //! generation"). Each program is built twice in this process, with
 //! `experimental.effectServiceShakingEagerGeneration` and without it; both
-//! builds must emit the same bundle and make the same decisions.
+//! builds must emit the same bundle and make the same decisions. Both builds
+//! run the same head, so this compares the two generation modes, not this head
+//! with an earlier one.
 //!
 //! The pass writes its decision record as a debug event (`record.rs`):
 //! bail reasons, keys, removals, widening, which lazy statements the solve
-//! activated, the literals that are removal candidates, and per body and per
-//! object the values that flowed and the escapes. Decision lines must match.
+//! activated, the literals and whether each is a key's value, and per body and
+//! per object the values that flowed and the escapes. Decision lines must
+//! match, counting repeats.
+//!
 //! Lines starting with `dormant` describe what generating a statement that
 //! never runs records (its literals, its class holes): eager generation has
 //! them for every such statement, deferred generation only for those it
-//! generates up front, so the deferred ones must be among the eager ones and no
-//! eager dormant literal may lose a property. Body flows and escapes are
-//! intermediate results: they depend on the order values arrive in, which
-//! deferred generation changes, and differ in a few programs even between two
-//! eager builds whose ids are shifted. They are printed, not required equal.
+//! generates up front. Each deferred dormant line must be among the eager ones
+//! (counting repeats), and every eager one must show it took part in nothing:
+//! no property removed, only variables linked to nothing hold it, it is no
+//! key's value, it has no demand and it did not escape.
+//!
+//! Body flows, key providers and escapes are supporting evidence. The record
+//! names objects by kind and site, so it is lossy (`record.rs`) and not an
+//! equivalence oracle. For the deferred-generation guards (`STRICT`) they must
+//! match line for line. Elsewhere a difference is printed and has to be
+//! explained (implementation.md lists the known ones).
 
 use std::path::{Path, PathBuf};
 
@@ -86,6 +95,7 @@ fn split(record: &str) -> (Vec<&str>, Vec<String>, Vec<&str>) {
     } else if line.starts_with("body ")
       || line.starts_with("escaped ")
       || line.starts_with("class escaped ")
+      || line.starts_with("provider ")
     {
       head = line;
       intermediate.push(line.to_string());
@@ -95,6 +105,27 @@ fn split(record: &str) -> (Vec<&str>, Vec<String>, Vec<&str>) {
     }
   }
   (decisions, intermediate, dormant)
+}
+
+/// The lines only `a` has and those only `b` has, counting repeats.
+fn difference<'l, L: AsRef<str>>(a: &'l [L], b: &'l [L]) -> (Vec<&'l str>, Vec<&'l str>) {
+  let mut counts: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+  for l in a {
+    *counts.entry(l.as_ref()).or_default() += 1;
+  }
+  for l in b {
+    *counts.entry(l.as_ref()).or_default() -= 1;
+  }
+  let (mut only_a, mut only_b) = (vec![], vec![]);
+  for (l, n) in counts {
+    for _ in 0..n.max(0) {
+      only_a.push(l);
+    }
+    for _ in 0..(-n).max(0) {
+      only_b.push(l);
+    }
+  }
+  (only_a, only_b)
 }
 
 fn field<'a>(built: &'a Built, name: &str) -> &'a str {
@@ -143,6 +174,14 @@ fn program_options(dir: &Path) -> BundlerOptions {
     ..Default::default()
   }
 }
+
+/// The guards whose flows and escapes must match too, line for line.
+const STRICT: [&str; 4] = [
+  "deferred_activation_paths",
+  "deferred_dormant_eager_facts",
+  "deferred_dormant_unsafe_lookup",
+  "deferred_late_arrivals",
+];
 
 /// The acceptance programs, the deferred-generation guard fixtures and the
 /// fixtures that refine module or class holes; every `tree_shaking/effect_service`
@@ -198,29 +237,49 @@ async fn deferred_generation_matches_eager() {
     }
     let (eager_decisions, eager_rest, eager_dormant) = split(&eager.record);
     let (deferred_decisions, deferred_rest, deferred_dormant) = split(&deferred.record);
-    if eager_decisions != deferred_decisions {
-      let only = |a: &[&str], b: &[&str]| -> Vec<String> {
-        a.iter().filter(|l| !b.contains(l)).take(4).map(|l| (*l).to_string()).collect()
-      };
+    if let Some(dir) = std::env::var_os("ROLLDOWN_TEST_DEFERRED_GENERATION_DUMP") {
+      let dir = PathBuf::from(dir);
+      std::fs::create_dir_all(&dir).expect("the dump directory");
+      std::fs::write(dir.join(format!("{name}.eager")), &eager.record).expect("dump");
+      std::fs::write(dir.join(format!("{name}.deferred")), &deferred.record).expect("dump");
+    }
+    let (eager_only, deferred_only) = difference(&eager_decisions, &deferred_decisions);
+    if !eager_only.is_empty() || !deferred_only.is_empty() {
       failures.push(format!(
         "{name}: the decisions differ; eager only {:?}, deferred only {:?}",
-        only(&eager_decisions, &deferred_decisions),
-        only(&deferred_decisions, &eager_decisions)
+        &eager_only[..eager_only.len().min(4)],
+        &deferred_only[..deferred_only.len().min(4)]
       ));
     }
-    for line in &deferred_dormant {
-      if !eager_dormant.contains(line) {
-        failures.push(format!("{name}: deferred generation records {line:?}, eager does not"));
+    // Deferred generation records a dormant fact only for a statement it generates up front.
+    let (_, deferred_only) = difference(&eager_dormant, &deferred_dormant);
+    for line in deferred_only {
+      failures.push(format!("{name}: deferred generation records {line:?}, eager does not"));
+    }
+    // What eager generation makes for a statement no solve reaches takes part in nothing: only
+    // variables linked to nothing hold it (`record.rs`), it is no key's value, has no demand
+    // and did not escape.
+    for line in &eager_dormant {
+      let inert = if line.starts_with("dormant literal ") {
+        line.contains(" removed=0 ")
+          && line.ends_with(" linked=0 candidate=false demand=none escaped=false")
+      } else {
+        line.contains(" linked=0 x")
+      };
+      if !inert {
+        failures.push(format!("{name}: a dormant fact takes part: {line}"));
       }
     }
-    for line in eager_dormant.iter().filter(|l| l.starts_with("dormant literal")) {
-      if !line.ends_with(" removed=0") {
-        failures.push(format!("{name}: a literal no solve reaches loses a property: {line}"));
-      }
-    }
-    let differing = eager_rest.iter().filter(|l| !deferred_rest.contains(l)).count()
-      + deferred_rest.iter().filter(|l| !eager_rest.contains(l)).count();
+    let (eager_only, deferred_only) = difference(&eager_rest, &deferred_rest);
+    let differing = eager_only.len() + deferred_only.len();
     if differing > 0 {
+      if STRICT.contains(&name.as_str()) {
+        failures.push(format!(
+          "{name}: flows or escapes differ; eager only {:?}, deferred only {:?}",
+          &eager_only[..eager_only.len().min(4)],
+          &deferred_only[..deferred_only.len().min(4)]
+        ));
+      }
       intermediate.push(format!("{name} ({differing} lines)"));
     }
     if field(&deferred, "generated").parse::<usize>().unwrap_or(0)
