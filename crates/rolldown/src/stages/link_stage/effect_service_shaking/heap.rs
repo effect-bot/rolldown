@@ -14,6 +14,7 @@ use arcstr::ArcStr;
 use oxc_index::IndexVec;
 use rolldown_common::ModuleIdx;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::rc::Rc;
 
 oxc_index::define_index_type! {
   pub struct VarId = u32;
@@ -387,7 +388,7 @@ pub enum Constraint {
     base: VarId,
     src: VarId,
   },
-  Call(Box<Call>),
+  Call(Rc<Call>),
   SuccessOf(VarId),
   FailureOf(VarId),
   KeyUse(KeyUse),
@@ -495,7 +496,7 @@ pub enum Constraint {
   /// A protocol method call (`protocol_call`) with the type model on: a summary found under a
   /// protocol name is effect code run with the receiver as `this`, so the receiver goes to
   /// unseen code instead of the summary being called; anything else is called.
-  ProtocolCall(Box<Call>),
+  ProtocolCall(Rc<Call>),
   /// What a callback handed to type-modelled code returns (`typed_callback`): it goes to unseen
   /// code, and so does what an Effect or promise among it succeeds with.
   EscapeOut,
@@ -564,7 +565,7 @@ impl Constraint {
       C::Store { key, src } => C::Store { key: key.remap(v), src: v(*src) },
       C::LoadThrough { base, dst } => C::LoadThrough { base: v(*base), dst: v(*dst) },
       C::StoreThrough { base, src } => C::StoreThrough { base: v(*base), src: v(*src) },
-      C::Call(call) => C::Call(Box::new(Call {
+      C::Call(call) => C::Call(Rc::new(Call {
         site: s(call.site),
         this: call.this.map(v),
         args: call
@@ -618,7 +619,7 @@ impl Constraint {
       C::TypedNested(slot, back, site, mask) => C::TypedNested(v(*slot), v(*back), *site, *mask),
       C::EscapeOut => C::EscapeOut,
       C::EscapeHeld => C::EscapeHeld,
-      C::ProtocolCall(call) => match C::Call(call.clone()).remap(v, s) {
+      C::ProtocolCall(call) => match C::Call(Rc::clone(call)).remap(v, s) {
         C::Call(c) => C::ProtocolCall(c),
         _ => unreachable!(),
       },
@@ -3291,7 +3292,7 @@ impl Analysis {
           is_new: true,
           builtin: None,
         };
-        self.constrain(h, Constraint::Call(Box::new(parent_call)));
+        self.constrain(h, Constraint::Call(Rc::new(parent_call)));
       }
       (None, None) => {}
     }
@@ -5070,7 +5071,7 @@ impl Analysis {
     let args =
       (0..4).map(|j| Arg::Var(if mask & (1 << j) != 0 { slot } else { unknown })).collect();
     let call = Call { site: call_site, this: None, args, ret, is_new: false, builtin: None };
-    self.constrain(callee, Constraint::Call(Box::new(call)));
+    self.constrain(callee, Constraint::Call(Rc::new(call)));
     self.constrain(ret, Constraint::TypedArg(slot, back, site, 0xFF, false, false));
   }
 
@@ -5579,7 +5580,7 @@ impl Analysis {
           is_new: false,
           builtin: None,
         };
-        self.constrain(cb, Constraint::Call(Box::new(call)));
+        self.constrain(cb, Constraint::Call(Rc::new(call)));
         self.wrap_callbacks.insert(w, cb);
         w
       }
@@ -6071,7 +6072,7 @@ impl Analysis {
       is_new: false,
       builtin: None,
     };
-    self.constrain(method, Constraint::ProtocolCall(Box::new(call)));
+    self.constrain(method, Constraint::ProtocolCall(Rc::new(call)));
     method
   }
 

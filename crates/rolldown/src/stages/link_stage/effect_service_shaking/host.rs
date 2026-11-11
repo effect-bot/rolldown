@@ -6,6 +6,7 @@
 
 use arcstr::ArcStr;
 use rustc_hash::FxHashMap;
+use std::rc::Rc;
 
 use super::heap::{
   Analysis, Arg, Call, Constraint, Flavour, Key, ObjId, ObjKind, Protocol, Site, VarId,
@@ -140,7 +141,7 @@ pub fn invoke(
     is_new: false,
     builtin: None,
   };
-  a.constrain(callee, Constraint::Call(Box::new(call)));
+  a.constrain(callee, Constraint::Call(Rc::new(call)));
   ret
 }
 
@@ -153,7 +154,7 @@ pub fn invoke_args(
 ) -> VarId {
   let ret = a.var();
   let call = Call { site: site.sub(callee), this, args, ret, is_new: false, builtin: None };
-  a.constrain(callee, Constraint::Call(Box::new(call)));
+  a.constrain(callee, Constraint::Call(Rc::new(call)));
   ret
 }
 
@@ -453,7 +454,7 @@ pub fn register(a: &mut Analysis) {
       is_new: true,
       builtin: None,
     };
-    a.constrain(f, Constraint::Call(Box::new(call)));
+    a.constrain(f, Constraint::Call(Rc::new(call)));
     a.copy(ret, c.ret);
   });
   a.rule("Reflect.deleteProperty", |a, c| a.seed(c.ret, a.prim));

@@ -23,6 +23,7 @@ use oxc::syntax::operator::{AssignmentOperator, BinaryOperator};
 use oxc_index::IndexVec;
 use rolldown_common::{ModuleIdx, SymbolRef, SymbolRefDb};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::rc::Rc;
 
 use super::heap::{
   Accessor, Analysis, Arg, Call, Constraint, Flavour, FnId, FnInfo, FnKind, Key, ObjId, ObjKind,
@@ -1241,7 +1242,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     // Nested calls (`Context.Service()("key")`) share a start: the end tells them apart.
     let site = Site { module: self.m.module, start: span.start, sub: span.end | 0x8000_0000 };
     let call = Call { site, this, args, ret, is_new, builtin: None };
-    self.constrain(callee, Constraint::Call(Box::new(call)));
+    self.constrain(callee, Constraint::Call(Rc::new(call)));
     ret
   }
 
