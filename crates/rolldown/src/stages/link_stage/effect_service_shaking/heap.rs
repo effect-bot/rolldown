@@ -6526,6 +6526,11 @@ impl Analysis {
           for class in self.crossed_classes(target) {
             self.constrain(holder, Constraint::ClassEscape(class, CLASS_STORED));
           }
+          // And one spread into it after it escaped escapes too, as a value stored on it does.
+          if let Some(Flavour::Ext) = self.objs[target].escaped {
+            let site = (!self.genuine_escaped.contains(&target)).then_some(EFFECT_ESCAPE);
+            self.constrain(holder, Constraint::Escape(Flavour::Ext, site));
+          }
         }
         if !self.objs[obj].spread_into.contains(&target) {
           self.objs[obj].spread_into.push(target);
