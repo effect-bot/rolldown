@@ -50,6 +50,48 @@ struct Rounds {
   /// The declarations the link stage started loading, for the first solve.
   declarations: Option<EffectDeclarations>,
   phases: Phases,
+  /// How the declarations were loaded, for the report.
+  loaded: Option<LoadTime>,
+  /// From the pass's start to the end of pruning, before the final drops.
+  active: std::time::Duration,
+  /// Printing this report, which the complete time leaves out.
+  printing: std::time::Duration,
+}
+
+/// The time loading the declarations took.
+#[derive(Clone, Copy)]
+struct LoadTime {
+  /// Reading and parsing them, on the rayon pool or in the pass.
+  work: std::time::Duration,
+  /// How long the pass waited for them: all of `work` when it loaded them itself.
+  wait: std::time::Duration,
+  preloaded: bool,
+}
+
+impl Rounds {
+  /// The pass's time, without its report's printing: `complete` runs from the pass's start to
+  /// its return, `active` to the end of pruning in the last solve, and `cleanup` is the rest
+  /// (the final drops, then the pass's other state). The phases cover only part of it.
+  fn time_report(&self, complete: std::time::Duration) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let phases: std::time::Duration = self.phases.spent.iter().sum();
+    let loaded = match self.loaded {
+      Some(t) if t.preloaded => format!(
+        "declarations preloaded on the rayon pool in {:.1} ms (the load's own wall time, started with the link stage), the pass waiting {:.1} ms for it",
+        ms(t.work),
+        ms(t.wait)
+      ),
+      Some(t) => format!("declarations loaded in the pass in {:.1} ms", ms(t.work)),
+      None => "declarations not loaded".to_string(),
+    };
+    format!(
+      "complete {:.1} ms = active {:.1} ms + cleanup {:.1} ms; the phases cover {:.1} ms of it; {loaded}",
+      ms(complete),
+      ms(self.active),
+      ms(complete.saturating_sub(self.active)),
+      ms(phases)
+    )
+  }
 }
 
 /// Whether a module is one of the `effect` package's.
@@ -91,7 +133,8 @@ struct Preload {
   /// Set when the pass ends without the files: the load stops starting new ones.
   cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
   /// Taken once the result is received.
-  receiver: Option<std::sync::mpsc::Receiver<std::thread::Result<dts::Loaded>>>,
+  receiver:
+    Option<std::sync::mpsc::Receiver<(std::thread::Result<dts::Loaded>, std::time::Duration)>>,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -106,18 +149,20 @@ impl Preload {
     let (sender, receiver) = std::sync::mpsc::channel();
     let flag = std::sync::Arc::clone(&cancel);
     rayon::spawn(move || {
+      let began = std::time::Instant::now();
       let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&paths, &flag)));
       // Only fails if the receiver is gone, which `Drop` rules out until this is sent.
-      let _ = sender.send(loaded);
+      let _ = sender.send((loaded, began.elapsed()));
     });
     Self { cancel, receiver: Some(receiver) }
   }
 
-  /// Waits for the files. `None` if the load ended without sending them.
-  fn wait(&mut self) -> Option<dts::Loaded> {
+  /// Waits for the files, with the time the load took. `None` if it ended without sending
+  /// them.
+  fn wait(&mut self) -> Option<(dts::Loaded, std::time::Duration)> {
     match self.receiver.take()?.recv() {
-      Ok(Ok(loaded)) => Some(loaded),
-      Ok(Err(panic)) => std::panic::resume_unwind(panic),
+      Ok((Ok(loaded), work)) => Some((loaded, work)),
+      Ok((Err(panic), _)) => std::panic::resume_unwind(panic),
       Err(_) => None,
     }
   }
@@ -157,13 +202,24 @@ impl EffectDeclarations {
   /// Hands the parsed files to `dts` in the order of `order` (the pass's execution order, as
   /// files are numbered as they are added) and returns what was found for each module's
   /// `.d.ts`. They were started in the module table's order, which varies between builds.
-  fn adopt(self, dts: &dts::Dts, order: &[ModuleIdx]) -> FxHashMap<ModuleIdx, dts::Read> {
-    let loaded = match self.loading {
+  fn adopt(
+    self,
+    dts: &dts::Dts,
+    order: &[ModuleIdx],
+  ) -> (FxHashMap<ModuleIdx, dts::Read>, LoadTime) {
+    let began = std::time::Instant::now();
+    let in_pass = |modules: &[(ModuleIdx, Option<std::path::PathBuf>)]| {
+      let loaded = load_now(&paths_of(modules));
+      let work = began.elapsed();
+      (loaded, LoadTime { work, wait: work, preloaded: false })
+    };
+    let (loaded, time) = match self.loading {
       #[cfg(not(target_family = "wasm"))]
-      Loading::Started(mut preload) => {
-        preload.wait().unwrap_or_else(|| load_now(&paths_of(&self.modules)))
-      }
-      Loading::Deferred => load_now(&paths_of(&self.modules)),
+      Loading::Started(mut preload) => match preload.wait() {
+        Some((loaded, work)) => (loaded, LoadTime { work, wait: began.elapsed(), preloaded: true }),
+        None => in_pass(&self.modules),
+      },
+      Loading::Deferred => in_pass(&self.modules),
     };
     let position: FxHashMap<ModuleIdx, usize> = self
       .modules
@@ -175,7 +231,7 @@ impl EffectDeclarations {
     let ordered: Vec<ModuleIdx> =
       order.iter().copied().filter(|m| position.contains_key(m)).collect();
     let loaded = loaded.ordered(ordered.iter().map(|m| position[m]));
-    ordered.into_iter().zip(dts.adopt(loaded)).collect()
+    (ordered.into_iter().zip(dts.adopt(loaded)).collect(), time)
   }
 }
 
@@ -258,6 +314,22 @@ impl LinkStage<'_> {
     let mut analysed_holes: FxHashSet<ModuleIdx> = FxHashSet::default();
     let mut rounds = Rounds { declarations, ..Rounds::default() };
     while self.effect_service_shaking_with(start, &mut analysed_holes, &mut rounds) {}
+    // The last solve dropped its state before returning. What the solves shared goes here: the
+    // parsed declarations, and a preload no solve adopted (its `Drop` ends the load).
+    drop(rounds.dts.take());
+    drop(rounds.declarations.take());
+    let complete = start.elapsed().saturating_sub(rounds.printing);
+    #[expect(clippy::print_stderr, reason = "opt-in report for measuring the experimental pass")]
+    if rounds.count > 0 && std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some() {
+      let per_solve: Vec<String> =
+        rounds.per_solve.iter().map(|(e, s)| format!("{e} entries / {s} steps")).collect();
+      eprintln!(
+        "[effect-service-shaking] each solve: [{}]; phases over all solves: {}",
+        per_solve.join(", "),
+        rounds.phases.report()
+      );
+      eprintln!("[effect-service-shaking] time: {}", rounds.time_report(complete));
+    }
   }
 
   /// One solve with the module holes `module_holes` leaves after `analysed_holes`. Returns
@@ -453,7 +525,10 @@ impl LinkStage<'_> {
       let effect_modules: Vec<&Module> =
         order.iter().map(|m| &self.module_table.modules[*m]).filter(|m| is_effect(m)).collect();
       let started = rounds.declarations.take();
-      started.unwrap_or_else(|| EffectDeclarations::new(&effect_modules)).adopt(&a.dts, &order)
+      let started = started.unwrap_or_else(|| EffectDeclarations::new(&effect_modules));
+      let (reads, time) = started.adopt(&a.dts, &order);
+      rounds.loaded = Some(time);
+      reads
     } else {
       FxHashMap::default()
     };
@@ -1110,6 +1185,7 @@ impl LinkStage<'_> {
     }
     rounds.phases.lap(6);
 
+    rounds.active = start.elapsed();
     let total_removed = report.removed.len();
     tracing::debug!(
       vars = a.vars.len(),
@@ -1117,22 +1193,23 @@ impl LinkStage<'_> {
       steps = a.steps,
       removed = total_removed,
       solve_ms = solved.as_millis(),
-      total_ms = start.elapsed().as_millis(),
+      active_ms = rounds.active.as_millis(),
       "effect service shaking"
     );
+    let printing = std::time::Instant::now();
     #[expect(clippy::print_stderr, reason = "opt-in report for measuring the experimental pass")]
     if std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_REPORT").is_some() {
       eprintln!(
-        "[effect-service-shaking] {} vars, {} objects, {} entries, {} steps, solve {} ms, total {} ms",
+        "[effect-service-shaking] {} vars, {} objects, {} entries, {} steps, solve {} ms, active {} ms",
         a.vars.len(),
         a.objs.len(),
         a.total_pts + a.total_copies,
         a.steps,
         solved.as_millis(),
-        start.elapsed().as_millis()
+        rounds.active.as_millis()
       );
       eprintln!(
-        "[effect-service-shaking] solves: {} (the line above is the last; vars, objects, entries and steps are its own, solve and total ms run from the first); all solves: {} entries, {} steps, {} ms solving",
+        "[effect-service-shaking] solves: {} (the line above is the last; vars, objects, entries and steps are its own, solve and active ms run from the first); all solves: {} entries, {} steps, {} ms solving",
         rounds.count,
         rounds.entries,
         rounds.steps,
@@ -1171,21 +1248,13 @@ impl LinkStage<'_> {
         eprintln!("[effect-service-shaking] removed {name} at {module}:{start}");
       }
     }
-    // The report's own printing is not a phase.
+    // The report's own printing is neither a phase nor part of the complete time.
+    rounds.printing += printing.elapsed();
     rounds.phases.start();
     drop(a);
     drop(decls);
     drop(edits);
     rounds.phases.lap(7);
-    if report_enabled {
-      let per_solve: Vec<String> =
-        rounds.per_solve.iter().map(|(e, s)| format!("{e} entries / {s} steps")).collect();
-      eprintln!(
-        "[effect-service-shaking] each solve: [{}]; phases over all solves: {}",
-        per_solve.join(", "),
-        rounds.phases.report()
-      );
-    }
     false
   }
 

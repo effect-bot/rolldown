@@ -425,7 +425,7 @@ impl tracing::Subscriber for SolveReports {
     let mut fields = Fields(vec![]);
     event.record(&mut fields);
     if fields.0.iter().any(|(name, value)| name == "message" && value == "effect service shaking") {
-      fields.0.retain(|(name, _)| !matches!(name.as_str(), "message" | "solve_ms" | "total_ms"));
+      fields.0.retain(|(name, _)| !matches!(name.as_str(), "message" | "solve_ms" | "active_ms"));
       self.0.lock().unwrap().push((std::thread::current().id(), fields.0));
     }
   }
