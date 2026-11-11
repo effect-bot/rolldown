@@ -21,6 +21,7 @@ mod generate;
 mod heap;
 mod host;
 mod prune;
+mod record;
 
 use std::cell::{OnceCell, RefCell};
 
@@ -119,6 +120,13 @@ impl Rounds {
       if self.stopped_generating { "; the budget ran out generating one" } else { "" }
     )
   }
+}
+
+/// FNV-1a, for the decision record's file names.
+fn fnv(bytes: &[u8]) -> u64 {
+  bytes
+    .iter()
+    .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
 /// Turns the references generated since the last call (`Shared::lazy_refs`) into activations:
@@ -1313,6 +1321,26 @@ impl LinkStage<'_> {
     report.bail_reasons.clone_from(&a.bail_reasons);
     rounds.phases.lap(5);
     phase!("planned {} removals", report.removed.len());
+    // The decision record, for comparing eager and deferred generation: neither a phase nor
+    // part of the complete time.
+    let record_to = std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_DECISIONS");
+    if record_to.is_some() || tracing::enabled!(tracing::Level::DEBUG) {
+      let recording = std::time::Instant::now();
+      let name = |m: ModuleIdx| names.get(m.index()).cloned().unwrap_or_default();
+      let decisions = record::record(&a, &sh, &report, rounds.count, &name);
+      tracing::debug!(decisions = decisions.as_str(), "effect service shaking decisions");
+      if let Some(dir) = record_to {
+        let entry =
+          self.user_defined_entry_modules.iter().map(|m| name(*m)).min().unwrap_or_default();
+        let file = format!("{:016x}.txt", fnv(entry.as_bytes()));
+        let path = std::path::Path::new(&dir).join(file);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+          let _ = std::io::Write::write_all(&mut f, format!("== {entry}\n{decisions}").as_bytes());
+        }
+      }
+      rounds.printing += recording.elapsed();
+      rounds.phases.start();
+    }
     drop(sh);
     for (module, properties) in &edits.properties {
       let scoping = self.symbols[*module].as_ref().expect("module symbols").scoping();

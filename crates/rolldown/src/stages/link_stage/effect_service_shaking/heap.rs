@@ -39,13 +39,13 @@ pub struct Site {
 const WRAP_CLONE_SITE: Site = Site { module: ModuleIdx::from_raw_unchecked(0), start: 0, sub: 0 };
 
 /// Tag of the sub-sites rules make (bit 31 marks the end-tagged sites the generator makes).
-const RULE_SUB: u32 = 0x4000_0000;
+pub(super) const RULE_SUB: u32 = 0x4000_0000;
 
 /// The model slots of a Fiber: what its effect succeeds and fails with.
 pub const FIBER_SUCCESS: &str = "~success";
 pub const FIBER_FAILURE: &str = "~failure";
 /// Tag of the call sites inside a function clone (both bits); the low bits index `clone_sites`.
-const CLONE_SUB: u32 = 0xC000_0000;
+pub(super) const CLONE_SUB: u32 = 0xC000_0000;
 
 impl Site {
   /// A sub-site for a call a rule makes on `callee` on behalf of this call.
@@ -1524,6 +1524,17 @@ impl Analysis {
   }
 
   /// A model object allocated once per call site and tag.
+  /// The objects `site_obj` made at a site whose offset is another object's id (instances
+  /// and default prototypes, tags 200, 201 and 204), with that object. For the decision record.
+  pub fn id_sited(&self) -> FxHashMap<ObjId, ObjId> {
+    self
+      .site_cache
+      .iter()
+      .filter(|((_, tag), _)| matches!(tag, 200 | 201 | 204))
+      .map(|((site, _), o)| (*o, ObjId::from_usize(site.start as usize)))
+      .collect()
+  }
+
   pub fn site_obj(
     &mut self,
     site: Site,
