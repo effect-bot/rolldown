@@ -265,6 +265,7 @@ impl<'a> LinkStage<'a> {
 
   #[tracing::instrument(level = "debug", skip_all)]
   pub fn link(mut self) -> (LinkStageOutput, IndexEcmaAst, UsedSymbolRefsBuilder) {
+    let effect_declarations = self.preload_effect_declarations();
     self.sort_modules();
     self.compute_tla();
     self.determine_module_exports_kind();
@@ -279,7 +280,7 @@ impl<'a> LinkStage<'a> {
     // The passes above only relax statement flags. Module verdicts must follow before
     // `reference_needed_symbols` derives import flags from them.
     self.recompute_analyzed_side_effects();
-    self.effect_service_shaking();
+    self.effect_service_shaking(effect_declarations);
     self.reference_needed_symbols();
     self.include_statements(&unreachable_import_expression_node_ids);
     self.check_lazy_barrel_uncertain_bindings();

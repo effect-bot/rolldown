@@ -47,7 +47,80 @@ struct Rounds {
   dts: Option<dts::Dts>,
   /// Each solve's own entries and steps, for the report.
   per_solve: Vec<(u64, u64)>,
+  /// The declarations the link stage started loading, for the first solve.
+  declarations: Option<EffectDeclarations>,
   phases: Phases,
+}
+
+/// Whether a module is one of the `effect` package's.
+fn is_effect(module: &Module) -> bool {
+  match module {
+    Module::Normal(normal) => normal
+      .originative_resolved_id
+      .package_json
+      .as_ref()
+      .is_some_and(|pkg| pkg.name() == Some("effect")),
+    Module::External(_) => false,
+  }
+}
+
+/// The `.d.ts` beside a module (`dist/Effect.js` has `dist/Effect.d.ts`).
+fn declarations_of(module: &Module) -> Option<std::path::PathBuf> {
+  module.id().as_str().strip_suffix(".js").map(|js| std::path::PathBuf::from(format!("{js}.d.ts")))
+}
+
+/// The declarations of `effect`'s modules, read and parsed on the rayon pool while the link
+/// stage runs up to the pass (`LinkStage::preload_effect_declarations`).
+pub(super) struct EffectDeclarations {
+  /// Each module of `effect`, with the `.d.ts` beside it if its id names one.
+  modules: Vec<(ModuleIdx, Option<std::path::PathBuf>)>,
+  loading: Loading,
+}
+
+enum Loading {
+  #[cfg(not(target_family = "wasm"))]
+  Started(std::sync::mpsc::Receiver<std::thread::Result<dts::Loaded>>),
+  /// Not started: loaded when the pass needs them.
+  Deferred,
+}
+
+impl EffectDeclarations {
+  fn new(modules: &[&Module]) -> Self {
+    Self {
+      modules: modules.iter().map(|m| (m.idx(), declarations_of(m))).collect(),
+      loading: Loading::Deferred,
+    }
+  }
+
+  fn paths(&self) -> Vec<std::path::PathBuf> {
+    self.modules.iter().filter_map(|(_, dts)| dts.clone()).collect()
+  }
+
+  /// Hands the parsed files to `dts` in the order of `order` (the pass's execution order, as
+  /// files are numbered as they are added) and returns what was found for each module's
+  /// `.d.ts`. They were started in the module table's order, which varies between builds.
+  fn adopt(self, dts: &dts::Dts, order: &[ModuleIdx]) -> FxHashMap<ModuleIdx, dts::Read> {
+    let loaded = match &self.loading {
+      #[cfg(not(target_family = "wasm"))]
+      Loading::Started(receiver) => match receiver.recv() {
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => dts::load(&self.paths()),
+      },
+      Loading::Deferred => dts::load(&self.paths()),
+    };
+    let position: FxHashMap<ModuleIdx, usize> = self
+      .modules
+      .iter()
+      .filter(|(_, d)| d.is_some())
+      .enumerate()
+      .map(|(i, (m, _))| (*m, i))
+      .collect();
+    let ordered: Vec<ModuleIdx> =
+      order.iter().copied().filter(|m| position.contains_key(m)).collect();
+    let loaded = loaded.ordered(ordered.iter().map(|m| position[m]));
+    ordered.into_iter().zip(dts.adopt(loaded)).collect()
+  }
 }
 
 /// The phases of one solve, as the report's `phases` line names them.
@@ -87,6 +160,35 @@ impl Phases {
 }
 
 impl LinkStage<'_> {
+  /// Starts reading and parsing the declarations of `effect`'s modules on the rayon pool, so
+  /// that the link stage's work up to the pass hides it. They depend only on the module table.
+  /// A link stage that runs on a rayon worker itself loads them when the pass needs them: it
+  /// would block that worker waiting for them.
+  pub(super) fn preload_effect_declarations(&self) -> Option<EffectDeclarations> {
+    if !self.options.experimental.is_effect_service_shaking_enabled() {
+      return None;
+    }
+    let modules: Vec<&Module> = self.module_table.modules.iter().filter(|m| is_effect(m)).collect();
+    if modules.is_empty() {
+      return None;
+    }
+    let declarations = EffectDeclarations::new(&modules);
+    #[cfg(not(target_family = "wasm"))]
+    let declarations = if rayon::current_thread_index().is_none() {
+      let paths = declarations.paths();
+      let (sender, receiver) = std::sync::mpsc::channel();
+      rayon::spawn(move || {
+        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dts::load(&paths)));
+        // The pass may have returned without waiting for them.
+        let _ = sender.send(loaded);
+      });
+      EffectDeclarations { loading: Loading::Started(receiver), ..declarations }
+    } else {
+      declarations
+    };
+    Some(declarations)
+  }
+
   fn warn_effect_service_shaking(&mut self, reason: String) {
     if self.options.checks.contains(EventKindSwitcher::EffectServiceShaking) {
       self
@@ -96,7 +198,7 @@ impl LinkStage<'_> {
   }
 
   #[tracing::instrument(level = "debug", skip_all)]
-  pub(super) fn effect_service_shaking(&mut self) {
+  pub(super) fn effect_service_shaking(&mut self, declarations: Option<EffectDeclarations>) {
     if !self.options.experimental.is_effect_service_shaking_enabled() {
       return;
     }
@@ -104,7 +206,7 @@ impl LinkStage<'_> {
     // Each solve that finds a service, a key or a provider in a module hole analyses those
     // modules in the next one (`module_holes`). The set only grows, so this ends.
     let mut analysed_holes: FxHashSet<ModuleIdx> = FxHashSet::default();
-    let mut rounds = Rounds::default();
+    let mut rounds = Rounds { declarations, ..Rounds::default() };
     while self.effect_service_shaking_with(start, &mut analysed_holes, &mut rounds) {}
   }
 
@@ -292,35 +394,22 @@ impl LinkStage<'_> {
     // principle 11). Without them there is nothing to model `effect` by, so one warning says
     // which declaration is missing or unreadable and every method is kept. Nothing else reads
     // `effect`'s bodies instead.
-    let is_effect_module = |idx: ModuleIdx| match &self.module_table.modules[idx] {
-      Module::Normal(normal) => normal
-        .originative_resolved_id
-        .package_json
-        .as_ref()
-        .is_some_and(|pkg| pkg.name() == Some("effect")),
-      Module::External(_) => false,
+    let is_effect_module = |idx: ModuleIdx| is_effect(&self.module_table.modules[idx]);
+    let declarations = |idx: ModuleIdx| declarations_of(&self.module_table.modules[idx]);
+    // They are read and parsed in parallel, from the start of the link stage, since the model
+    // reads most of them (`preload_effect_declarations`). A later solve has the same modules,
+    // whose declarations the first one found readable and parsed.
+    let mut reads = if rounds.count == 0 {
+      let effect_modules: Vec<&Module> =
+        order.iter().map(|m| &self.module_table.modules[*m]).filter(|m| is_effect(m)).collect();
+      let started = rounds.declarations.take();
+      started.unwrap_or_else(|| EffectDeclarations::new(&effect_modules)).adopt(&a.dts, &order)
+    } else {
+      FxHashMap::default()
     };
-    let declarations = |idx: ModuleIdx| {
-      self.module_table[idx]
-        .id()
-        .as_str()
-        .strip_suffix(".js")
-        .map(|js| std::path::PathBuf::from(format!("{js}.d.ts")))
-    };
-    // They are read and parsed in parallel here, since the model reads most of them. A later
-    // solve has the same modules, whose declarations the first one found readable and parsed.
-    let effect_modules: Vec<(ModuleIdx, Option<std::path::PathBuf>)> = order
-      .iter()
-      .copied()
-      .filter(|m| rounds.count == 0 && is_effect_module(*m))
-      .map(|m| (m, declarations(m)))
-      .collect();
-    let paths: Vec<std::path::PathBuf> =
-      effect_modules.iter().filter_map(|(_, dts)| dts.clone()).collect();
-    let mut reads = a.dts.preload(&paths).into_iter();
-    for (module, dts) in effect_modules {
+    for module in order.iter().copied().filter(|m| rounds.count == 0 && is_effect_module(*m)) {
       let id = self.module_table[module].id().as_str();
-      let problem = match (dts, reads.next()) {
+      let problem = match (declarations(module), reads.remove(&module)) {
         (None, _) => Some(format!("`{id}` has no `.d.ts` declarations")),
         (Some(dts), Some(dts::Read::Missing)) => Some(format!("`{}` is missing", dts.display())),
         (Some(dts), Some(dts::Read::Unreadable(err))) => {

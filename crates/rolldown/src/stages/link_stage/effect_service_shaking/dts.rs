@@ -172,8 +172,8 @@ self_cell!(
 
 // SAFETY: as for `rolldown_ecmascript::EcmaAst`: the `Allocator` is `Send`, and the arena and
 // the source move with the cell. Every reference in the index points into them, and nothing
-// outside the cell refers into them. `Dts::preload` parses a file on one thread and hands it
-// over whole; it is only read after that.
+// outside the cell refers into them. `load` parses a file on one thread and hands it over
+// whole; it is only read after that.
 unsafe impl Send for DtsFile {}
 
 /// A `.d.ts` file parsed into its index (`Dts::file`, `Dts::preload`).
@@ -186,11 +186,47 @@ fn parse(path: &Path, source: String) -> DtsFile {
   })
 }
 
-/// What `Dts::preload` found at a path.
+/// What `load` found at a path.
 pub enum Read {
   Missing,
   Unreadable(std::io::Error),
   Parsed,
+}
+
+/// `.d.ts` files read and parsed apart from any analysis (`load`), each under its lexically
+/// normalized path, for a `Dts` to take (`Dts::adopt`).
+pub struct Loaded(Vec<(PathBuf, Result<DtsFile, Read>)>);
+
+impl Loaded {
+  /// The files at the given positions of the paths `load` was given, in that order.
+  pub fn ordered(self, positions: impl Iterator<Item = usize>) -> Loaded {
+    let mut files: Vec<_> = self.0.into_iter().map(Some).collect();
+    Loaded(positions.filter_map(|i| files.get_mut(i).and_then(Option::take)).collect())
+  }
+}
+
+/// Reads and parses the files at `paths` in parallel, ahead of the lookups that need them
+/// (`Dts::file`). It depends on nothing but the files, so it can run before the analysis
+/// exists, while the link stage does other work (`LinkStage::preload_effect_declarations`).
+pub fn load(paths: &[PathBuf]) -> Loaded {
+  Loaded(
+    paths
+      .par_iter()
+      // One task per file: a few large files (`Effect.d.ts`) take most of the time.
+      .with_max_len(1)
+      .map(|path| {
+        let path = path.normalize().into_owned();
+        let read = if path.is_file() {
+          std::fs::read_to_string(&path)
+            .map(|source| parse(&path, source))
+            .map_err(Read::Unreadable)
+        } else {
+          Err(Read::Missing)
+        };
+        (path, read)
+      })
+      .collect(),
+  )
 }
 
 struct Sig<'a> {
@@ -1334,27 +1370,11 @@ impl Dts {
     self.files.push(file)
   }
 
-  /// Reads and parses the files at `paths` in parallel, ahead of the lookups that need them
-  /// (`file`), and reports for each whether it is missing or can't be read. A file that is
-  /// neither is parsed once, under its normalized path; one that is is left to `file`.
-  pub fn preload(&self, paths: &[PathBuf]) -> Vec<Read> {
-    let reads: Vec<(PathBuf, Result<DtsFile, Read>)> = paths
-      .par_iter()
-      // One task per file: a few large files (`Effect.d.ts`) take most of the time.
-      .with_max_len(1)
-      .map(|path| {
-        let path = path.normalize().into_owned();
-        let read = if path.is_file() {
-          std::fs::read_to_string(&path)
-            .map(|source| parse(&path, source))
-            .map_err(Read::Unreadable)
-        } else {
-          Err(Read::Missing)
-        };
-        (path, read)
-      })
-      .collect();
-    reads
+  /// Takes the files `load` parsed, each once under its normalized path, and reports for each
+  /// path, in order, whether it was missing or can't be read. Such a path is left to `file`.
+  pub fn adopt(&self, loaded: Loaded) -> Vec<Read> {
+    loaded
+      .0
       .into_iter()
       .map(|(path, read)| match read {
         Ok(file) => {
