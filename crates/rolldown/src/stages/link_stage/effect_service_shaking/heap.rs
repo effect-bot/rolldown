@@ -1285,6 +1285,12 @@ pub struct Analysis {
   /// Running totals of points-to entries and copy edges, for the allocation budget.
   pub total_pts: u64,
   pub total_copies: u64,
+  /// Rows of the objects' named-load indexes (`Obj::named_loads`), counted as entries: each is
+  /// a read edge from an object to a variable, as a copy edge is.
+  pub total_named_loads: u64,
+  /// Replay or the named-load index found the analysis over budget (`replay_stopped`). Latched:
+  /// the solve stops even if widening later takes the totals back under the cap.
+  replay_over: bool,
 }
 
 pub const PROTO_JSON: u8 = 1;
@@ -1469,6 +1475,8 @@ impl Analysis {
       steps: 0,
       total_pts: 0,
       total_copies: 0,
+      total_named_loads: 0,
+      replay_over: false,
     };
     this.seed(ambient_keys, all_keys);
     // Unknown keys alias every key: what they provide is visible through every key.
@@ -1539,7 +1547,19 @@ impl Analysis {
   /// The solve will stop at once, keeping everything (`solve_with`): generation ran past the
   /// budget, or the analysis is over it. Nothing more needs setting up or generating.
   pub(super) fn terminal(&self) -> bool {
-    self.exhausted || self.over_budget()
+    self.exhausted || self.replay_over || self.over_budget()
+  }
+
+  /// Replay into earlier named loads and the named-load index stop here once the analysis is
+  /// over budget (`Obj::named_loads`): the first time it is found over latches `replay_over`,
+  /// so the solve stops keeping everything and a row or replay skipped here is never missed by
+  /// a solve that finishes.
+  #[inline]
+  fn replay_stopped(&mut self) -> bool {
+    if !self.replay_over && self.over_budget() {
+      self.replay_over = true;
+    }
+    self.exhausted || self.replay_over
   }
 
   pub fn rule(&mut self, name: &'static str, rule: Rule) -> u16 {
@@ -1918,6 +1938,9 @@ impl Analysis {
     self.objs[obj].elem = Some(v);
     // Named reads that ran before the object had elements.
     for (name, dst) in self.named_loads(obj) {
+      if self.replay_stopped() {
+        break;
+      }
       if reads_elem(&self.objs[obj].kind, &name) {
         self.copy(v, dst);
       }
@@ -1949,10 +1972,16 @@ impl Analysis {
     }
     // Reads that ran before the object had a prototype read through it now.
     for (name, dst) in self.named_loads(obj) {
+      if self.replay_stopped() {
+        return v;
+      }
       self.constrain(v, Constraint::Load { key: Key::Name(name), dst });
     }
     if records_named_loads(&self.objs[obj].kind) {
       for dst in self.objs[obj].unknown_loads.clone() {
+        if self.replay_stopped() {
+          return v;
+        }
         self.constrain(v, Constraint::Load { key: Key::Unknown, dst });
       }
     }
@@ -2192,7 +2221,12 @@ impl Analysis {
   pub(super) fn over_budget(&self) -> bool {
     self.objs.len() > self.env_limits.objects
       || self.vars.len() > self.env_limits.vars
-      || self.total_pts + self.total_copies > self.env_limits.entries.unwrap_or(self.max_entries)
+      || self.entries() > self.env_limits.entries.unwrap_or(self.max_entries)
+  }
+
+  /// The entries the budget counts: points-to entries, copy edges and named-load rows.
+  pub(super) fn entries(&self) -> u64 {
+    self.total_pts + self.total_copies + self.total_named_loads
   }
 
   /// Sets the entry cap, for tests that run out of entries at a chosen point.
@@ -2207,7 +2241,7 @@ impl Analysis {
     Work {
       vars: self.vars.len(),
       objs: self.objs.len(),
-      entries: self.total_pts + self.total_copies,
+      entries: self.entries(),
       constraints: self.vars.iter().map(|v| v.constraints.len()).sum(),
       queued: self.new_constraints.len() + self.worklist.len() + self.activation_queue.len(),
       pending: self.fns.iter().map(|f| f.pending.len()).sum(),
@@ -2350,7 +2384,7 @@ impl Analysis {
   /// before installing anything of it, terminally (every method kept, no retry).
   pub fn solve_with(&mut self, generate: &mut dyn FnMut(&mut Analysis, FnId)) {
     'solve: loop {
-      if self.exhausted || self.over_budget() {
+      if self.exhausted || self.replay_over || self.over_budget() {
         self.budget_exceeded = true;
         if self.debug {
           self.report_demand_at_stop();
@@ -2918,8 +2952,13 @@ impl Analysis {
           }
         }
         // The rest reads the elements, spread sources and prototype as they are now: recorded,
-        // so what the object gains later reaches this read too (`Obj::named_loads`).
-        self.objs[obj].named_loads.get_or_insert_default().insert((name.clone(), dst));
+        // so what the object gains later reaches this read too (`Obj::named_loads`). A row is an
+        // entry; none is added once the analysis is over budget, which stops the solve.
+        if !self.replay_stopped()
+          && self.objs[obj].named_loads.get_or_insert_default().insert((name.clone(), dst))
+        {
+          self.total_named_loads += 1;
+        }
         if matches!(self.objs[obj].kind, ObjKind::Array) {
           if let Some(id) = self.rule_id(&format!("Array.prototype.{name}")) {
             let b = self.method(id, obj);
@@ -6473,10 +6512,16 @@ impl Analysis {
         }
         let mut named: Vec<(ArcStr, VarId)> =
           self.objs[target].fields.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        // And the named reads made on the target before this source arrived.
+        // And the named reads made on the target before this source arrived. Each is a load on
+        // the source's holder, as a read made after it is (`load_name`): a field the source
+        // gains later reaches it (`field`), and so does what a source spread into this one
+        // later holds.
         named.extend(self.named_loads(target));
         for (name, dst) in named {
-          self.load_name(obj, &name, dst);
+          if self.replay_stopped() {
+            break;
+          }
+          self.constrain(holder, Constraint::Load { key: Key::Name(name), dst });
         }
       }
       ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => {
@@ -8376,5 +8421,236 @@ mod tests {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
     assert_eq!(unreached, Vec::<String>::new());
+  }
+
+  /// A step of a spread scenario (`spread_case`), on objects `0` to `2`.
+  #[derive(Clone, Copy, Debug)]
+  enum Step {
+    /// A read of `handler` on object 0.
+    Read,
+    /// Object 0's own field `handler`, the destination of what spreads into it.
+    TargetField,
+    /// Object `.0` spread into object `.1`.
+    Spread(usize, usize),
+    /// Object `.0` gains `handler`, holding the service.
+    Field(usize),
+  }
+
+  /// Runs `steps`, solving after each or once. Returns whether the read and object 0's field
+  /// hold the service and which objects demand `handler`, and whether the named-load rows
+  /// settle: spreading every edge again twice adds none the second time, and every row is
+  /// counted as an entry.
+  fn spread_case(steps: &[Step], solve_each: bool) -> String {
+    let mut a = Analysis::new();
+    let handler = ArcStr::from("handler");
+    let service = a.alloc(ObjKind::Object, None);
+    let objs: Vec<ObjId> = (0..3).map(|_| a.alloc(ObjKind::Object, None)).collect();
+    let dst = a.var();
+    let mut field = None;
+    let spread = |a: &mut Analysis, from: usize, into: usize| {
+      let src = a.var();
+      a.seed(src, objs[from]);
+      a.constrain(src, Constraint::SpreadInto(objs[into]));
+    };
+    for step in steps {
+      match *step {
+        Step::Read => {
+          let recv = a.var();
+          a.seed(recv, objs[0]);
+          a.constrain(recv, Constraint::Load { key: Key::Name(handler.clone()), dst });
+        }
+        Step::TargetField => field = Some(a.field(objs[0], &handler)),
+        Step::Spread(from, into) => spread(&mut a, from, into),
+        Step::Field(i) => {
+          let f = a.field(objs[i], &handler);
+          a.seed(f, service);
+        }
+      }
+      if solve_each {
+        a.solve();
+      }
+    }
+    a.solve();
+    let rows = |a: &Analysis| -> usize {
+      a.objs.iter().map(|o| o.named_loads.as_ref().map_or(0, |l| l.len())).sum()
+    };
+    let held = format!(
+      "read {}, field {}, demand {:?}",
+      a.vars[dst].pts.contains(&service),
+      field.is_some_and(|f| a.vars[f].pts.contains(&service)),
+      objs.iter().map(|o| a.objs[*o].demand.has("handler")).collect::<Vec<_>>(),
+    );
+    let mut settled = vec![];
+    for _ in 0..2 {
+      for step in steps {
+        if let Step::Spread(from, into) = *step {
+          spread(&mut a, from, into);
+        }
+      }
+      a.solve();
+      settled.push(rows(&a));
+    }
+    format!(
+      "{held}, settled {}",
+      settled[0] == settled[1] && a.total_named_loads == settled[1] as u64,
+    )
+  }
+
+  /// Guard: a spread source's late inputs reach the reads and fields replayed into it
+  /// (`spread_into`). A read of the target, or the target's own field, registered before a
+  /// source arrives sees a field the source gains after it, through one spread or two, with the
+  /// target spread into itself and in a two-object cycle: as when the read comes last or the
+  /// field comes before the spread. Demand is the same either way, and the named-load rows
+  /// settle, each counted as an entry. (A spread applied again after its target gained a field
+  /// replays that field too, so the rows may grow once.)
+  #[test]
+  fn late_spread_inputs_reach_earlier_loads() {
+    use Step::{Field, Read, Spread, TargetField};
+    let cases: [(&str, &[Step], &[Step]); 6] = [
+      ("late field", &[Read, Spread(1, 0), Field(1)], &[Spread(1, 0), Field(1), Read]),
+      (
+        "target field",
+        &[TargetField, Spread(1, 0), Field(1)],
+        &[TargetField, Field(1), Spread(1, 0)],
+      ),
+      (
+        "two hops",
+        &[Read, Spread(1, 0), Spread(2, 1), Field(2)],
+        &[Spread(1, 0), Spread(2, 1), Field(2), Read],
+      ),
+      (
+        "two hops, target field",
+        &[TargetField, Spread(1, 0), Spread(2, 1), Field(2)],
+        &[TargetField, Field(2), Spread(2, 1), Spread(1, 0)],
+      ),
+      (
+        "self spread",
+        &[Read, Spread(0, 0), Spread(1, 0), Field(1)],
+        &[Spread(0, 0), Spread(1, 0), Field(1), Read],
+      ),
+      (
+        "cycle",
+        &[Read, Spread(1, 0), Spread(0, 1), Field(1)],
+        &[Spread(1, 0), Spread(0, 1), Field(1), Read],
+      ),
+    ];
+    let mut wrong = vec![];
+    for (name, late, reference) in cases {
+      let expected = spread_case(reference, true);
+      if !expected.contains("true,") || !expected.ends_with("settled true") {
+        wrong.push(format!("{name} reference: {expected}"));
+      }
+      for solve_each in [true, false] {
+        let got = spread_case(late, solve_each);
+        if got != expected {
+          wrong.push(format!("{name} solve each {solve_each}: {got} / reference {expected}"));
+        }
+      }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+  }
+
+  /// A target with `k` fields and `k` named reads, solved, then `sources` empty objects
+  /// spread into it. Returns the analysis, the sources and the entries before the spreads.
+  fn fan_out(k: usize, sources: usize, cap: Option<u64>) -> (Analysis, Vec<ObjId>, u64) {
+    let mut a = Analysis::new();
+    let target = a.alloc(ObjKind::Object, None);
+    let recv = a.var();
+    a.seed(recv, target);
+    for i in 0..k {
+      let name = ArcStr::from(format!("f{i}"));
+      a.field(target, &name);
+      let dst = a.var();
+      a.constrain(recv, Constraint::Load { key: Key::Name(name), dst });
+    }
+    a.solve();
+    let entries = a.entries();
+    if let Some(room) = cap {
+      a.set_entry_cap(entries + room);
+    }
+    let objs: Vec<ObjId> = (0..sources).map(|_| a.alloc(ObjKind::Object, None)).collect();
+    for o in &objs {
+      let src = a.var();
+      a.seed(src, *o);
+      a.constrain(src, Constraint::SpreadInto(target));
+    }
+    a.solve();
+    (a, objs, entries)
+  }
+
+  /// Guard: the named-load index is bounded by the budget (`Obj::named_loads`). Spreading 16
+  /// empty sources into a target with 8 fields and 8 reads gives each source 16 rows, one per
+  /// field and read replayed into it, each counted as an entry, and the 8 names as demand; the
+  /// only other entries are each source in its own variable and its holder. With room for 10
+  /// more entries the solve stops, keeping everything, with at most 10 rows.
+  #[test]
+  fn named_load_fan_out_is_counted_and_bounded() {
+    let (k, sources) = (8, 16);
+    let (a, objs, entries) = fan_out(k, sources, None);
+    let rows: Vec<usize> =
+      objs.iter().map(|o| a.objs[*o].named_loads.as_ref().map_or(0, |l| l.len())).collect();
+    assert_eq!(rows, vec![2 * k; sources]);
+    let demand: Vec<bool> =
+      objs.iter().map(|o| (0..k).all(|i| a.objs[*o].demand.has(&format!("f{i}")))).collect();
+    assert_eq!(demand, vec![true; sources]);
+    assert_eq!(
+      a.total_named_loads,
+      (2 * k * sources + k) as u64,
+      "the target's reads, and the rows"
+    );
+    assert_eq!(a.entries() - entries, (2 * k * sources + 2 * sources) as u64);
+    assert!(!a.budget_exceeded);
+    let (a, objs, _) = fan_out(k, sources, Some(10));
+    let rows: usize =
+      objs.iter().map(|o| a.objs[*o].named_loads.as_ref().map_or(0, |l| l.len())).sum();
+    assert!(rows <= 10 && a.budget_exceeded, "{rows} rows");
+  }
+
+  /// Guard: over the budget, replay and the named-load index stop (`replay_stopped`). A read,
+  /// a late element, prototype or spread source adds no row, copy or constraint, and the solve
+  /// stops keeping everything even after the totals come back under the cap, as widening may
+  /// take them.
+  #[test]
+  fn replay_stops_over_budget() {
+    let mut a = Analysis::new();
+    // Read under two names, and under an unknown key.
+    let [obj, unknown_read] = [0, 1].map(|_| a.alloc(ObjKind::Object, None));
+    let [recv, unknown_recv, unknown] = [0, 1, 2].map(|_| a.var());
+    a.seed(recv, obj);
+    a.seed(unknown_recv, unknown_read);
+    for name in ["a", "b"] {
+      let dst = a.var();
+      a.constrain(recv, Constraint::Load { key: Key::Name(ArcStr::from(name)), dst });
+    }
+    a.constrain(unknown_recv, Constraint::Load { key: Key::Unknown, dst: unknown });
+    a.solve();
+    let source = a.alloc(ObjKind::Object, None);
+    let dst = a.var();
+    a.set_entry_cap(a.entries() - 1);
+    let work = |a: &Analysis| {
+      (
+        a.total_named_loads,
+        a.total_copies,
+        a.new_constraints.len(),
+        a.vars.iter().map(|v| v.constraints.len()).sum::<usize>(),
+      )
+    };
+    let before = work(&a);
+    a.load_name(obj, &ArcStr::from("c"), dst);
+    assert_eq!(work(&a).0, before.0, "a read over budget adds no row");
+    let before = work(&a);
+    a.elem(obj);
+    assert_eq!(work(&a), before, "late elements replay nothing");
+    a.proto_var(obj);
+    a.proto_var(unknown_read);
+    // Each prototype variable's own `Inherits`, and nothing replayed.
+    assert_eq!(work(&a).3, before.3 + 2, "a late prototype replays nothing");
+    let before = work(&a);
+    a.spread_into(source, obj);
+    assert_eq!(work(&a).2, before.2, "a late spread source replays nothing");
+    a.set_entry_cap(u64::MAX);
+    assert!(!a.over_budget());
+    a.solve();
+    assert!(a.budget_exceeded, "the solve stops");
   }
 }

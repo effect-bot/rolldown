@@ -2769,7 +2769,7 @@ mod tests {
     for o in &objs[..8] {
       a.seed(wide, *o);
     }
-    a.set_entry_cap(a.total_pts + a.total_copies);
+    a.set_entry_cap(a.entries());
     a.generating = true;
     let (v, o) = (a.var(), a.alloc(ObjKind::Object, None));
     a.seed(v, o);

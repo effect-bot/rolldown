@@ -1137,9 +1137,9 @@ impl LinkStage<'_> {
     rounds.generation += generation;
     rounds.stopped_generating |= a.budget_exceeded_generating;
     rounds.count += 1;
-    rounds.entries += a.total_pts + a.total_copies;
+    rounds.entries += a.entries();
     rounds.steps += a.steps;
-    rounds.per_solve.push((a.total_pts + a.total_copies, a.steps));
+    rounds.per_solve.push((a.entries(), a.steps));
     rounds.solve += solve_start.elapsed().saturating_sub(generation);
     // Refinement: a module hole that a service, a key or a provider reached is analysed in the
     // next solve, so that it keeps no more methods than its code reads.
@@ -1393,7 +1393,7 @@ impl LinkStage<'_> {
         "[effect-service-shaking] {} vars, {} objects, {} entries, {} steps, solve {} ms, active {} ms",
         a.vars.len(),
         a.objs.len(),
-        a.total_pts + a.total_copies,
+        a.entries(),
         a.steps,
         solved.as_millis(),
         rounds.active.as_millis()
