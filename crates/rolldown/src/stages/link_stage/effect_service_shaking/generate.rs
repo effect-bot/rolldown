@@ -134,6 +134,19 @@ pub struct Shared<'l> {
 }
 
 impl Shared<'_> {
+  /// How many entries the tables generation records into hold, for tests.
+  #[cfg(test)]
+  pub(super) fn records(&self) -> usize {
+    self.symbol_vars.len()
+      + self.literals.len()
+      + self.decls.len()
+      + self.lazy_refs.len()
+      + self.lazy_decls.len()
+      + self.lazy_spans.len()
+      + self.key_symbols.len()
+      + self.globals.len()
+  }
+
   pub fn symbol_var(&mut self, a: &mut Analysis, sym: SymbolRef) -> VarId {
     let canonical = self.symbols.canonical_ref_for(sym);
     if let Some(v) = self.symbol_vars.get(&canonical) {
@@ -195,6 +208,10 @@ pub struct Gen<'a, 'l, 's> {
   /// The allocation budget ran out (`checkpoint`): every statement and expression from here on
   /// returns at once, and loops over a node's children stop.
   stopped: bool,
+  /// What the shared tables held when this generator first found the budget over, for tests
+  /// counting what it records afterwards (`Shared::records`).
+  #[cfg(test)]
+  shared_at_exhaustion: Option<usize>,
 }
 
 /// The analysis allocates as usual again once generation is over (`Analysis::generating`).
@@ -215,10 +232,14 @@ pub struct DeferredStatement {
 
 impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   pub fn new(a: &'a mut Analysis, sh: &'s mut Shared<'l>, m: &'s ModuleFacts<'l>) -> Self {
+    // The module's own body is generation too (`Analysis::generating`).
+    a.generating = true;
     let module_fn = Self::new_fn(a, m.module, 0, FnKind::Normal);
     sh.module_fns[m.module] = Some(module_fn);
     let prim = sh.prim;
-    a.copy(prim, a.fns[module_fn].this);
+    if !a.generation_exhausted() {
+      a.copy(prim, a.fns[module_fn].this);
+    }
     Self::at_top(a, sh, m, module_fn, 0)
   }
 
@@ -262,6 +283,8 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       seq: 0,
       stmt_keys: vec![],
       stopped,
+      #[cfg(test)]
+      shared_at_exhaustion: None,
     }
   }
 
@@ -294,17 +317,22 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     Site { module: self.m.module, start, sub: 0 }
   }
 
-  fn emit(&mut self, p: Pending) {
-    if !self.a.generation_exhausted() {
-      self.a.fns[self.cur].pending.push(p);
+  /// `Analysis::generation_exhausted`. Past the cap the generator adds nothing to the
+  /// analysis (`emit`, `Gen::new`) or to the tables it records into (`symbol_var`,
+  /// `record_decl`, `object`'s literal, `call_expr`'s method name), and a module stops at
+  /// its next statement (`program`).
+  fn exhausted(&mut self) -> bool {
+    let exhausted = self.a.generation_exhausted();
+    #[cfg(test)]
+    if exhausted && self.shared_at_exhaustion.is_none() {
+      self.shared_at_exhaustion = Some(self.sh.records());
     }
+    exhausted
   }
 
-  /// Adds a copy to the analysis now rather than when the function is reached, unless the
-  /// budget is over (`Analysis::generation_exhausted`).
-  fn install(&mut self, src: VarId, dst: VarId) {
-    if !self.a.generation_exhausted() {
-      self.a.copy(src, dst);
+  fn emit(&mut self, p: Pending) {
+    if !self.exhausted() {
+      self.a.fns[self.cur].pending.push(p);
     }
   }
 
@@ -332,7 +360,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   /// partial body is ever pruned against. This bounds how far generation walks; what the nodes
   /// it is inside allocate as they complete is bounded by `Analysis::generation_exhausted`.
   fn checkpoint(&mut self, start: u32) -> bool {
-    if !self.stopped && self.a.over_budget() {
+    if !self.stopped && self.exhausted() {
       self.stopped = true;
       self.a.generation_stopped = Some(self.site(start));
     }
@@ -340,7 +368,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn fresh(&mut self) -> VarId {
-    let sink = self.a.generation_exhausted();
+    let sink = self.exhausted();
     let v = self.a.var();
     if self.cur != self.module_fn && !sink {
       self.a.fns[self.cur].locals.push(v);
@@ -420,6 +448,10 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let owner =
       if self.cur == self.module_fn { self.lazy_owner.unwrap_or(self.cur) } else { self.cur };
     let canonical = self.sh.symbols.canonical_ref_for(sym);
+    // Past the cap a symbol is the sink, and neither its reference nor its variable is kept.
+    if self.exhausted() {
+      return self.a.var();
+    }
     self.sh.lazy_refs.push((owner, canonical));
     self.sh.symbol_var(self.a, sym)
   }
@@ -430,6 +462,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn record_decl(&mut self, ident: &BindingIdentifier<'_>, kind: DeclKind) {
+    if self.exhausted() {
+      return;
+    }
     if let Some(symbol) = ident.symbol_id.get() {
       let sym: SymbolRef = (self.m.module, symbol).into();
       let canonical = self.sh.symbols.canonical_ref_for(sym);
@@ -509,6 +544,11 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   pub fn program(&mut self, program: &Program<'_>, defer: bool) -> Vec<DeferredStatement> {
     let mut deferred = vec![];
     for (i, stmt) in program.body.iter().enumerate() {
+      // Before a lazy statement's body is registered as well as before a statement is
+      // generated: past the cap, the rest of the module adds nothing.
+      if self.checkpoint(oxc::span::GetSpan::span(stmt).start) {
+        break;
+      }
       self.begin_statement();
       let Some(declared) = self.m.lazy_stmts.get(&i).cloned() else {
         self.statement(stmt);
@@ -1110,7 +1150,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     // The function's own name binding, for named function expressions.
     if let Some(name) = &f.id {
       if let Some(bv) = self.binding_var(name) {
-        self.install(v, bv);
+        self.a.copy(v, bv);
       }
     }
     let outer = self.cur;
@@ -1150,7 +1190,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     // Arrows share `this` with the enclosing function.
     let enclosing_this = *self.this_stack.last().unwrap();
     let this = self.a.fns[id].this;
-    self.install(enclosing_this, this);
+    self.a.copy(enclosing_this, this);
     self.a.fns[id].enclosing_this = Some(enclosing_this);
     let outer = self.cur;
     self.a.fns[outer].leaf = false;
@@ -1287,7 +1327,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     if let Some(id) = &c.id {
       if let Some(bv) = self.binding_var(id) {
-        self.install(cv, bv);
+        self.a.copy(cv, bv);
       }
     }
     self.a.hole(class_obj, proto_obj);
@@ -1339,7 +1379,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     if let Some(id) = &c.id {
       if let Some(bv) = self.binding_var(id) {
-        self.install(cv, bv);
+        self.a.copy(cv, bv);
       }
     }
     self.class_stack.push(heritage);
@@ -1595,7 +1635,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       // `o.m(...)`: the name lets a call into unseen code hand over only the receivers that
       // can hold that callee (`Analysis::method_names`).
       let site = Site { module: self.m.module, start: c.span.start, sub: c.span.end | 0x8000_0000 };
-      self.a.method_names.insert(site, ArcStr::from(m.property.name.as_str()));
+      if !self.exhausted() {
+        self.a.method_names.insert(site, ArcStr::from(m.property.name.as_str()));
+      }
     }
     self.call(callee, this, args, c.span, false)
   }
@@ -1961,6 +2003,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         }
       }
     }
+    if self.exhausted() {
+      return v;
+    }
     self.sh.literals.insert(
       obj,
       LiteralInfo {
@@ -2320,7 +2365,9 @@ mod tests {
   use rustc_hash::{FxHashMap, FxHashSet};
 
   use super::{Gen, ModuleFacts, Shared};
-  use crate::stages::link_stage::effect_service_shaking::heap::{Analysis, ObjKind};
+  use crate::stages::link_stage::effect_service_shaking::heap::{
+    Analysis, FnInfo, FnKind, ObjKind, Work,
+  };
 
   fn scoping(allocator: &Allocator, source: &str) -> Scoping {
     let program = Parser::new(allocator, source, SourceType::mjs()).parse().program;
@@ -2339,14 +2386,67 @@ mod tests {
     /// Variables allocated: all of them, and those past the cap.
     used: usize,
     overshoot: usize,
-    /// Objects allocated, and points-to and copy entries installed.
-    objects: usize,
-    entries: u64,
-    /// Constraints left pending for when the functions are reached.
-    pending: usize,
     /// The generator's context (enclosing functions, classes, `switch` cases, `try` blocks,
     /// binding being declared) is back at the top level.
     restored: bool,
+    /// What the analysis gained after generation first found the budget over, and the entries
+    /// the shared tables gained after the generator first saw that: the work done past the
+    /// cap, apart from what the nodes it was inside made on their way down.
+    post: Work,
+    post_records: usize,
+  }
+
+  /// `now` less `then`, count by count.
+  fn since(now: Work, then: Work) -> Work {
+    Work {
+      vars: now.vars - then.vars,
+      objs: now.objs - then.objs,
+      entries: now.entries - then.entries,
+      constraints: now.constraints - then.constraints,
+      queued: now.queued - then.queued,
+      pending: now.pending - then.pending,
+      fns: now.fns - then.fns,
+      locals: now.locals - then.locals,
+      slots: now.slots - then.slots,
+      records: now.records - then.records,
+    }
+  }
+
+  /// The tables generation shares across `modules` modules, with the analysis's values.
+  fn shared<'l>(symbols: &'l SymbolRefDb, modules: usize, a: &mut Analysis) -> Shared<'l> {
+    let [prim, top_host, top_ext, thrown] = std::array::from_fn(|_| a.var());
+    a.seed(prim, a.prim);
+    a.seed(top_host, a.top_host);
+    a.seed(top_ext, a.top_ext);
+    Shared {
+      symbols,
+      symbol_vars: FxHashMap::default(),
+      namespace_syms: FxHashMap::default(),
+      namespace_objs: FxHashMap::default(),
+      rule_symbols: FxHashMap::default(),
+      externals: FxHashMap::default(),
+      globals: FxHashMap::default(),
+      literals: FxHashMap::default(),
+      decls: FxHashMap::default(),
+      thrown,
+      prim,
+      top_host,
+      top_ext,
+      module_fns: IndexVec::from_vec(vec![None; modules]),
+      cjs_modules: FxHashSet::default(),
+      lazy_decls: FxHashMap::default(),
+      lazy_refs: vec![],
+      lazy_by_module: FxHashMap::default(),
+      resolve_global: |a, _, _| a.var(),
+      key_symbols: FxHashMap::default(),
+      statements: 1,
+      lazy_spans: vec![],
+      kept_eager: 0,
+      scan_time: std::time::Duration::ZERO,
+      key_ctor_symbols: FxHashSet::default(),
+      key_ctor_members: FxHashSet::default(),
+      hole_values: FxHashMap::default(),
+    }
   }
 
   /// Generates `source` as the only module, eagerly. `key` names a binding that counts as a
@@ -2363,39 +2463,7 @@ mod tests {
     let mut symbols = SymbolRefDb::new();
     symbols.store_local_db(module, SymbolRefDbForModule::new(db_scoping, module, root));
     let mut a = Analysis::new();
-    let [prim, top_host, top_ext, thrown] = std::array::from_fn(|_| a.var());
-    a.seed(prim, a.prim);
-    a.seed(top_host, a.top_host);
-    a.seed(top_ext, a.top_ext);
-    let mut sh = Shared {
-      symbols: &symbols,
-      symbol_vars: FxHashMap::default(),
-      namespace_syms: FxHashMap::default(),
-      namespace_objs: FxHashMap::default(),
-      rule_symbols: FxHashMap::default(),
-      externals: FxHashMap::default(),
-      globals: FxHashMap::default(),
-      literals: FxHashMap::default(),
-      decls: FxHashMap::default(),
-      thrown,
-      prim,
-      top_host,
-      top_ext,
-      module_fns: IndexVec::from_vec(vec![None]),
-      cjs_modules: FxHashSet::default(),
-      lazy_decls: FxHashMap::default(),
-      lazy_refs: vec![],
-      lazy_by_module: FxHashMap::default(),
-      resolve_global: |a, _, _| a.var(),
-      key_symbols: FxHashMap::default(),
-      statements: 1,
-      lazy_spans: vec![],
-      kept_eager: 0,
-      scan_time: std::time::Duration::ZERO,
-      key_ctor_symbols: FxHashSet::default(),
-      key_ctor_members: FxHashSet::default(),
-      hole_values: FxHashMap::default(),
-    };
+    let mut sh = shared(&symbols, 1, &mut a);
     let name_of = |name: &str| scoping.symbol_ids().find(|s| scoping.symbol_name(*s) == name);
     if let Some(key) = key {
       let sym = name_of(key).expect("the key binding");
@@ -2412,11 +2480,10 @@ mod tests {
     };
     let mut g = Gen::new(&mut a, &mut sh, &facts);
     let start = g.a.vars.len();
-    let objects = g.a.objs.len();
-    let entries = g.a.total_pts + g.a.total_copies;
     let cap = start + headroom;
     g.a.set_var_cap(cap);
     g.program(program, false);
+    let shared_at = g.shared_at_exhaustion;
     let restored = g.cur == g.module_fn
       && g.this_stack.len() == 1
       && g.class_stack.is_empty()
@@ -2435,10 +2502,9 @@ mod tests {
       closures,
       used,
       overshoot,
-      objects: a.objs.len() - objects,
-      entries: a.total_pts + a.total_copies - entries,
-      pending: a.fns.iter().map(|f| f.pending.len()).sum(),
       restored,
+      post: a.at_exhaustion.map(|w| since(a.work(), w)).unwrap_or_default(),
+      post_records: shared_at.map_or(0, |r| sh.records() - r),
     }
   }
 
@@ -2523,28 +2589,61 @@ mod tests {
     assert!(walked.overshoot <= 2 && walked.restored, "{} over", walked.overshoot);
   }
 
+  /// Generates `source` with the variable cap at the leaf of a nested shape: the smallest
+  /// headroom with which generation runs through to `const after`, so that the leaf's own
+  /// variables cross the cap past its check and every node above it completes past the cap.
+  fn crossing_at_leaf(source: &str, used: usize) -> Walked {
+    let after = u32::try_from(source.find("const after").unwrap()).unwrap();
+    let through = |headroom| walk(source, headroom, None).stopped.is_none_or(|at| at >= after);
+    let (mut low, mut high) = (0, used);
+    while low < high {
+      let mid = usize::midpoint(low, high);
+      if through(mid) {
+        high = mid;
+      } else {
+        low = mid + 1;
+      }
+    }
+    let walked = walk(source, low, None);
+    assert_eq!(walked.stopped, Some(after), "{source:.30}");
+    walked
+  }
+
   /// Guard: what a node does after its children return is bounded as well as what it does on
-  /// the way down. Right-nested logical and conditional expressions and class heritages each
-  /// allocate their own result once the child below returns, and a named class copies itself
-  /// into its name, here already read in its heritage. With the cap crossed by the innermost
-  /// node (an arrow), every node above still completes, and the next statement is where
-  /// generation stops; or a child stops at its own check, and the nodes above complete after
-  /// it. Either way they add nothing past the cap: the variables over it, the objects, the
-  /// entries and the pending constraints are the same at two depths.
+  /// the way down. Each shape nests a node that completes after its child: logical and
+  /// conditional expressions and class heritages allocate their own result; a named class
+  /// copies itself into its name, here already read in its heritage; an object literal sets
+  /// its prototype (a slot and an inheritance constraint on an object made on the way down)
+  /// and records itself (`Shared::literals`); a method call records its name
+  /// (`Analysis::method_names`); an array literal stores into its elements; a getter is copied
+  /// in as the object's `this`; a named function expression copies itself into its name; and a
+  /// class declaration in an arrow, declared once its heritage returns, records its name and
+  /// makes it a local of the arrow.
+  /// With the cap crossed by the innermost node (an arrow), every node above still completes,
+  /// and the next statement is where generation stops; or a child stops at its own check, and
+  /// the nodes above complete after it. Either way what was made past the cap is the same at
+  /// two depths: variables, objects, entries, installed constraints, queued work, pending
+  /// constraints, functions, locals, object slots, records in the analysis and in the shared
+  /// tables.
   #[test]
   fn generation_allocates_nothing_past_the_cap_while_unwinding() {
     let chain = |open: &str, leaf: &str, close: &str, n: usize| {
       format!("const v = {}{leaf}{};\nconst after = 0;", open.repeat(n), close.repeat(n))
     };
-    // (open, leaf, close, variables allocated per level on the way down)
     let shapes = [
-      ("null || (", "() => {}", ")", 0),
-      ("null ? null : (", "() => {}", ")", 0),
-      ("(class extends ", "(() => {})", " {})", 0),
-      ("(class A extends (A, ", "() => {}", ") {})", 1),
-      ("[] || (", "null", ")", 0),
+      ("null || (", "() => {}", ")"),
+      ("null ? null : (", "() => {}", ")"),
+      ("(class extends ", "(() => {})", " {})"),
+      ("(class A extends (A, ", "() => {}", ") {})"),
+      ("({ __proto__: ", "() => {}", " })"),
+      ("o.m(", "() => {}", ")"),
+      ("[", "() => {}", "]"),
+      ("({ get a() { return ", "() => {}", " } })"),
+      ("(function f() { return ", "() => {}", " })"),
+      ("(() => { class A extends (", "() => {}", ") {} })"),
+      ("[] || (", "null", ")"),
     ];
-    for (open, leaf, close, per_level) in shapes {
+    for (open, leaf, close) in shapes {
       let mut past = vec![];
       for n in [50, 100] {
         let source = chain(open, leaf, close, n);
@@ -2558,20 +2657,130 @@ mod tests {
           walked
         } else {
           // The arrow's own variables cross the cap; nothing checks it until `after`.
-          let walked = walk(&source, per_level * n + 3, None);
-          let after = u32::try_from(source.find("const after").unwrap()).unwrap();
-          assert_eq!(walked.stopped, Some(after), "{source:.30}");
-          assert!(walked.objects <= 1, "{} objects: {source:.30}", walked.objects);
-          walked
+          crossing_at_leaf(&source, whole.used)
         };
         assert!(
-          walked.overshoot <= 2 && walked.restored,
-          "{} over: {source:.30}",
-          walked.overshoot
+          walked.overshoot <= 2 && walked.post.objs <= 1 && walked.restored,
+          "{} over, {:?}: {source:.30}",
+          walked.overshoot,
+          walked.post
         );
-        past.push((walked.overshoot, walked.objects, walked.entries, walked.pending));
+        past.push((walked.overshoot, walked.post, walked.post_records));
       }
-      assert_eq!(past[0], past[1], "(over, objects, entries, pending) by depth: {open}");
+      assert_eq!(past[0], past[1], "(over, past the cap, shared records) by depth: {open}");
     }
+  }
+
+  /// Generates each of `sources` as a module, in order, eagerly, with the variable cap
+  /// `headroom` above what the analysis held before. Every statement of the modules after the
+  /// first is lazy. With `stop`, no module is set up once the analysis is terminal, as
+  /// `LinkStage::effect_service_shaking` does. Returns how many modules were generated, and
+  /// what the analysis and the shared tables gained after the first.
+  fn modules(sources: &[String], headroom: usize, stop: bool) -> (usize, Work, usize) {
+    let allocator = Allocator::default();
+    let mut symbols = SymbolRefDb::new();
+    let mut parsed = vec![];
+    for (i, source) in sources.iter().enumerate() {
+      let module = ModuleIdx::from_raw_unchecked(u32::try_from(i).unwrap());
+      let program =
+        allocator.alloc(Parser::new(&allocator, source, SourceType::mjs()).parse().program);
+      let scoping = SemanticBuilder::new().build(program).semantic.into_scoping();
+      let db_scoping = self::scoping(&allocator, source);
+      let root = db_scoping.root_scope_id();
+      symbols.store_local_db(module, SymbolRefDbForModule::new(db_scoping, module, root));
+      parsed.push((module, &*program, scoping));
+    }
+    let mut a = Analysis::new();
+    let mut sh = shared(&symbols, sources.len(), &mut a);
+    a.set_var_cap(a.vars.len() + headroom);
+    let mut generated = 0;
+    let mut first = None;
+    for (module, program, scoping) in &parsed {
+      if stop && a.terminal() {
+        break;
+      }
+      let symbol = |name: String| scoping.symbol_ids().find(|s| scoping.symbol_name(*s) == name);
+      let lazy_stmts = if generated == 0 {
+        FxHashMap::default()
+      } else {
+        (0..program.body.len())
+          .map(|i| (i, vec![(*module, symbol(format!("x{i}")).unwrap()).into()]))
+          .collect()
+      };
+      let facts = ModuleFacts {
+        module: *module,
+        scoping,
+        external_imports: FxHashMap::default(),
+        cjs_imports: FxHashSet::default(),
+        dynamic_imports: FxHashMap::default(),
+        default_export: (*module, scoping.symbol_ids().next().expect("a symbol")).into(),
+        lazy_stmts,
+      };
+      let mut g = Gen::new(&mut a, &mut sh, &facts);
+      g.program(program, false);
+      drop(g);
+      generated += 1;
+      first.get_or_insert((a.work(), sh.records()));
+    }
+    let (work, records) = first.expect("the first module is generated");
+    (generated, since(a.work(), work), sh.records() - records)
+  }
+
+  /// Guard: past the cap, the modules after the one that crossed it add nothing. The first
+  /// module's arrow crosses a low cap. Its later modules, each of lazy statements, are not set
+  /// up at all once the analysis is terminal (`Analysis::terminal`, as the pass's module loop
+  /// checks). A generator built for one anyway adds its module's body and nothing else: no
+  /// variable, object, entry, constraint, slot or record, and none of its statements, lazy or
+  /// not. The same holds with two modules of 5 statements and six of 40.
+  #[test]
+  fn generation_adds_nothing_after_the_module_that_ran_out() {
+    for (count, statements) in [(2, 5), (6, 40)] {
+      let tail =
+        (0..statements).map(|i| format!("const x{i} = {{}};")).collect::<Vec<_>>().join("\n");
+      let mut sources = vec!["const v = () => {};\nconst after = 0;".to_string()];
+      sources.extend(std::iter::repeat_n(tail, count));
+      let (generated, work, records) = modules(&sources, 3, true);
+      assert_eq!((generated, work, records), (1, Work::default(), 0), "{count} modules");
+      let (generated, work, records) = modules(&sources, 3, false);
+      let bodies = Work { fns: count, ..Work::default() };
+      assert_eq!((generated, work, records), (count + 1, bodies, 0), "{count} modules");
+    }
+  }
+
+  /// Guard: running out is terminal even when the totals come back under the cap. Generation
+  /// crosses an entry cap and is handed the sink. Widening a variable then takes entries off,
+  /// below the cap: a later generator is still handed the sink, and the solve stops at once
+  /// keeping everything, without generating the deferred body activated for it.
+  #[test]
+  fn generation_exhaustion_is_terminal_after_widening() {
+    let mut a = Analysis::new();
+    a.widen_limit = 8;
+    let wide = a.var();
+    // Numbers, which carry nothing across a boundary.
+    let objs: Vec<_> = (0..9).map(|i| a.num(i)).collect();
+    for o in &objs[..8] {
+      a.seed(wide, *o);
+    }
+    a.set_entry_cap(a.total_pts + a.total_copies);
+    a.generating = true;
+    let (v, o) = (a.var(), a.alloc(ObjKind::Object, None));
+    a.seed(v, o);
+    let sink = a.var();
+    assert_eq!(a.var(), sink);
+    // Between generators, a ninth value widens `wide`: its eight objects go, the opaque
+    // value comes.
+    a.generating = false;
+    a.seed(wide, objs[8]);
+    assert!(!a.over_budget(), "widening took the entries back under the cap");
+    // The next generator is still handed the sink.
+    a.generating = true;
+    assert_eq!(a.var(), sink);
+    a.generating = false;
+    let vars = std::array::from_fn(|_| a.var());
+    let f = a.fns.push(FnInfo::new(ModuleIdx::from_raw_unchecked(0), 0, FnKind::Normal, vars));
+    a.fns[f].deferred = true;
+    a.activate(f);
+    a.solve_with(&mut |_, _| panic!("a body generated past exhaustion"));
+    assert!(a.budget_exceeded && a.bail_all);
   }
 }

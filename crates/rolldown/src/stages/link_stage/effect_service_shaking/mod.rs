@@ -926,6 +926,11 @@ impl LinkStage<'_> {
     let mut deferred: FxHashMap<FnId, (ModuleIdx, DeferredStatement)> = FxHashMap::default();
     let mut deferred_modules: FxHashMap<ModuleIdx, (ModuleFacts<'_>, u32)> = FxHashMap::default();
     for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
+      // Past the budget the solve keeps everything (`Analysis::solve_with`): later modules are
+      // not set up or generated.
+      if a.terminal() {
+        break;
+      }
       let Module::Normal(normal) = module else { continue };
       let Some(ast) = self.ast_table[normal.idx].as_ref() else { continue };
       // Modelled modules sit behind rules; their bodies are never analysed.
@@ -1006,86 +1011,91 @@ impl LinkStage<'_> {
       phase!("generated {} ({} vars, {} objs)", normal.id.as_ref(), a.vars.len(), a.objs.len());
     }
 
-    // == namespace objects hold every export
-    for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
-      let Module::Normal(normal) = module else { continue };
-      let ns = sh.namespace_objs[&normal.idx];
-      let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(normal.idx);
-      for (name, symbol) in exports {
-        let v = sh.symbol_var(&mut a, symbol);
-        let f = a.field(ns, &name);
-        a.copy(v, f);
-      }
-      if sh.cjs_modules.contains(&normal.idx) {
-        let elem = a.elem(ns);
-        let value = sh.hole_values.get(&normal.idx).copied().unwrap_or(a.top_ext);
-        a.seed(elem, value);
-      }
-    }
-
-    // == entry exports escape to the consumer
-    for idx in self.user_defined_entry_modules.iter().copied().collect::<Vec<_>>() {
-      let Module::Normal(normal) = &self.module_table.modules[idx] else { continue };
-      let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(idx);
-      for (_, symbol) in exports {
-        lazy_roots.push(symbol);
-        let v = sh.symbol_var(&mut a, symbol);
-        a.constrain(v, Constraint::Escape(Flavour::Ext, None));
-      }
-      if sh.cjs_modules.contains(&idx) || self.metas[idx].has_dynamic_exports {
-        let ns = sh.namespace_objs[&normal.idx];
-        let v = a.var();
-        a.seed(v, ns);
-        a.constrain(v, Constraint::Escape(Flavour::Ext, None));
-      }
-    }
-
-    // == lazy top-level statements: a reference activates the statement declaring the symbol
-    // (design.md, principle 2). Roots are the references made outside generated code.
+    // Past the budget, nothing below sets up the solve: it stops at once keeping everything.
+    let terminal = a.terminal();
     let mut seen: FxHashSet<(FnId, FnId)> = FxHashSet::default();
-    {
-      add_activations(&mut a, &mut sh, &mut seen, None);
-      for module in order.iter().copied() {
-        let Some(ns) = sh.namespace_objs.get(&module).copied() else { continue };
-        let mut all: Vec<FnId> = sh.lazy_by_module.get(&module).cloned().unwrap_or_default();
-        for (name, symbol) in self.sorted_exports(module) {
-          let canonical = self.symbols.canonical_ref_for(symbol);
-          if let Some(l) = sh.lazy_decls.get(&canonical).copied() {
-            a.lazy_exports.insert((ns, name), l);
-            all.push(l);
+    if !terminal {
+      // == namespace objects hold every export
+      for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
+        let Module::Normal(normal) = module else { continue };
+        let ns = sh.namespace_objs[&normal.idx];
+        let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(normal.idx);
+        for (name, symbol) in exports {
+          let v = sh.symbol_var(&mut a, symbol);
+          let f = a.field(ns, &name);
+          a.copy(v, f);
+        }
+        if sh.cjs_modules.contains(&normal.idx) {
+          let elem = a.elem(ns);
+          let value = sh.hole_values.get(&normal.idx).copied().unwrap_or(a.top_ext);
+          a.seed(elem, value);
+        }
+      }
+
+      // == entry exports escape to the consumer
+      for idx in self.user_defined_entry_modules.iter().copied().collect::<Vec<_>>() {
+        let Module::Normal(normal) = &self.module_table.modules[idx] else { continue };
+        let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(idx);
+        for (_, symbol) in exports {
+          lazy_roots.push(symbol);
+          let v = sh.symbol_var(&mut a, symbol);
+          a.constrain(v, Constraint::Escape(Flavour::Ext, None));
+        }
+        if sh.cjs_modules.contains(&idx) || self.metas[idx].has_dynamic_exports {
+          let ns = sh.namespace_objs[&normal.idx];
+          let v = a.var();
+          a.seed(v, ns);
+          a.constrain(v, Constraint::Escape(Flavour::Ext, None));
+        }
+      }
+
+      // == lazy top-level statements: a reference activates the statement declaring the symbol
+      // (design.md, principle 2). Roots are the references made outside generated code.
+      {
+        add_activations(&mut a, &mut sh, &mut seen, None);
+        for module in order.iter().copied() {
+          let Some(ns) = sh.namespace_objs.get(&module).copied() else { continue };
+          let mut all: Vec<FnId> = sh.lazy_by_module.get(&module).cloned().unwrap_or_default();
+          for (name, symbol) in self.sorted_exports(module) {
+            let canonical = self.symbols.canonical_ref_for(symbol);
+            if let Some(l) = sh.lazy_decls.get(&canonical).copied() {
+              a.lazy_exports.insert((ns, name), l);
+              all.push(l);
+            }
+          }
+          if !all.is_empty() {
+            a.lazy_namespaces.insert(ns, all);
           }
         }
-        if !all.is_empty() {
-          a.lazy_namespaces.insert(ns, all);
+        for sym in lazy_roots {
+          if let Some(l) = sh.lazy_decls.get(&self.symbols.canonical_ref_for(sym)).copied() {
+            a.activate(l);
+          }
         }
       }
-      for sym in lazy_roots {
-        if let Some(l) = sh.lazy_decls.get(&self.symbols.canonical_ref_for(sym)).copied() {
-          a.activate(l);
-        }
-      }
-    }
 
-    // == type bounds (design section 8): the exported functions of the modules analysed under the
-    // service-constructor exception, bounded by the `.d.ts` next to each and resolved when first
-    // called. They are the only `effect` functions whose bodies are analysed; a call into any
-    // other `effect` module goes through the type model, which reads the same declarations.
-    for module in order.iter().copied().filter(|m| analysed.contains(m) && !modelled.contains(m)) {
-      let dts_path = declarations(module).expect("checked with the declarations");
-      let Some(ast) = self.ast_table[module].as_ref() else { continue };
-      for (name, f, returned) in exported_functions(ast.program()) {
-        a.lazy_bounds.insert((module, f.0), (dts_path.clone(), name.clone(), f.1, false));
-        if let Some(r) = returned {
-          a.lazy_bounds.entry((module, r.0)).or_insert((dts_path.clone(), name, r.1, true));
+      // == type bounds (design section 8): the exported functions of the modules analysed under the
+      // service-constructor exception, bounded by the `.d.ts` next to each and resolved when first
+      // called. They are the only `effect` functions whose bodies are analysed; a call into any
+      // other `effect` module goes through the type model, which reads the same declarations.
+      for module in order.iter().copied().filter(|m| analysed.contains(m) && !modelled.contains(m))
+      {
+        let dts_path = declarations(module).expect("checked with the declarations");
+        let Some(ast) = self.ast_table[module].as_ref() else { continue };
+        for (name, f, returned) in exported_functions(ast.program()) {
+          a.lazy_bounds.insert((module, f.0), (dts_path.clone(), name.clone(), f.1, false));
+          if let Some(r) = returned {
+            a.lazy_bounds.entry((module, r.0)).or_insert((dts_path.clone(), name, r.1, true));
+          }
         }
       }
-    }
 
-    // == solve. A deferred statement is generated when the solve first installs it, and the
-    // activations its references add join its bodies' pending constraints, as `add_activations`
-    // adds them above for the rest.
-    for f in module_fns {
-      a.activate(f);
+      // == solve. A deferred statement is generated when the solve first installs it, and the
+      // activations its references add join its bodies' pending constraints, as `add_activations`
+      // adds them above for the rest.
+      for f in module_fns {
+        a.activate(f);
+      }
     }
     rounds.deferred += deferred.len();
     rounds.kept_eager += sh.kept_eager;
@@ -1115,9 +1125,10 @@ impl LinkStage<'_> {
       };
       a.solve_with(&mut generate);
     }
-    // Fail closed: a statement generated part way keeps everything.
+    // Fail closed: a statement generated part way, or one that used the sink, keeps everything.
     assert!(
-      a.generation_stopped.is_none() || (a.budget_exceeded && a.bail_all),
+      !(terminal || a.exhausted() || a.generation_stopped.is_some())
+        || (a.budget_exceeded && a.bail_all),
       "a solve whose generation stopped part way must keep every method"
     );
     drop(deferred_modules);

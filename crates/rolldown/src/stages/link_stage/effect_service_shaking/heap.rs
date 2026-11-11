@@ -944,6 +944,26 @@ impl Marks {
   }
 }
 
+/// Counts of what the analysis holds (`Analysis::work`): variables, objects and entries;
+/// constraints installed, and variables, constraints and functions queued for the solve;
+/// constraints pending in function bodies; functions and their locals; object slots (fields, elements,
+/// prototypes); and records keyed by site or object (method names, builtins, inheritance,
+/// class crossings, hole relations).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Work {
+  pub vars: usize,
+  pub objs: usize,
+  pub entries: u64,
+  pub constraints: usize,
+  pub queued: usize,
+  pub pending: usize,
+  pub fns: usize,
+  pub locals: usize,
+  pub slots: usize,
+  pub records: usize,
+}
+
 #[expect(clippy::struct_excessive_bools, reason = "independent switches of the analysis")]
 pub struct Analysis {
   pub vars: IndexVec<VarId, Var>,
@@ -1006,6 +1026,15 @@ pub struct Analysis {
   pub(super) generating: bool,
   sink_var: Option<VarId>,
   sink_obj: Option<ObjId>,
+  /// Set the first time generation finds the budget over (`generation_exhausted`) and never
+  /// cleared. From then on what generation made may hold the sink in place of its own
+  /// variables and objects, so the solve stops at once (`solve_with`), whatever the totals
+  /// become afterwards: widening takes entries off them.
+  exhausted: bool,
+  /// What the analysis held when generation first found the budget over, for tests counting
+  /// what it does afterwards.
+  #[cfg(test)]
+  pub(super) at_exhaustion: Option<Work>,
   /// Objects each walk pool has walked.
   walked: FxHashSet<(VarId, ObjId)>,
   /// The program-wide pools of the protocol and hashing walks (`Walk`).
@@ -1302,6 +1331,9 @@ impl Analysis {
       generating: false,
       sink_var: None,
       sink_obj: None,
+      exhausted: false,
+      #[cfg(test)]
+      at_exhaustion: None,
       walked: FxHashSet::default(),
       ignored_pool: None,
       prim_arg: None,
@@ -1467,13 +1499,37 @@ impl Analysis {
 
   /// Generation ran past the budget: the solve will stop before installing anything more
   /// (`solve_with`), keeping everything, so what generation still does is only unwinding. From
-  /// here every variable and object it allocates is the sink (`var`, `alloc`), and it drops
-  /// what it would add to the analysis (`Gen::emit`, `Gen::install`). Past the cap, a
-  /// generator allocates at most the sink variable and object, wherever it is, and nothing in
-  /// proportion to how deep it is when the cap is crossed or after a child stopped.
+  /// here every variable and object it allocates is the sink (`var`, `alloc`); no prototype
+  /// slot is made for an object made before (`proto_var`), the one slot a node completing
+  /// after its child makes on its own object; and the generator drops what it would add to the
+  /// analysis or record about what it generated (`Gen::exhausted` lists where). Past the cap,
+  /// a generator allocates at most the sink variable and object, wherever it is, and nothing in
+  /// proportion to how deep it is when the cap is crossed or after a child stopped. The first
+  /// time it is found over latches `exhausted`.
   #[inline]
-  pub(super) fn generation_exhausted(&self) -> bool {
-    self.generating && self.over_budget()
+  pub(super) fn generation_exhausted(&mut self) -> bool {
+    if !self.generating {
+      return false;
+    }
+    if !self.exhausted && self.over_budget() {
+      self.exhausted = true;
+      #[cfg(test)]
+      {
+        self.at_exhaustion = Some(self.work());
+      }
+    }
+    self.exhausted
+  }
+
+  /// Generation ran past the budget (`generation_exhausted`): the analysis is terminal.
+  pub(super) fn exhausted(&self) -> bool {
+    self.exhausted
+  }
+
+  /// The solve will stop at once, keeping everything (`solve_with`): generation ran past the
+  /// budget, or the analysis is over it. Nothing more needs setting up or generating.
+  pub(super) fn terminal(&self) -> bool {
+    self.exhausted || self.over_budget()
   }
 
   pub fn rule(&mut self, name: &'static str, rule: Rule) -> u16 {
@@ -1855,6 +1911,9 @@ impl Analysis {
     if let Some(v) = self.objs[obj].proto {
       return v;
     }
+    if self.generation_exhausted() {
+      return self.var();
+    }
     let v = self.var();
     self.objs[obj].proto = Some(v);
     // Whatever becomes this object's prototype is inherited from by it, and by every object
@@ -2104,6 +2163,42 @@ impl Analysis {
       || self.total_pts + self.total_copies > self.env_limits.entries.unwrap_or(self.max_entries)
   }
 
+  /// Sets the entry cap, for tests that run out of entries at a chosen point.
+  #[cfg(test)]
+  pub(super) fn set_entry_cap(&mut self, entries: u64) {
+    self.env_limits.entries = Some(entries);
+  }
+
+  /// What the analysis holds, for tests counting what generation did.
+  #[cfg(test)]
+  pub(super) fn work(&self) -> Work {
+    Work {
+      vars: self.vars.len(),
+      objs: self.objs.len(),
+      entries: self.total_pts + self.total_copies,
+      constraints: self.vars.iter().map(|v| v.constraints.len()).sum(),
+      queued: self.new_constraints.len() + self.worklist.len() + self.activation_queue.len(),
+      pending: self.fns.iter().map(|f| f.pending.len()).sum(),
+      fns: self.fns.len(),
+      locals: self.fns.iter().map(|f| f.locals.len()).sum(),
+      slots: self
+        .objs
+        .iter()
+        .map(|o| {
+          o.fields.len()
+            + usize::from(o.elem.is_some())
+            + usize::from(o.named_elem.is_some())
+            + usize::from(o.proto.is_some())
+        })
+        .sum(),
+      records: self.method_names.len()
+        + self.builtins.len()
+        + self.inherits.len()
+        + self.class_escaped.len()
+        + self.hole_related.len(),
+    }
+  }
+
   /// Counts of objects by kind (and builtins by rule), for diagnosing runaway analyses.
   pub fn histogram(&self) -> String {
     let mut counts: FxHashMap<String, usize> = FxHashMap::default();
@@ -2220,7 +2315,7 @@ impl Analysis {
   /// before installing anything of it, terminally (every method kept, no retry).
   pub fn solve_with(&mut self, generate: &mut dyn FnMut(&mut Analysis, FnId)) {
     'solve: loop {
-      if self.over_budget() || self.generation_stopped.is_some() {
+      if self.exhausted || self.over_budget() {
         self.budget_exceeded = true;
         if self.debug {
           self.report_demand_at_stop();
@@ -2238,7 +2333,7 @@ impl Analysis {
           generate(self, f);
           // A body generated part way, or one that ran past the budget, is never installed: the
           // loop's start stops the solve.
-          if self.generation_stopped.is_some() || self.over_budget() {
+          if self.exhausted || self.over_budget() {
             self.budget_exceeded_generating = true;
             continue 'solve;
           }
