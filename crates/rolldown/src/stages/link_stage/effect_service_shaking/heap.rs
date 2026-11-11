@@ -3220,6 +3220,10 @@ impl Analysis {
           let site = (!self.genuine_escaped.contains(&obj)).then_some(EFFECT_ESCAPE);
           self.constrain(src, Constraint::Escape(Flavour::Ext, site));
         }
+        // And after a host escape, as the fields it had then did (`escape_with`).
+        if let Some(Flavour::Host) = self.objs[obj].escaped {
+          self.constrain(src, Constraint::Escape(Flavour::Host, None));
+        }
         for class in self.crossed_classes(obj) {
           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
         }
@@ -6530,6 +6534,9 @@ impl Analysis {
           if let Some(Flavour::Ext) = self.objs[target].escaped {
             let site = (!self.genuine_escaped.contains(&target)).then_some(EFFECT_ESCAPE);
             self.constrain(holder, Constraint::Escape(Flavour::Ext, site));
+          }
+          if let Some(Flavour::Host) = self.objs[target].escaped {
+            self.constrain(holder, Constraint::Escape(Flavour::Host, None));
           }
         }
         if !self.objs[obj].spread_into.contains(&target) {
