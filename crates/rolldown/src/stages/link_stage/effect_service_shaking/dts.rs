@@ -25,8 +25,10 @@ use oxc::ast::ast::{
 };
 use oxc::parser::Parser;
 use oxc::span::SourceType;
+use rolldown_utils::rayon::{IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::FxHashMap;
 use self_cell::self_cell;
+use sugar_path::SugarPath;
 
 /// What a declared type admits. `members` lists alternatives: an object passes one if it has
 /// every member named there (own fields or prototype chain). `ignored` marks an `unknown`/`any`
@@ -166,6 +168,29 @@ self_cell!(
     dependent: Index,
   }
 );
+
+// SAFETY: as for `rolldown_ecmascript::EcmaAst`: the `Allocator` is `Send`, and the arena and
+// the source move with the cell. Every reference in the index points into them, and nothing
+// outside the cell refers into them. `Dts::preload` parses a file on one thread and hands it
+// over whole; it is only read after that.
+unsafe impl Send for DtsFile {}
+
+/// A `.d.ts` file parsed into its index (`Dts::file`, `Dts::preload`).
+fn parse(path: &Path, source: String) -> DtsFile {
+  let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+  DtsFile::new(Owner { source, allocator: Allocator::default() }, |owner| {
+    let ret = Parser::new(&owner.allocator, &owner.source, SourceType::d_ts()).parse();
+    let program: &Program<'_> = owner.allocator.alloc(ret.program);
+    index(program, dir, path.file_name().map(|n| n.to_string_lossy().to_string()))
+  })
+}
+
+/// What `Dts::preload` found at a path.
+pub enum Read {
+  Missing,
+  Unreadable(std::io::Error),
+  Parsed,
+}
 
 struct Sig<'a> {
   params: Vec<(Option<&'a TSType<'a>>, bool)>,
@@ -1244,18 +1269,55 @@ impl Dts {
     if let Some(f) = self.by_path.borrow().get(path) {
       return *f;
     }
-    let parsed = std::fs::read_to_string(path).ok().map(|source| {
-      let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-      let cell = DtsFile::new(Owner { source, allocator: Allocator::default() }, |owner| {
-        let ret = Parser::new(&owner.allocator, &owner.source, SourceType::d_ts()).parse();
-        let program: &Program<'_> = owner.allocator.alloc(ret.program);
-        index(program, dir, path.file_name().map(|n| n.to_string_lossy().to_string()))
-      });
-      self.files_parsed.set(self.files_parsed.get() + 1);
-      self.files.push(cell)
-    });
+    // Relative specifiers resolve lexically, so `dist/http/../Effect.d.ts` is `dist/Effect.d.ts`:
+    // each file is parsed once, under its normalized path, whichever way it was reached.
+    let normalized = path.normalize();
+    if normalized != path {
+      let f = self.file(&normalized);
+      self.by_path.borrow_mut().insert(path.to_path_buf(), f);
+      return f;
+    }
+    let parsed = std::fs::read_to_string(path).ok().map(|source| self.add(parse(path, source)));
     self.by_path.borrow_mut().insert(path.to_path_buf(), parsed);
     parsed
+  }
+
+  fn add(&self, file: DtsFile) -> usize {
+    self.files_parsed.set(self.files_parsed.get() + 1);
+    self.files.push(file)
+  }
+
+  /// Reads and parses the files at `paths` in parallel, ahead of the lookups that need them
+  /// (`file`), and reports for each whether it is missing or can't be read. A file that is
+  /// neither is parsed once, under its normalized path; one that is is left to `file`.
+  pub fn preload(&self, paths: &[PathBuf]) -> Vec<Read> {
+    let reads: Vec<(PathBuf, Result<DtsFile, Read>)> = paths
+      .par_iter()
+      .map(|path| {
+        let path = path.normalize().into_owned();
+        let read = if path.is_file() {
+          std::fs::read_to_string(&path)
+            .map(|source| parse(&path, source))
+            .map_err(Read::Unreadable)
+        } else {
+          Err(Read::Missing)
+        };
+        (path, read)
+      })
+      .collect();
+    reads
+      .into_iter()
+      .map(|(path, read)| match read {
+        Ok(file) => {
+          if !self.by_path.borrow().contains_key(&path) {
+            let f = self.add(file);
+            self.by_path.borrow_mut().insert(path, Some(f));
+          }
+          Read::Parsed
+        }
+        Err(read) => read,
+      })
+      .collect()
   }
 
   /// An exported name, as (file, local name).

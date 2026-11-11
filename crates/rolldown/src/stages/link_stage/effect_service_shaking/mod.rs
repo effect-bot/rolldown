@@ -40,6 +40,9 @@ struct Rounds {
   entries: u64,
   steps: u64,
   solve: std::time::Duration,
+  /// The `.d.ts` files the previous solve parsed. They depend on nothing but the files, so the
+  /// next solve starts with them instead of parsing them again.
+  dts: Option<dts::Dts>,
 }
 
 impl LinkStage<'_> {
@@ -88,6 +91,9 @@ impl LinkStage<'_> {
     }
     if let Some(max) = self.options.experimental.effect_service_shaking_max_entries {
       a.max_entries = max;
+    }
+    if let Some(dts) = rounds.dts.take() {
+      a.dts = dts;
     }
     host::register(&mut a);
     effect::register(&mut a);
@@ -258,14 +264,26 @@ impl LinkStage<'_> {
         .strip_suffix(".js")
         .map(|js| std::path::PathBuf::from(format!("{js}.d.ts")))
     };
-    for module in order.iter().copied().filter(|m| is_effect_module(*m)) {
+    // They are read and parsed in parallel here, since the model reads most of them. A later
+    // solve has the same modules, whose declarations the first one found readable and parsed.
+    let effect_modules: Vec<(ModuleIdx, Option<std::path::PathBuf>)> = order
+      .iter()
+      .copied()
+      .filter(|m| rounds.count == 0 && is_effect_module(*m))
+      .map(|m| (m, declarations(m)))
+      .collect();
+    let paths: Vec<std::path::PathBuf> =
+      effect_modules.iter().filter_map(|(_, dts)| dts.clone()).collect();
+    let mut reads = a.dts.preload(&paths).into_iter();
+    for (module, dts) in effect_modules {
       let id = self.module_table[module].id().as_str();
-      let problem = match declarations(module) {
-        None => Some(format!("`{id}` has no `.d.ts` declarations")),
-        Some(dts) if !dts.is_file() => Some(format!("`{}` is missing", dts.display())),
-        Some(dts) => std::fs::read_to_string(&dts)
-          .err()
-          .map(|err| format!("`{}` can't be read ({err})", dts.display())),
+      let problem = match (dts, reads.next()) {
+        (None, _) => Some(format!("`{id}` has no `.d.ts` declarations")),
+        (Some(dts), Some(dts::Read::Missing)) => Some(format!("`{}` is missing", dts.display())),
+        (Some(dts), Some(dts::Read::Unreadable(err))) => {
+          Some(format!("`{}` can't be read ({err})", dts.display()))
+        }
+        (Some(_), _) => None,
       };
       if let Some(problem) = problem {
         self.warn_effect_service_shaking(format!(
@@ -721,6 +739,7 @@ impl LinkStage<'_> {
         );
       }
       analysed_holes.extend(reached);
+      rounds.dts = Some(std::mem::take(&mut a.dts));
       return true;
     }
     if debug {
