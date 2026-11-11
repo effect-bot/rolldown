@@ -29,6 +29,10 @@
 //! `dist/deterministic` and compares what the pass reports about each solve
 //! (see its doc comment).
 //!
+//! `deferred_generation_matches_eager` (`deferred_generation.rs`) builds these
+//! programs and every `tree_shaking/effect_service` fixture with eager and with
+//! deferred generation and compares the bundles and the decision records.
+//!
 //! The builds run in the test process, so every program runs under
 //! `rolldown_testing::memory_guard`. If the analysis runs away, the process
 //! stops at `ROLLDOWN_TEST_MAX_RSS_MB` (6 GiB by default) instead of
@@ -41,6 +45,8 @@ use rolldown::{
   Bundler, BundlerOptions, ExperimentalOptions, InputItem, IsExternal, OutputFormat, Platform,
 };
 use serde::Deserialize;
+
+mod deferred_generation;
 
 const PROGRAMS: &str =
   concat!(env!("CARGO_MANIFEST_DIR"), "/tests/rolldown/topics/effect_service_acceptance/programs");
@@ -400,13 +406,20 @@ async fn unreadable_declarations() {
 /// timings: what the solve produced (`vars`, `objs`, `steps`, `removed`).
 type Report = Vec<(String, String)>;
 
-/// Every solve reported in the process, with the thread its build ran on.
+/// Every solve reported in the process, with the thread its build ran on, and
+/// every decision record (the `effect service shaking decisions` event).
 #[derive(Default)]
-struct SolveReports(std::sync::Mutex<Vec<(std::thread::ThreadId, Report)>>);
+struct SolveReports(
+  std::sync::Mutex<Vec<(std::thread::ThreadId, Report)>>,
+  std::sync::Mutex<Vec<(std::thread::ThreadId, String)>>,
+);
 
 struct Fields(Report);
 
 impl tracing::field::Visit for Fields {
+  fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+    self.0.push((field.name().to_string(), value.to_string()));
+  }
   fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
     self.0.push((field.name().to_string(), format!("{value:?}")));
   }
@@ -427,6 +440,13 @@ impl tracing::Subscriber for SolveReports {
     if fields.0.iter().any(|(name, value)| name == "message" && value == "effect service shaking") {
       fields.0.retain(|(name, _)| !matches!(name.as_str(), "message" | "solve_ms" | "active_ms"));
       self.0.lock().unwrap().push((std::thread::current().id(), fields.0));
+    } else if fields
+      .0
+      .iter()
+      .any(|(name, value)| name == "message" && value == "effect service shaking decisions")
+    {
+      let record = fields.0.into_iter().find(|(name, _)| name == "decisions").map(|(_, v)| v);
+      self.1.lock().unwrap().push((std::thread::current().id(), record.unwrap_or_default()));
     }
   }
   fn enter(&self, _: &tracing::span::Id) {}

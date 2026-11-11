@@ -1,0 +1,10 @@
+{
+  "_comment": "Deferred generation (B1), the control for deferred_dormant_unsafe_lookup: lazy statements whose generation records facts at once (an allocation seeded into its binding, class method names, a literal and its declarations) stay dormant or are reached late, through a callback the service hands back. An unread provider initialiser that names a lazy binding declared before it is removed only if that binding's declaration was generated (its initialisation is checked). deferred_generation_matches_eager compares the decisions.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

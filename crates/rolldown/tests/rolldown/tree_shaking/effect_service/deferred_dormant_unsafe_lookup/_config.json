@@ -1,0 +1,10 @@
+{
+  "_comment": "Deferred generation (B1): a class that looks a service up by key string with Context.getOrUndefinedUnsafe sits in a lazy statement nothing reaches. Eager generation bails on it while generating; deferred generation keeps such a statement eager, so it bails the same way and every method stays. deferred_generation_matches_eager compares the bail reason.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

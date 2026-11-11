@@ -1,0 +1,11 @@
+{
+  "_comment": "Deferred generation (B1): two callers at distinct sites hand a shared lazy helper callbacks whose service values arrive late, declared in two orders, with a widening limit of 2 so the helper's parameters widen. Generating the statements as they are reached changes the order values arrive in; deferred_generation_matches_eager compares activation, per-site flows, escapes, key bails, widening and removals with eager generation.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true,
+      "effectServiceShakingWiden": 2
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

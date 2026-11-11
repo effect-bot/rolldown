@@ -1,0 +1,10 @@
+{
+  "_comment": "Deferred generation (B1): lazy statements reached through a renamed re-export, a namespace member read, a whole namespace, an entry re-export and a function that names a statement declared later and one in another module are generated when first reached, some by more than one path. Each one's service read survives; the unread method goes. deferred_generation_matches_eager compares this fixture's decisions with eager generation.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
