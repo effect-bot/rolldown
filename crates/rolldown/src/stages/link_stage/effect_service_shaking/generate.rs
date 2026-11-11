@@ -306,7 +306,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   /// Checks the allocation budget before a statement, expression or other child node at `start`
   /// is generated: every loop over a node's children checks it, including the walks that never
-  /// enter an expression (parameters, binding and assignment patterns, class members).
+  /// enter an expression (parameters, binding and assignment patterns, class members), and so
+  /// does each level of a walk that recurses without a loop (nested patterns, `super`'s
+  /// heritages).
   /// Once it has run out, generation stops for the rest of the solve: what was generated stays
   /// partial, and the solve ends at once keeping everything (`Analysis::solve_with`), so no
   /// partial body is ever pruned against.
@@ -886,6 +888,12 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn bind_pattern(&mut self, pattern: &BindingPattern<'_>, src: VarId, kind: DeclKind) {
+    // Patterns nest with no sibling in between (`[...[...[...tail]]]`): each level checks.
+    if !matches!(pattern, BindingPattern::BindingIdentifier(_))
+      && self.checkpoint(oxc::span::GetSpan::span(pattern).start)
+    {
+      return;
+    }
     match pattern {
       BindingPattern::BindingIdentifier(id) => {
         self.record_decl(id, kind);
@@ -1483,7 +1491,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   fn member_object(&mut self, object: &Expression<'_>) -> VarId {
     match object {
-      Expression::Super(_) => self.super_prototype(),
+      Expression::Super(s) => self.super_prototype(s.span.start),
       other => self.expr(other),
     }
   }
@@ -1494,13 +1502,17 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   /// members), of every enclosing class, since a nested class's computed keys see the outer
   /// `super`. Class code bails what reaches it (`Analysis::class_bail`), so this need not tell
   /// static from instance members or one class from another.
-  fn super_prototype(&mut self) -> VarId {
+  /// Nested classes make the heritages as many as the input is deep: each checks the budget.
+  fn super_prototype(&mut self, start: u32) -> VarId {
     let heritages: Vec<VarId> = self.class_stack.iter().flatten().copied().collect();
     if heritages.is_empty() {
       return self.sh.top_host;
     }
     let v = self.fresh();
     for h in heritages {
+      if self.checkpoint(start) {
+        break;
+      }
       self.copy(h, v);
       let prototype = self.load(h, Key::Name(ArcStr::from("prototype")));
       self.copy(prototype, v);
@@ -1616,7 +1628,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
         self.run_time_string(expr)
       }
       Expression::Identifier(id) => self.reference_var(id),
-      Expression::Super(_) => self.super_prototype(),
+      Expression::Super(s) => self.super_prototype(s.span.start),
       Expression::ArrayExpression(arr) => {
         let (obj, v) = self.alloc(ObjKind::Array, arr.span.start);
         let elem = self.a.elem(obj);
@@ -2036,6 +2048,14 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn assign_target(&mut self, target: &AssignmentTarget<'_>, value: VarId) {
+    // Like `bind_pattern`, nested destructuring targets check at each level.
+    if matches!(
+      target,
+      AssignmentTarget::ArrayAssignmentTarget(_) | AssignmentTarget::ObjectAssignmentTarget(_)
+    ) && self.checkpoint(oxc::span::GetSpan::span(target).start)
+    {
+      return;
+    }
     match target {
       AssignmentTarget::AssignmentTargetIdentifier(id) => {
         let v = self.reference_var(id);
@@ -2296,6 +2316,12 @@ mod tests {
     declared: FxHashSet<String>,
     /// Closures allocated.
     closures: usize,
+    /// Variables allocated: all of them, and those past the cap.
+    used: usize,
+    overshoot: usize,
+    /// The generator's context (enclosing functions, classes, `switch` cases, `try` blocks,
+    /// binding being declared) is back at the top level.
+    restored: bool,
   }
 
   /// Generates `source` as the only module, eagerly. `key` names a binding that counts as a
@@ -2360,12 +2386,29 @@ mod tests {
       lazy_stmts: FxHashMap::default(),
     };
     let mut g = Gen::new(&mut a, &mut sh, &facts);
-    let cap = g.a.vars.len() + headroom;
+    let start = g.a.vars.len();
+    let cap = start + headroom;
     g.a.set_var_cap(cap);
     g.program(program, false);
+    let restored = g.cur == g.module_fn
+      && g.this_stack.len() == 1
+      && g.class_stack.is_empty()
+      && g.generator_stack.len() == 1
+      && g.tdz_until.is_none()
+      && g.case_stack.is_empty()
+      && g.try_throws.is_empty()
+      && g.lazy_owner.is_none();
+    let (used, overshoot) = (a.vars.len() - start, a.vars.len().saturating_sub(cap));
     let declared = sh.decls.keys().map(|s| scoping.symbol_name(s.symbol).to_string()).collect();
     let closures = a.objs.iter().filter(|o| matches!(o.kind, ObjKind::Closure(_))).count();
-    Walked { stopped: a.generation_stopped.map(|s| s.start), declared, closures }
+    Walked {
+      stopped: a.generation_stopped.map(|s| s.start),
+      declared,
+      closures,
+      used,
+      overshoot,
+      restored,
+    }
   }
 
   /// `n` comma-separated names, `prefix0` to `prefix{n-1}`.
@@ -2408,5 +2451,44 @@ mod tests {
     let walked = walk(&class, 100, Some("K"));
     stopped_between(&walked, &class, "m1()", &format!("m{}()", n - 1));
     assert!(walked.closures > 0 && walked.closures < n / 2, "{} closures", walked.closures);
+  }
+
+  /// Guard: recursive walks check the budget per level, not only per sibling. Rest elements
+  /// nest with no sibling in between (`[...[...[...tail]]]`), in a binding and in an assignment;
+  /// `super` in the innermost of nested key classes reads every enclosing heritage. Past a low
+  /// variable cap generation stops inside the walk, at most a few variables over the cap, the
+  /// deepest binding is never reached and the generator's context is restored.
+  #[test]
+  fn generation_stops_inside_recursive_walks() {
+    let n = 100;
+    let nested = format!("{}tail{}", "[...".repeat(n), "]".repeat(n));
+    let binding = format!("function deep({nested}) {{}}");
+    let assignment = format!("let tail;\n{nested} = [];");
+    for source in [&binding, &assignment] {
+      let whole = walk(source, 100_000, None);
+      assert_eq!((whole.stopped, whole.restored), (None, true));
+      assert!(whole.used > 2 * n, "{} variables", whole.used);
+      let walked = walk(source, 50, None);
+      stopped_between(&walked, source, "[...[", "tail]");
+      assert!(walked.overshoot <= 3 && walked.restored, "{} over: {source:.30}", walked.overshoot);
+      assert!(walked.used < whole.used / 2, "{} of {} variables", walked.used, whole.used);
+    }
+    assert!(!walk(&binding, 50, None).declared.contains("tail"));
+
+    let class = |body: &str| {
+      let open = (0..n).map(|i| format!("class C{i} extends K {{ m() {{ ")).collect::<Vec<_>>();
+      let open = open.concat();
+      format!("const K = 0;\n{open}{body}{}", "} } ".repeat(n))
+    };
+    let (without, with) = (class(""), class("super.x;"));
+    let base = walk(&without, 100_000, Some("K")).used;
+    let whole = walk(&with, 100_000, Some("K"));
+    assert_eq!((whole.stopped, whole.restored), (None, true));
+    assert!(whole.used >= base + n, "{} variables, {base} without super", whole.used);
+    let walked = walk(&with, base + 10, Some("K"));
+    let at = u32::try_from(with.find("super").unwrap()).unwrap();
+    assert_eq!(walked.stopped, Some(at));
+    // One heritage load crosses the cap; `.x` is the member read's own load, after the stop.
+    assert!(walked.overshoot <= 2 && walked.restored, "{} over", walked.overshoot);
   }
 }
