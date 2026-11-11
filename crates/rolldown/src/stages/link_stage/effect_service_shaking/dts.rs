@@ -16,6 +16,7 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use append_only_vec::AppendOnlyVec;
 use oxc::allocator::Allocator;
@@ -193,6 +194,8 @@ pub enum Read {
   Missing,
   Unreadable(std::io::Error),
   Parsed,
+  /// Not read: the load was cancelled first. Like a parsed file, it is left to `Dts::file`.
+  Skipped,
 }
 
 /// `.d.ts` files read and parsed apart from any analysis (`load`), each under its lexically
@@ -210,7 +213,8 @@ impl Loaded {
 /// Reads and parses the files at `paths` in parallel, ahead of the lookups that need them
 /// (`Dts::file`). It depends on nothing but the files, so it can run before the analysis
 /// exists, while the link stage does other work (`LinkStage::preload_effect_declarations`).
-pub fn load(paths: &[PathBuf]) -> Loaded {
+/// Once `cancel` is set it starts no further file (`Read::Skipped`).
+pub fn load(paths: &[PathBuf], cancel: &AtomicBool) -> Loaded {
   let paths = paths.par_iter();
   // One task per file: a few large files (`Effect.d.ts`) take most of the time. Without threads
   // (wasm) the iterator is sequential and has no task size.
@@ -220,7 +224,9 @@ pub fn load(paths: &[PathBuf]) -> Loaded {
     paths
       .map(|path| {
         let path = path.normalize().into_owned();
-        let read = if path.is_file() {
+        let read = if cancel.load(Ordering::Relaxed) {
+          Err(Read::Skipped)
+        } else if path.is_file() {
           std::fs::read_to_string(&path)
             .map(|source| parse(&path, source))
             .map_err(Read::Unreadable)

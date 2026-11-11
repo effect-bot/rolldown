@@ -79,9 +79,71 @@ pub(super) struct EffectDeclarations {
 
 enum Loading {
   #[cfg(not(target_family = "wasm"))]
-  Started(std::sync::mpsc::Receiver<std::thread::Result<dts::Loaded>>),
+  Started(Preload),
   /// Not started: loaded when the pass needs them.
   Deferred,
+}
+
+/// A load running on the rayon pool. It belongs to the build that started it: whatever way the
+/// pass ends, the load has ended before the pass returns (`Drop`).
+#[cfg(not(target_family = "wasm"))]
+struct Preload {
+  /// Set when the pass ends without the files: the load stops starting new ones.
+  cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+  /// Taken once the result is received.
+  receiver: Option<std::sync::mpsc::Receiver<std::thread::Result<dts::Loaded>>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Preload {
+  fn start(
+    paths: Vec<std::path::PathBuf>,
+    load: impl FnOnce(&[std::path::PathBuf], &std::sync::atomic::AtomicBool) -> dts::Loaded
+    + Send
+    + 'static,
+  ) -> Self {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let flag = std::sync::Arc::clone(&cancel);
+    rayon::spawn(move || {
+      let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&paths, &flag)));
+      // Only fails if the receiver is gone, which `Drop` rules out until this is sent.
+      let _ = sender.send(loaded);
+    });
+    Self { cancel, receiver: Some(receiver) }
+  }
+
+  /// Waits for the files. `None` if the load ended without sending them.
+  fn wait(&mut self) -> Option<dts::Loaded> {
+    match self.receiver.take()?.recv() {
+      Ok(Ok(loaded)) => Some(loaded),
+      Ok(Err(panic)) => std::panic::resume_unwind(panic),
+      Err(_) => None,
+    }
+  }
+}
+
+/// The pass may end without the files: a contract check that fails (`effect` external, an
+/// unsupported version, missing exports) or a panic. The load must not outlive it, reading
+/// files and holding parsed arenas into rendering or the next build, so this stops the files
+/// not yet started and waits for those in flight. The pass is not on a rayon worker when a load
+/// was started (`preload_effect_declarations`), so the wait blocks no worker.
+#[cfg(not(target_family = "wasm"))]
+impl Drop for Preload {
+  fn drop(&mut self) {
+    if let Some(receiver) = self.receiver.take() {
+      self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+      let _ = receiver.recv();
+    }
+  }
+}
+
+fn paths_of(modules: &[(ModuleIdx, Option<std::path::PathBuf>)]) -> Vec<std::path::PathBuf> {
+  modules.iter().filter_map(|(_, dts)| dts.clone()).collect()
+}
+
+fn load_now(paths: &[std::path::PathBuf]) -> dts::Loaded {
+  dts::load(paths, &std::sync::atomic::AtomicBool::new(false))
 }
 
 impl EffectDeclarations {
@@ -92,22 +154,16 @@ impl EffectDeclarations {
     }
   }
 
-  fn paths(&self) -> Vec<std::path::PathBuf> {
-    self.modules.iter().filter_map(|(_, dts)| dts.clone()).collect()
-  }
-
   /// Hands the parsed files to `dts` in the order of `order` (the pass's execution order, as
   /// files are numbered as they are added) and returns what was found for each module's
   /// `.d.ts`. They were started in the module table's order, which varies between builds.
   fn adopt(self, dts: &dts::Dts, order: &[ModuleIdx]) -> FxHashMap<ModuleIdx, dts::Read> {
-    let loaded = match &self.loading {
+    let loaded = match self.loading {
       #[cfg(not(target_family = "wasm"))]
-      Loading::Started(receiver) => match receiver.recv() {
-        Ok(Ok(loaded)) => loaded,
-        Ok(Err(panic)) => std::panic::resume_unwind(panic),
-        Err(_) => dts::load(&self.paths()),
-      },
-      Loading::Deferred => dts::load(&self.paths()),
+      Loading::Started(mut preload) => {
+        preload.wait().unwrap_or_else(|| load_now(&paths_of(&self.modules)))
+      }
+      Loading::Deferred => load_now(&paths_of(&self.modules)),
     };
     let position: FxHashMap<ModuleIdx, usize> = self
       .modules
@@ -175,14 +231,8 @@ impl LinkStage<'_> {
     let declarations = EffectDeclarations::new(&modules);
     #[cfg(not(target_family = "wasm"))]
     let declarations = if rayon::current_thread_index().is_none() {
-      let paths = declarations.paths();
-      let (sender, receiver) = std::sync::mpsc::channel();
-      rayon::spawn(move || {
-        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dts::load(&paths)));
-        // The pass may have returned without waiting for them.
-        let _ = sender.send(loaded);
-      });
-      EffectDeclarations { loading: Loading::Started(receiver), ..declarations }
+      let preload = Preload::start(paths_of(&declarations.modules), dts::load);
+      EffectDeclarations { loading: Loading::Started(preload), ..declarations }
     } else {
       declarations
     };
@@ -1668,4 +1718,50 @@ fn exported_functions(program: &oxc::ast::ast::Program<'_>) -> Vec<(ArcStr, FnAt
     .into_iter()
     .filter_map(|(name, local)| locals.get(local).map(|&(f, ret)| (name, f, ret)))
     .collect()
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+  use std::sync::atomic::Ordering;
+  use std::sync::{Arc, Mutex, mpsc};
+
+  use super::{EffectDeclarations, Loading, Preload, dts};
+
+  /// A pass that ends at a contract check (`effect` external, an unsupported version, missing
+  /// exports) drops the declarations it never adopted. The load is held unfinished across that
+  /// drop: the drop must ask it to stop and return only after it has ended.
+  #[test]
+  fn abandoned_preload_ends_before_the_pass_returns() {
+    let log: Arc<Mutex<Vec<&str>>> = Arc::default();
+    let (release, gate) = mpsc::channel::<()>();
+    let saw_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let preload = {
+      let (log, saw_cancel) = (Arc::clone(&log), Arc::clone(&saw_cancel));
+      Preload::start(vec![], move |paths, cancel| {
+        gate.recv().expect("released");
+        saw_cancel.store(cancel.load(Ordering::Relaxed), Ordering::Relaxed);
+        log.lock().unwrap().push("load ended");
+        dts::load(paths, cancel)
+      })
+    };
+    let cancel = Arc::clone(&preload.cancel);
+    let declarations = EffectDeclarations { modules: vec![], loading: Loading::Started(preload) };
+    // The early return, on its own thread so that this one can hold the load.
+    let pass = {
+      let log = Arc::clone(&log);
+      std::thread::spawn(move || {
+        drop(declarations);
+        log.lock().unwrap().push("pass returned");
+      })
+    };
+    let begun = std::time::Instant::now();
+    while !cancel.load(Ordering::Relaxed) && !log.lock().unwrap().contains(&"pass returned") {
+      assert!(begun.elapsed().as_secs() < 30, "the drop neither cancelled nor returned");
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    release.send(()).expect("the load waits");
+    pass.join().expect("the pass thread");
+    assert_eq!(*log.lock().unwrap(), ["load ended", "pass returned"]);
+    assert!(saw_cancel.load(Ordering::Relaxed), "the load was asked to stop");
+  }
 }
