@@ -8828,6 +8828,243 @@ mod tests {
     assert_eq!(wrong, Vec::<String>::new());
   }
 
+  /// A service provided under `name`, and an object whose `key` field names it.
+  fn provided_key(a: &mut Analysis, name: &str) -> (ObjId, ObjId) {
+    let provided = a.alloc(ObjKind::Object, None);
+    let v = a.key_value_var(&ArcStr::from(name));
+    a.seed(v, provided);
+    let keyed = a.alloc(ObjKind::Object, None);
+    let key = a.field(keyed, &ArcStr::from("key"));
+    let s = a.str(name);
+    a.seed(key, s);
+    (provided, keyed)
+  }
+
+  /// Looks a service up through what `var` holds and calls its method `m`: whether the
+  /// service provided as `provided` is found, and whether its `m` is demanded.
+  fn looked_up(a: &mut Analysis, var: VarId, provided: ObjId) -> String {
+    let [service, method] = [0, 1].map(|_| a.var());
+    a.constrain(var, Constraint::KeyUse(KeyUse::Lookup(service)));
+    a.constrain(service, Constraint::Load { key: Key::Name(ArcStr::from("m")), dst: method });
+    a.solve();
+    format!("found {}, m {}", a.pts(service).contains(&provided), a.objs[provided].demand.has("m"))
+  }
+
+  const FOUND: &str = "found true, m true";
+
+  /// The widening boundary's opaque value, from a set of three values past a limit of two:
+  /// `first` and two objects when given, or three names. Only names have crossed then, so the
+  /// opaque value has not crossed its own boundary (an object crossing seeds its fields with
+  /// it, `class_escape`).
+  fn widened_opaque(a: &mut Analysis, first: Option<ObjId>) -> ObjId {
+    let saved = a.widen_limit;
+    a.widen_limit = 2;
+    let set = a.var();
+    let mut objs = vec![];
+    match first {
+      Some(o) => {
+        objs.push(o);
+        while objs.len() < 3 {
+          objs.push(a.alloc(ObjKind::Object, None));
+        }
+      }
+      None => {
+        for name in ["test/W1", "test/W2", "test/W3"] {
+          objs.push(a.str(name));
+        }
+      }
+    }
+    for o in objs {
+      a.seed(set, o);
+    }
+    a.solve();
+    assert!(a.vars[set].widened, "setup: the set widens");
+    a.widen_limit = saved;
+    let class = a.widened_class.expect("setup: a widening class");
+    a.opaque(class)
+  }
+
+  /// The receivers the prototype and spread-target probes run on: the widening boundary's
+  /// opaque value (as a mixed set's, with a string beside it), code the pass can't see
+  /// (`top_ext`), and an external value no class stands behind.
+  #[derive(Clone, Copy, Debug)]
+  enum OpaqueRecv {
+    Widened,
+    TopExt,
+    External,
+  }
+
+  fn receiver(a: &mut Analysis, kind: OpaqueRecv) -> VarId {
+    let r = a.var();
+    let obj = match kind {
+      OpaqueRecv::Widened => widened_opaque(a, None),
+      OpaqueRecv::TopExt => a.top_ext,
+      OpaqueRecv::External => {
+        a.alloc(ObjKind::External { flavour: Flavour::Ext, name: ArcStr::from("probe") }, None)
+      }
+    };
+    a.seed(r, obj);
+    let d = a.str("test/D");
+    a.seed(r, d);
+    a.solve();
+    assert!(!a.vars[r].widened, "setup: the receiver is a mixed set, not widened");
+    r
+  }
+
+  /// `Object.getPrototypeOf` on a receiver: an object whose prototype names `test/Proto` crossed
+  /// the receiver's boundary (into the widening, or to code the pass can't see), and a lookup
+  /// through the receiver's prototype finds that service. Returns the lookup's result.
+  fn proto_of(kind: OpaqueRecv) -> String {
+    let mut a = Analysis::new();
+    let (provided, proto) = provided_key(&mut a, "test/Proto");
+    let obj = a.alloc(ObjKind::Object, None);
+    let pv = a.proto_var(obj);
+    a.seed(pv, proto);
+    match kind {
+      OpaqueRecv::Widened => {
+        widened_opaque(&mut a, Some(obj));
+      }
+      OpaqueRecv::TopExt | OpaqueRecv::External => {
+        let v = a.var();
+        a.seed(v, obj);
+        a.constrain(v, Constraint::Escape(Flavour::Ext, None));
+        a.solve();
+      }
+    }
+    assert!(a.handed_names.contains("test/Proto"), "setup: the prototype's name is handed");
+    let r = receiver(&mut a, kind);
+    let dst = a.var();
+    a.constrain(r, Constraint::ProtoOf(dst));
+    looked_up(&mut a, dst, provided)
+  }
+
+  /// `Object.setPrototypeOf` (`set_proto`) or a spread into the receiver (`Object.assign`) with a
+  /// fresh object naming `test/Assigned`, never handed otherwise; then a lookup through the
+  /// receiver. Returns the lookup's result.
+  fn handed_into(kind: OpaqueRecv, set_proto: bool) -> String {
+    let mut a = Analysis::new();
+    let (provided, keyed) = provided_key(&mut a, "test/Assigned");
+    let r = receiver(&mut a, kind);
+    assert!(
+      a.pts(r).iter().all(|o| !a.class_escaped.contains_key(o) && a.objs[*o].escaped.is_none()),
+      "setup: the receiver has crossed no boundary"
+    );
+    assert!(!a.handed_names.contains("test/Assigned"), "setup: the name is fresh");
+    let src = a.var();
+    a.seed(src, keyed);
+    a.constrain(
+      r,
+      if set_proto { Constraint::SetProto(src) } else { Constraint::SpreadTarget(src) },
+    );
+    a.solve();
+    looked_up(&mut a, r, provided)
+  }
+
+  /// Guard: the prototype of the widening boundary's opaque value is that boundary's, so a
+  /// lookup through it sees the names handed across, as through the value itself
+  /// (`Constraint::ProtoOf`). A concrete receiver finds its prototype's key either way.
+  #[test]
+  fn proto_of_widened_opaque_sees_handed_keys() {
+    let mut a = Analysis::new();
+    let (provided, proto) = provided_key(&mut a, "test/Proto");
+    let obj = a.alloc(ObjKind::Object, None);
+    let pv = a.proto_var(obj);
+    a.seed(pv, proto);
+    let r = a.var();
+    a.seed(r, obj);
+    let dst = a.var();
+    a.constrain(r, Constraint::ProtoOf(dst));
+    assert_eq!(looked_up(&mut a, dst, provided), FOUND, "setup: a concrete receiver");
+    assert_eq!(proto_of(OpaqueRecv::Widened), FOUND);
+  }
+
+  /// Guard: the same through replay. A read of `pick` on a target, made before (through replay)
+  /// or after a spread source's late field brings two more values, widens past a limit of two
+  /// and holds the boundary's opaque value in place of the target's own object, whose prototype
+  /// names `test/Proto`. A prototype read registered after it settles still finds the service.
+  #[test]
+  fn proto_of_replay_widened_read_sees_handed_keys() {
+    let mut wrong = vec![];
+    for read_first in [true, false] {
+      let mut a = Analysis::new();
+      a.widen_limit = 2;
+      let (provided, proto) = provided_key(&mut a, "test/Proto");
+      let obj = a.alloc(ObjKind::Object, None);
+      let pv = a.proto_var(obj);
+      a.seed(pv, proto);
+      let pick = ArcStr::from("pick");
+      let [target, source] = [0, 1].map(|_| a.alloc(ObjKind::Object, None));
+      let [recv, read] = [0, 1].map(|_| a.var());
+      a.seed(recv, target);
+      let reads = |a: &mut Analysis| {
+        a.constrain(recv, Constraint::Load { key: Key::Name(pick.clone()), dst: read });
+        a.solve();
+      };
+      if read_first {
+        reads(&mut a);
+      }
+      let own = a.field(target, &pick);
+      a.seed(own, obj);
+      let src = a.var();
+      a.seed(src, source);
+      a.constrain(src, Constraint::SpreadInto(target));
+      a.solve();
+      let late = a.field(source, &pick);
+      let d = a.str("test/D");
+      a.seed(late, d);
+      let e = a.str("test/E");
+      a.seed(late, e);
+      a.solve();
+      if !read_first {
+        reads(&mut a);
+      }
+      a.widen_limit = 400;
+      assert!(!a.pts(read).contains(&obj), "setup: the read no longer holds the object");
+      assert!(a.handed_names.contains("test/Proto"), "setup: the prototype's name is handed");
+      let dst = a.var();
+      a.constrain(read, Constraint::ProtoOf(dst));
+      let found = looked_up(&mut a, dst, provided);
+      if found != FOUND {
+        wrong.push(format!("read first {read_first}: {found}"));
+      }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+  }
+
+  /// Guard: a prototype set on the widening boundary's opaque value crosses into the boundary,
+  /// as a value stored on it does, so a lookup through it sees the key the prototype names
+  /// (`Constraint::SetProto`).
+  #[test]
+  fn set_proto_on_widened_opaque_crosses() {
+    assert_eq!(handed_into(OpaqueRecv::Widened, true), FOUND);
+  }
+
+  /// Guard: an object spread into the widening boundary's opaque value crosses into the
+  /// boundary, as a value stored on it does (`Constraint::SpreadTarget`).
+  #[test]
+  fn spread_into_widened_opaque_crosses() {
+    assert_eq!(handed_into(OpaqueRecv::Widened, false), FOUND);
+  }
+
+  /// OpaqueRecv: the same three on code the pass can't see, and on an external value no class
+  /// stands behind.
+  #[test]
+  fn plain_external_receivers_probe() {
+    let mut wrong = vec![];
+    for kind in [OpaqueRecv::TopExt, OpaqueRecv::External] {
+      for (what, found) in [
+        ("proto of", proto_of(kind)),
+        ("set proto", handed_into(kind, true)),
+        ("spread target", handed_into(kind, false)),
+      ] {
+        if found != FOUND {
+          wrong.push(format!("{kind:?} {what}: {found}"));
+        }
+      }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+  }
+
   /// Guard: over the budget, replay and the named-load index stop (`replay_stopped`). A read,
   /// a late element, prototype or spread source adds no row, copy or constraint, and the solve
   /// stops keeping everything even after the totals come back under the cap, as widening may
