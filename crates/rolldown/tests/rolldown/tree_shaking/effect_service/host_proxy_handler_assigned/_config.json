@@ -1,0 +1,10 @@
+{
+  "_comment": "A Proxy handler that gains its `get` trap after the Proxy is built. The trap runs with any property name, so the method it calls through `Context.get` stays.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
