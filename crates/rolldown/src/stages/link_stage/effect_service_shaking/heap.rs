@@ -2519,7 +2519,11 @@ impl Analysis {
   ///
   /// A shared member equals a fresh one only while neither it nor the wrapped values have
   /// widened: a widened variable drops what it held, and a fresh member would hold only what
-  /// remains. From then on a site gets a fresh member, which later sites share.
+  /// remains. The two cases differ. When the member widens, the next site gets a fresh member
+  /// that replaces it in the memo, and later sites share that one (while the wrapped values
+  /// have not widened). Once the wrapped values have widened, which may be before the widening
+  /// has reached the cached member, the memo is not read or written for that wrap again: every
+  /// later site on it gets its own fresh member for the rest of the solve.
   fn receiver_member(&mut self, recv: ObjId, name: &ArcStr) -> VarId {
     #[cfg(test)]
     if self.fresh_receiver_members {
@@ -7388,10 +7392,14 @@ mod tests {
   // Each case builds the same analysis twice, with a fresh member per call site (the
   // construction before sharing, `fresh_receiver_members`) and with shared members, under the
   // same events. It compares what every site's check did, by name rather than by variable:
-  // what reached each site's slot, which values escaped or crossed the widening boundary, what
-  // was demanded of them, and whether the budget stopped the solve.
+  // what each site's member held, whether its check handed the receiver over, what reached its
+  // slot, which values escaped or crossed the widening boundary, what was demanded of them, and
+  // whether the budget stopped the solve.
 
-  /// The objects and variables a receiver case reads its outcome from.
+  /// The objects and variables a receiver case reads its outcome from. Its limits: an object it
+  /// has no name for is labelled by its kind, so two unnamed objects of one kind (two opaque
+  /// values, say) look the same; and the sites' `back` variables are not read, so per-site back
+  /// flow is not compared. The cases name every object whose identity they assert on.
   #[derive(Default)]
   struct Probe {
     objs: Vec<(String, ObjId)>,
@@ -7430,8 +7438,22 @@ mod tests {
           })
           .map(|(n, _)| n.as_str())
           .collect();
+        // The site's member, and whether its check fired: handed the receiver to `typed_arg`.
+        let check = a.vars.iter_enumerated().find_map(|(v, var)| {
+          var.constraints.iter().find_map(|c| match c {
+            Constraint::TypedReceiverIf(_, recv, s, ..) if s == slot => Some((v, *recv)),
+            _ => None,
+          })
+        });
+        let (member, handed) = match check {
+          Some((v, recv)) => (
+            format!("{:?} (widened {})", self.set(a, v), a.vars[v].widened),
+            a.typed_args_seen.contains(&(recv, *slot, false, false)),
+          ),
+          None => ("none".to_string(), false),
+        };
         out.push(format!(
-          "site {i}: slot {:?}, widened {}, slot-in from {slot_in:?}",
+          "site {i}: member {member}, handed over {handed}, slot {:?}, widened {}, slot-in from {slot_in:?}",
           self.set(a, *slot),
           a.vars[*slot].widened
         ));
@@ -7489,9 +7511,9 @@ mod tests {
     Fill,
     /// Excluded-kind cases: the receiver gets a prototype whose `map` holds the callee.
     Proto,
-    /// The wrapped values widen before a shared member has caught up with them: the window
-    /// between a variable widening and its delta reaching the variables it copies into, in
-    /// which a site's `TypedReceiver` may be applied.
+    /// The wrapped values widen. The next solve propagates it, so a site registered after this
+    /// event is applied after the propagation; `staged_pending_widening` covers a site applied
+    /// before it.
     WidenWrapped,
   }
 
@@ -7500,23 +7522,46 @@ mod tests {
   #[derive(Clone, Copy, Debug)]
   enum Receiver {
     Wrap,
+    /// A string with no registered methods: every name reads host data.
     Str,
+    /// A string whose `map` and `slice` are registered builtins, which are the callees
+    /// (callee 0 is `String.prototype.map`, callee 1 `String.prototype.slice`): a name's
+    /// member holds that name's builtin and no other.
+    StrMethods,
     Object,
     Namespace,
   }
 
-  const SITES: [(usize, &str); 4] = [(0, "map"), (1, "map"), (0, "map"), (0, "slice")];
+  const SITES: [(usize, &str); 5] =
+    [(0, "map"), (1, "map"), (0, "map"), (0, "slice"), (1, "slice")];
 
-  /// Runs `events` (solving after each one, or once at the end) on a receiver of `kind`, with
-  /// the widening limit and entries budget given. Returns the outcome and the member count.
-  fn receiver_case(
-    kind: Receiver,
-    fresh: bool,
-    events: &[Event],
-    solve_each: bool,
-    limit: usize,
-    budget: Option<u64>,
-  ) -> (Vec<String>, usize) {
+  /// The analysis of a receiver case before any event.
+  struct Case {
+    a: Analysis,
+    p: Probe,
+    callees: [ObjId; 2],
+    fillers: Vec<ObjId>,
+    recv: VarId,
+    recv_obj: ObjId,
+    arrivals: Option<VarId>,
+    backs: Vec<VarId>,
+  }
+
+  impl Case {
+    /// Site `i`'s `TypedReceiver` constraint.
+    fn site(&self, i: usize) -> Constraint {
+      let (callee, name) = SITES[i];
+      Constraint::TypedReceiver(
+        self.callees[callee],
+        ArcStr::from(name),
+        self.p.slots[i],
+        self.backs[i],
+        site(i),
+      )
+    }
+  }
+
+  fn receiver_setup(kind: Receiver, fresh: bool, limit: usize, budget: Option<u64>) -> Case {
     let mut a = Analysis::new();
     a.fresh_receiver_members = fresh;
     a.widen_limit = limit;
@@ -7524,9 +7569,20 @@ mod tests {
       a.max_entries = budget;
     }
     let mut p = Probe::default();
-    let callees = [summary(&mut a), summary(&mut a)];
-    p.objs.push(("callee0".into(), callees[0]));
-    p.objs.push(("callee1".into(), callees[1]));
+    let callees = if let Receiver::StrMethods = kind {
+      let names = ["String.prototype.map", "String.prototype.slice"];
+      names.map(|name| {
+        let rule = a.rule(name, |_, _| {});
+        let b = a.builtin(rule, None, None);
+        p.objs.push((name.into(), b));
+        b
+      })
+    } else {
+      let callees = [summary(&mut a), summary(&mut a)];
+      p.objs.push(("callee0".into(), callees[0]));
+      p.objs.push(("callee1".into(), callees[1]));
+      callees
+    };
     let service = a.alloc(ObjKind::Object, None);
     p.objs.push(("service".into(), service));
     let fillers: Vec<ObjId> = (0..3).map(|_| a.alloc(ObjKind::Object, None)).collect();
@@ -7541,7 +7597,7 @@ mod tests {
         p.vars.push(("wrapped".into(), inner));
         (a.alloc(ObjKind::Wrap(inner), None), Some(inner))
       }
-      Receiver::Str => (a.str("receiver"), None),
+      Receiver::Str | Receiver::StrMethods => (a.str("receiver"), None),
       Receiver::Object => {
         let obj = a.alloc(ObjKind::Object, None);
         let own = a.field(obj, &ArcStr::from("map"));
@@ -7571,20 +7627,27 @@ mod tests {
     a.seed(recv, recv_obj);
     p.slots = SITES.iter().map(|_| a.var()).collect();
     let backs: Vec<VarId> = SITES.iter().map(|_| a.var()).collect();
+    Case { a, p, callees, fillers, recv, recv_obj, arrivals, backs }
+  }
+
+  /// Runs `events` (solving after each one, or once at the end) on a receiver of `kind`, with
+  /// the widening limit and entries budget given. Returns the outcome and the member count.
+  fn receiver_case(
+    kind: Receiver,
+    fresh: bool,
+    events: &[Event],
+    solve_each: bool,
+    limit: usize,
+    budget: Option<u64>,
+  ) -> (Vec<String>, usize) {
+    let case = receiver_setup(kind, fresh, limit, budget);
+    let c = &case;
+    let sites: Vec<Constraint> = (0..SITES.len()).map(|i| c.site(i)).collect();
+    let Case { mut a, p, callees, fillers, recv, arrivals, .. } = case;
     let mut filled = 0;
     for event in events {
       match *event {
-        Event::Site(i) => {
-          let (callee, name) = SITES[i];
-          let c = Constraint::TypedReceiver(
-            callees[callee],
-            ArcStr::from(name),
-            p.slots[i],
-            backs[i],
-            site(i),
-          );
-          a.constrain(recv, c);
-        }
+        Event::Site(i) => a.constrain(recv, sites[i].clone()),
         Event::Callee => a.seed(arrivals.expect("a place to arrive"), callees[0]),
         Event::Fill => {
           a.seed(arrivals.expect("a place to arrive"), fillers[filled]);
@@ -7686,13 +7749,18 @@ mod tests {
     assert_eq!(
       outcome[1..=4],
       [
-        "site 0: slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
-        "site 1: slot [], widened false, slot-in from []",
-        "site 2: slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
-        "site 3: slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
+        "site 0: member [\"callee0\", \"receiver\", \"service\"] (widened false), handed over \
+         true, slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
+        "site 1: member [\"callee0\", \"receiver\", \"service\"] (widened false), handed over \
+         false, slot [], widened false, slot-in from []",
+        "site 2: member [\"callee0\", \"receiver\", \"service\"] (widened false), handed over \
+         true, slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
+        "site 3: member [\"callee0\", \"receiver\", \"service\"] (widened false), handed over \
+         true, slot [\"receiver\"], widened false, slot-in from [\"wrapped\"]",
       ],
     );
-    // A string's member holds the same builtin or host value for every site.
+    // A string with no registered methods: every name's member holds host data. Names with
+    // distinct builtins are `shared_string_member_keeps_names_apart`.
     let (wrong, (fresh, shared)) = compare(Receiver::Str, &ALL_SITES, &[400]);
     assert!(wrong.is_empty(), "{wrong:#?}");
     assert!(shared < fresh, "the members are shared: {shared} of {fresh}");
@@ -7734,9 +7802,10 @@ mod tests {
 
   /// Guard 3, the widening boundary. The callee and fillers arrive in every order around the
   /// sites, with limits that widen the shared member, or the wrapped values themselves, before,
-  /// between and after the sites; and the wrapped values widen while a shared member still
-  /// holds what they held. Each site's check sees what it saw with a fresh member: a site that
-  /// comes after the member or the wrapped values widened gets a fresh one.
+  /// between and after the sites; and the wrapped values widen between sites (propagated before
+  /// the next site is applied). Each site's check sees what it saw with a fresh member. After
+  /// the member widens, the next site gets a fresh member that later sites share again; after
+  /// the wrapped values widen, every later site gets its own.
   #[test]
   fn shared_receiver_member_widens_as_fresh_members() {
     let events =
@@ -7761,5 +7830,121 @@ mod tests {
     let (new, _) = receiver_case(Receiver::Wrap, false, &events, true, 400, Some(1));
     assert_eq!(old, new);
     assert_eq!(new[0], "budget stop true, bail true");
+  }
+
+  /// Guard 1, names. One string whose `map` and `slice` are distinct registered builtins, and
+  /// sites whose callee is the builtin of their own name (0, 2, 4) or of the other name (1, 3),
+  /// with `map` read twice. Each name's member holds its own builtin only, so a site's check
+  /// fires exactly when its callee is the builtin of the name it reads, whichever name is read
+  /// first. A member shared across names would hold both builtins and fire the cross-name sites.
+  #[test]
+  fn shared_string_member_keeps_names_apart() {
+    let map_first =
+      [Event::Site(0), Event::Site(4), Event::Site(1), Event::Site(3), Event::Site(2)];
+    let slice_first =
+      [Event::Site(4), Event::Site(3), Event::Site(0), Event::Site(2), Event::Site(1)];
+    for events in [map_first, slice_first] {
+      for solve_each in [true, false] {
+        let (old, _) = receiver_case(Receiver::StrMethods, true, &events, solve_each, 400, None);
+        let (new, members) =
+          receiver_case(Receiver::StrMethods, false, &events, solve_each, 400, None);
+        assert_eq!(old, new, "{events:?} solve each {solve_each}");
+        assert_eq!(members, 2, "a member per name");
+        let sites: Vec<String> =
+          new[1..=5].iter().map(|l| l.split(", slot ").next().unwrap().to_string()).collect();
+        assert_eq!(
+          sites,
+          [
+            "site 0: member [\"String.prototype.map\"] (widened false), handed over true",
+            "site 1: member [\"String.prototype.map\"] (widened false), handed over false",
+            "site 2: member [\"String.prototype.map\"] (widened false), handed over true",
+            "site 3: member [\"String.prototype.slice\"] (widened false), handed over false",
+            "site 4: member [\"String.prototype.slice\"] (widened false), handed over true",
+          ],
+          "{events:?} solve each {solve_each}"
+        );
+      }
+    }
+  }
+
+  /// What `staged_pending_widening` saw: the outcome, and whether the staging held.
+  struct Staged {
+    outcome: Vec<String>,
+    /// Shared construction: site 0's member, cached under (receiver, `map`) before the widening.
+    cached: Option<VarId>,
+    /// The widening was still queued when site 2 was applied, and after.
+    pending: bool,
+    /// The cached member did not yet hold the widened stand-in when site 2 was applied.
+    behind: bool,
+    /// Members after site 1 was applied too, and the memo entry for (receiver, `map`) then.
+    members: usize,
+    memo_after: Option<VarId>,
+  }
+
+  /// Site 0 on a wrapped value holding the service and callee 0 is applied and solved, so its
+  /// member holds both. The wrapped values then widen, and site 2 (callee 0, `map`) is applied
+  /// as the solve applies a new constraint, to the receiver's objects before the worklist runs,
+  /// so before the widening has reached site 0's member. Then the solve drains, and site 1
+  /// (callee 1, `map`) is registered and solved after the widening has propagated.
+  fn staged_pending_widening(fresh: bool) -> Staged {
+    let mut c = receiver_setup(Receiver::Wrap, fresh, 400, None);
+    let inner = c.arrivals.expect("wrapped values");
+    c.a.seed(inner, c.callees[0]);
+    let site0 = c.site(0);
+    c.a.constrain(c.recv, site0);
+    c.a.solve();
+    let cached = c.a.receiver_members.get(&(c.recv_obj, ArcStr::from("map"))).copied();
+    c.a.widen(inner);
+    let stand_in = c.a.vars[inner].delta[0];
+    c.p.objs.push(("widened stand-in".into(), stand_in));
+    let queued = c.a.vars[inner].queued && c.a.vars[inner].delta == [stand_in];
+    let behind = cached.is_some_and(|m| !c.a.vars[m].pts.contains(&stand_in));
+    let site2 = c.site(2);
+    c.a.apply(c.recv, c.recv_obj, &site2);
+    let pending = queued && c.a.vars[inner].queued;
+    c.a.solve();
+    let site1 = c.site(1);
+    c.a.constrain(c.recv, site1);
+    c.a.solve();
+    let memo_after = c.a.receiver_members.get(&(c.recv_obj, ArcStr::from("map"))).copied();
+    Staged {
+      outcome: c.p.outcome(&c.a),
+      cached,
+      pending,
+      behind,
+      members: members(&c.a),
+      memo_after,
+    }
+  }
+
+  /// Guard 3, a site applied while the wrapped values' widening is pending. The cached member
+  /// still holds callee 0, which the widening dropped; a fresh member reads the wrapped values
+  /// as they are now, the stand-in. Site 2 must see what a fresh member sees, and so must site 1,
+  /// applied later: after the wrapped values widen, no site on the wrap shares a member again.
+  #[test]
+  fn shared_receiver_member_skips_pending_inner_widening() {
+    let old = staged_pending_widening(true);
+    let new = staged_pending_widening(false);
+    assert!(old.pending && new.pending, "site 2 was applied before the widening propagated");
+    assert!(new.cached.is_some() && new.behind, "a cached member that had not caught up");
+    assert_eq!(old.outcome, new.outcome);
+    // Shared: site 0's member, then one each for sites 2 and 1. The fresh construction also
+    // applies site 0 twice (from the new constraint and the receiver's pending seed), each
+    // time with a member of its own.
+    assert_eq!((old.members, new.members), (4, 3), "no member shared after the widening");
+    assert_eq!(new.memo_after, new.cached, "the memo entry is neither reused nor replaced");
+    let sites: Vec<String> =
+      new.outcome[1..=3].iter().map(|l| l.split(", slot-in").next().unwrap().to_string()).collect();
+    assert_eq!(
+      sites,
+      [
+        "site 0: member [\"callee0\", \"receiver\", \"service\", \"widened stand-in\"] (widened \
+         false), handed over true, slot [\"receiver\", \"widened stand-in\"], widened false",
+        "site 1: member [\"receiver\", \"widened stand-in\"] (widened false), handed over false, \
+         slot [], widened false",
+        "site 2: member [\"receiver\", \"widened stand-in\"] (widened false), handed over false, \
+         slot [], widened false",
+      ]
+    );
   }
 }
