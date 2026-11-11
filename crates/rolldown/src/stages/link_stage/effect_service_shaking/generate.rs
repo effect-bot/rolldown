@@ -15,7 +15,7 @@ use oxc::ast::ast::{
   ForStatementInit, ForStatementLeft, FormalParameters, Function, IdentifierReference,
   ImportDeclarationSpecifier, MethodDefinitionKind, ObjectExpression, ObjectPropertyKind, Program,
   PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement, StaticMemberExpression,
-  VariableDeclaration, VariableDeclarationKind,
+  VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc::semantic::{ReferenceId, Scoping};
 use oxc::span::GetSpan;
@@ -116,8 +116,17 @@ pub struct Shared<'l> {
   /// Resolves an unresolved global name to a variable, via the host table.
   pub resolve_global: fn(&mut Analysis, &mut FxHashMap<ArcStr, VarId>, &str) -> VarId,
   /// Canonical symbols declared, by a `const` that is never reassigned, as a key constructor's
-  /// result (`const K = Context.Service(..)`), for the key-class test.
-  pub key_symbols: FxHashSet<SymbolRef>,
+  /// result (`const K = Context.Service(..)`), for the key-class test, with the position of the
+  /// top-level statement declaring each (`Gen::key_heritage`).
+  pub key_symbols: FxHashMap<SymbolRef, u32>,
+  /// Top-level statements numbered so far, in generation order (modules in execution order).
+  pub statements: u32,
+  /// Each lazy statement: its module, span and body, for the decision record.
+  pub lazy_spans: Vec<(ModuleIdx, u32, u32, FnId)>,
+  /// Lazy statements generated up front although deferral was on (`may_bail`).
+  pub kept_eager: usize,
+  /// Time spent registering deferred statements and scanning them (`Gen::program`).
+  pub scan_time: std::time::Duration,
   /// Canonical symbols bound to effect's own `Context.Service`/`Context.Reference` rules.
   pub key_ctor_symbols: FxHashSet<SymbolRef>,
   /// Modules exporting one of those under its own name (`Context.Service` through a namespace).
@@ -179,15 +188,51 @@ pub struct Gen<'a, 'l, 's> {
   next_case: u32,
   /// Values thrown inside the enclosing inert `try` blocks (see `inert_statement`).
   try_throws: Vec<VarId>,
+  /// The position of the top-level statement being generated (`Shared::statements`).
+  seq: u32,
+  /// Key symbols this top-level statement declared so far (`key_heritage`).
+  stmt_keys: Vec<SymbolRef>,
+}
+
+/// A lazy top-level statement whose generation is deferred to its first activation: its body,
+/// its index in the module's program and its position (`Shared::statements`).
+#[derive(Clone, Copy, Debug)]
+pub struct DeferredStatement {
+  pub lazy: FnId,
+  pub index: usize,
+  pub seq: u32,
 }
 
 impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   pub fn new(a: &'a mut Analysis, sh: &'s mut Shared<'l>, m: &'s ModuleFacts<'l>) -> Self {
     let module_fn = Self::new_fn(a, m.module, 0, FnKind::Normal);
     sh.module_fns[m.module] = Some(module_fn);
-    let this = a.fns[module_fn].this;
     let prim = sh.prim;
-    a.copy(prim, this);
+    a.copy(prim, a.fns[module_fn].this);
+    Self::at_top(a, sh, m, module_fn, 0)
+  }
+
+  /// A generator for the deferred statements of a module `program` already walked: it
+  /// continues at the module's top level, with the module's `switch` cases numbered on from
+  /// `next_case`.
+  pub fn resume(
+    a: &'a mut Analysis,
+    sh: &'s mut Shared<'l>,
+    m: &'s ModuleFacts<'l>,
+    next_case: u32,
+  ) -> Self {
+    let module_fn = sh.module_fns[m.module].expect("the module's top level was generated");
+    Self::at_top(a, sh, m, module_fn, next_case)
+  }
+
+  fn at_top(
+    a: &'a mut Analysis,
+    sh: &'s mut Shared<'l>,
+    m: &'s ModuleFacts<'l>,
+    module_fn: FnId,
+    next_case: u32,
+  ) -> Self {
+    let this = a.fns[module_fn].this;
     Self {
       a,
       sh,
@@ -200,9 +245,16 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
       module_fn,
       tdz_until: None,
       case_stack: vec![],
-      next_case: 0,
+      next_case,
       try_throws: vec![],
+      seq: 0,
+      stmt_keys: vec![],
     }
+  }
+
+  /// The next `switch` case number, for `resume`.
+  pub fn next_case(&self) -> u32 {
+    self.next_case
   }
 
   fn new_fn(a: &mut Analysis, module: ModuleIdx, span_start: u32, kind: FnKind) -> FnId {
@@ -405,29 +457,116 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   // == program
 
-  pub fn program(&mut self, program: &Program<'_>) {
+  /// Generates the module's top level. A lazy statement's constraints wait in a body of their
+  /// own, like a function's, and are installed once reachable code references a symbol it
+  /// declares (`LinkStage::effect_service_shaking` adds the activations once every module is
+  /// generated). With `defer`, a lazy statement's body is only registered here and generated
+  /// when the solver first installs it (`deferred_statement`); the statements returned are
+  /// those. What other statements' generation or the plan reads of one is produced here
+  /// either way: its key symbols (`scan_key_symbols`), and the unsafe-lookup bailout, by
+  /// generating any statement that may reach it now (`may_bail`).
+  pub fn program(&mut self, program: &Program<'_>, defer: bool) -> Vec<DeferredStatement> {
+    let mut deferred = vec![];
     for (i, stmt) in program.body.iter().enumerate() {
+      self.begin_statement();
       let Some(declared) = self.m.lazy_stmts.get(&i).cloned() else {
         self.statement(stmt);
         continue;
       };
-      // A lazy statement's constraints wait in a body of their own, like a function's, and are
-      // installed once reachable code references a symbol it declares (`LinkStage::
-      // effect_service_shaking` adds the activations once every module is generated).
       let span = oxc::span::GetSpan::span(stmt);
       let lazy = Self::new_fn(self.a, self.m.module, span.start, FnKind::Normal);
       self.a.fns[lazy].leaf = false;
-      let before = self.a.fns[self.module_fn].pending.len();
-      self.lazy_owner = Some(lazy);
-      self.statement(stmt);
-      self.lazy_owner = None;
-      let moved: Vec<Pending> = self.a.fns[self.module_fn].pending.drain(before..).collect();
-      self.a.fns[lazy].pending = moved;
       for sym in declared {
         self.sh.lazy_decls.insert(sym, lazy);
       }
       self.sh.lazy_by_module.entry(self.m.module).or_default().push(lazy);
+      self.sh.lazy_spans.push((self.m.module, span.start, span.end, lazy));
+      if defer {
+        let scan = std::time::Instant::now();
+        let bails = may_bail(stmt);
+        if !bails {
+          self.scan_key_symbols(stmt);
+          self.a.fns[lazy].deferred = true;
+          deferred.push(DeferredStatement { lazy, index: i, seq: self.seq });
+        }
+        self.sh.scan_time += scan.elapsed();
+        if !bails {
+          continue;
+        }
+        self.sh.kept_eager += 1;
+      }
+      self.lazy_statement(lazy, stmt);
     }
+    deferred
+  }
+
+  /// Generates a deferred statement (`program`), on its first activation.
+  pub fn deferred_statement(&mut self, d: DeferredStatement, stmt: &Statement<'_>) {
+    self.seq = d.seq;
+    self.stmt_keys.clear();
+    self.lazy_statement(d.lazy, stmt);
+  }
+
+  fn begin_statement(&mut self) {
+    self.seq = self.sh.statements;
+    self.sh.statements += 1;
+    self.stmt_keys.clear();
+  }
+
+  fn lazy_statement(&mut self, lazy: FnId, stmt: &Statement<'_>) {
+    let before = self.a.fns[self.module_fn].pending.len();
+    self.lazy_owner = Some(lazy);
+    self.statement(stmt);
+    self.lazy_owner = None;
+    let moved: Vec<Pending> = self.a.fns[self.module_fn].pending.drain(before..).collect();
+    debug_assert!(self.a.fns[lazy].pending.is_empty(), "a lazy statement is generated once");
+    self.a.fns[lazy].pending = moved;
+  }
+
+  /// The key symbols a deferred top-level `const` declares, as `variable_declaration` records
+  /// them, for the statements generated before it (`key_heritage`).
+  fn scan_key_symbols(&mut self, stmt: &Statement<'_>) {
+    let d = match stmt {
+      Statement::VariableDeclaration(d) => d,
+      Statement::ExportDeclaration(e) => match &e.declaration {
+        Declaration::VariableDeclaration(d) => d,
+        _ => return,
+      },
+      _ => return,
+    };
+    for decl in &d.declarations {
+      if self.bound_to_rule(decl).is_some() {
+        continue;
+      }
+      if let Some(key) = self.key_symbol(d, decl) {
+        self.sh.key_symbols.entry(key).or_insert(self.seq);
+      }
+    }
+  }
+
+  /// The declarator's binding when a model rule is bound to it (`variable_declaration`).
+  fn bound_to_rule<'d>(
+    &self,
+    decl: &'d VariableDeclarator<'_>,
+  ) -> Option<(&'d BindingIdentifier<'d>, SymbolRef)> {
+    let BindingPattern::BindingIdentifier(id) = &decl.id else { return None };
+    let sym: SymbolRef = (self.m.module, id.symbol_id.get()?).into();
+    let canonical = self.sh.symbols.canonical_ref_for(sym);
+    self.sh.rule_symbols.contains_key(&canonical).then_some((&**id, sym))
+  }
+
+  /// The canonical symbol a `const` declarator binds to a key constructor's result.
+  fn key_symbol(
+    &self,
+    d: &VariableDeclaration<'_>,
+    decl: &VariableDeclarator<'_>,
+  ) -> Option<SymbolRef> {
+    let (BindingPattern::BindingIdentifier(id), Some(init)) = (&decl.id, &decl.init) else {
+      return None;
+    };
+    let symbol = id.symbol_id.get()?;
+    (d.kind == VariableDeclarationKind::Const && self.key_constructor_call(init))
+      .then(|| self.sh.symbols.canonical_ref_for((self.m.module, symbol).into()))
   }
 
   fn statements(&mut self, stmts: &[Statement<'_>]) {
@@ -693,24 +832,14 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     let kind = decl_kind(d.kind);
     for decl in &d.declarations {
       // A binding bound to a model rule keeps the rule and skips its initialiser.
-      if let BindingPattern::BindingIdentifier(id) = &decl.id {
-        if let Some(symbol) = id.symbol_id.get() {
-          let sym: SymbolRef = (self.m.module, symbol).into();
-          let canonical = self.sh.symbols.canonical_ref_for(sym);
-          if self.sh.rule_symbols.contains_key(&canonical) {
-            self.record_decl(id, kind);
-            self.symbol_var(sym);
-            continue;
-          }
-        }
+      if let Some((id, sym)) = self.bound_to_rule(decl) {
+        self.record_decl(id, kind);
+        self.symbol_var(sym);
+        continue;
       }
-      if let (BindingPattern::BindingIdentifier(id), Some(init)) = (&decl.id, &decl.init) {
-        if let Some(symbol) = id.symbol_id.get() {
-          if d.kind == VariableDeclarationKind::Const && self.key_constructor_call(init) {
-            let canonical = self.sh.symbols.canonical_ref_for((self.m.module, symbol).into());
-            self.sh.key_symbols.insert(canonical);
-          }
-        }
+      if let Some(key) = self.key_symbol(d, decl) {
+        self.sh.key_symbols.entry(key).or_insert(self.seq);
+        self.stmt_keys.push(key);
       }
       let value = match &decl.init {
         Some(init) => self.expr(init),
@@ -1015,12 +1144,15 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   /// `Context.Service`/`Context.Reference` (`Context.Service<..>()("id")`), or a binding a `const`
   /// declares as one. Both are resolved by symbol, never by spelling. Such a key class is
   /// generated; any other class, including a subclass of a key class, is a hole (`class_hole`).
+  /// The binding counts when the generator has met its declaration first, as in program order:
+  /// declared by an earlier top-level statement, or earlier in this one. A deferred statement
+  /// is generated after statements that follow it, which must not change its classes.
   fn key_heritage(&self, c: &Class<'_>) -> bool {
     let Some(h) = &c.heritage else { return false };
     match &h.expression {
-      Expression::Identifier(id) => {
-        self.canonical_of(id).is_some_and(|s| self.sh.key_symbols.contains(&s))
-      }
+      Expression::Identifier(id) => self.canonical_of(id).is_some_and(|s| {
+        self.sh.key_symbols.get(&s).is_some_and(|at| *at < self.seq || self.stmt_keys.contains(&s))
+      }),
       e => self.key_constructor_call(e),
     }
   }
@@ -1970,6 +2102,35 @@ fn inert_expr(expr: &Expression<'_>) -> bool {
   }
 }
 
+/// Whether a statement may reach the unsafe-lookup bailout of `class_hole`: it names
+/// `getOrUndefinedUnsafe` anywhere, in any of the ways `FreeRefs` detects in a class body. A
+/// statement for which this holds is generated up front, so the bailout is the generator's own.
+fn may_bail(stmt: &Statement<'_>) -> bool {
+  let mut names = NamesUnsafeLookup(false);
+  oxc::ast_visit::Visit::visit_statement(&mut names, stmt);
+  names.0
+}
+
+struct NamesUnsafeLookup(bool);
+
+impl<'a> oxc::ast_visit::Visit<'a> for NamesUnsafeLookup {
+  fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+    self.0 |= it.name.as_str() == UNSAFE_LOOKUP;
+  }
+
+  fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
+    self.0 |= it.property.name.as_str() == UNSAFE_LOOKUP;
+    oxc::ast_visit::walk::walk_static_member_expression(self, it);
+  }
+
+  fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
+    self.0 |= matches!(&it.expression, Expression::StringLiteral(s) if s.value == UNSAFE_LOOKUP);
+    oxc::ast_visit::walk::walk_computed_member_expression(self, it);
+  }
+}
+
+const UNSAFE_LOOKUP: &str = "getOrUndefinedUnsafe";
+
 /// The references a class body makes to bindings declared outside it (`Gen::class_hole`):
 /// for each, its reference, name, position and the static member names read through it
 /// (`ns.sub.x` is `ns` with `["sub", "x"]`). Whether a reference is free is decided by its
@@ -1984,7 +2145,7 @@ struct FreeRefs<'s> {
 
 impl FreeRefs<'_> {
   fn record(&mut self, id: &IdentifierReference<'_>, path: Vec<ArcStr>) {
-    if id.name.as_str() == "getOrUndefinedUnsafe" {
+    if id.name.as_str() == UNSAFE_LOOKUP {
       self.unsafe_lookup = true;
     }
     let reference = id.reference_id.get();
@@ -2005,7 +2166,7 @@ impl<'a> oxc::ast_visit::Visit<'a> for FreeRefs<'_> {
   }
 
   fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
-    if it.property.name.as_str() == "getOrUndefinedUnsafe" {
+    if it.property.name.as_str() == UNSAFE_LOOKUP {
       self.unsafe_lookup = true;
     }
     let mut path = vec![ArcStr::from(it.property.name.as_str())];
@@ -2024,7 +2185,7 @@ impl<'a> oxc::ast_visit::Visit<'a> for FreeRefs<'_> {
 
   fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
     if let Expression::StringLiteral(s) = &it.expression {
-      if s.value == "getOrUndefinedUnsafe" {
+      if s.value == UNSAFE_LOOKUP {
         self.unsafe_lookup = true;
       }
     }

@@ -294,6 +294,10 @@ pub struct FnInfo {
   pub returns_closure_only: bool,
   pub closure: Option<ObjId>,
   pub activated: bool,
+  /// A lazy top-level statement whose constraints are not generated yet (deferred generation,
+  /// implementation.md). The solver asks its generator for them when it first installs the
+  /// body, then clears this: a body is generated at most once per solve.
+  pub deferred: bool,
   /// Constraints installed when the body becomes reachable.
   pub pending: Vec<Pending>,
   pub module: ModuleIdx,
@@ -331,6 +335,7 @@ impl FnInfo {
       returns_closure_only: false,
       closure: None,
       activated: false,
+      deferred: false,
       pending: vec![],
       module,
       span_start,
@@ -985,6 +990,8 @@ pub struct Analysis {
   rejected: FxHashMap<ObjId, Vec<(u32, VarId)>>,
   /// Set when the analysis exceeded its allocation budget: everything is kept.
   pub budget_exceeded: bool,
+  /// Set when the budget ran out generating a deferred body (`solve_with`), for the report.
+  pub budget_exceeded_generating: bool,
   /// Objects each walk pool has walked.
   walked: FxHashSet<(VarId, ObjId)>,
   /// The program-wide pools of the protocol and hashing walks (`Walk`).
@@ -1276,6 +1283,7 @@ impl Analysis {
       dts: super::dts::Dts::default(),
       rejected: FxHashMap::default(),
       budget_exceeded: false,
+      budget_exceeded_generating: false,
       walked: FxHashSet::default(),
       ignored_pool: None,
       prim_arg: None,
@@ -1985,6 +1993,12 @@ impl Analysis {
     }
   }
 
+  /// The bytes of a function's body before it is generated: its `FnInfo` and the variables
+  /// every body has.
+  pub fn body_bytes(&self) -> usize {
+    std::mem::size_of::<FnInfo>() + 5 * std::mem::size_of::<Var>()
+  }
+
   pub fn activate(&mut self, f: FnId) {
     if self.fns[f].activated {
       return;
@@ -2113,8 +2127,17 @@ impl Analysis {
     )
   }
 
+  /// Solves with every body already generated.
+  #[cfg(test)]
   pub fn solve(&mut self) {
-    loop {
+    self.solve_with(&mut |_, _| unreachable!("a deferred body needs a generator (solve_with)"));
+  }
+
+  /// Solves to a fixpoint. `generate` fills a deferred body's `pending` when the body is first
+  /// installed: its constraints, and the activations its references add. It runs between the
+  /// solver's steps, never inside one, and the budget is checked after each body it generates.
+  pub fn solve_with(&mut self, generate: &mut dyn FnMut(&mut Analysis, FnId)) {
+    'solve: loop {
       if self.over_budget() {
         self.budget_exceeded = true;
         if self.debug {
@@ -2128,6 +2151,16 @@ impl Analysis {
         break;
       }
       while let Some(f) = self.activation_queue.pop() {
+        if self.fns[f].deferred {
+          self.fns[f].deferred = false;
+          generate(self, f);
+          // A large body must not run past the budget until the queue drains: the loop's start
+          // stops the solve, before the body's constraints are installed.
+          if self.over_budget() {
+            self.budget_exceeded_generating = true;
+            continue 'solve;
+          }
+        }
         let pending = if self.fns[f].cloneable {
           self.fns[f].pending.clone()
         } else {

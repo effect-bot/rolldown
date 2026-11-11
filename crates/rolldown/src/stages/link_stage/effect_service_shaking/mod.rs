@@ -31,13 +31,15 @@ use rolldown_common::{ExportsKind, Module, ModuleIdx, Specifier, SymbolRef};
 use rolldown_error::{BuildDiagnostic, EventKindSwitcher};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use self::generate::{Gen, ModuleFacts, Shared};
+use self::generate::{DeferredStatement, Gen, ModuleFacts, Shared};
 use self::heap::{Analysis, Constraint, Flavour, FnId, ObjKind, Pending};
 use super::LinkStage;
 
 /// The work of every solve of one build (`effect_service_shaking_with` runs one per round).
 #[derive(Default)]
 struct Rounds {
+  /// Whether a solve ran out of budget generating a deferred statement.
+  stopped_generating: bool,
   count: usize,
   entries: u64,
   steps: u64,
@@ -56,6 +58,16 @@ struct Rounds {
   active: std::time::Duration,
   /// Printing this report, which the complete time leaves out.
   printing: std::time::Duration,
+  /// Deferred generation (implementation.md), over all solves: statements registered for it,
+  /// those generated up front instead, those generated on activation and the time that took
+  /// (inside the solve, but not counted as solving), the eager scans' time, and the bytes of
+  /// the registrations (bodies, descriptors and the module facts they keep).
+  deferred: usize,
+  kept_eager: usize,
+  generated: usize,
+  generation: std::time::Duration,
+  scans: std::time::Duration,
+  descriptor_bytes: usize,
 }
 
 /// The time loading the declarations took.
@@ -92,6 +104,78 @@ impl Rounds {
       ms(phases)
     )
   }
+
+  /// Deferred generation's line of the report.
+  fn deferred_report(&self) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    format!(
+      "deferred generation: {} lazy statements deferred, {} generated up front (they name getOrUndefinedUnsafe), {} generated on activation in {:.1} ms; registration and scans {:.1} ms, {} KiB registered{}",
+      self.deferred,
+      self.kept_eager,
+      self.generated,
+      ms(self.generation),
+      ms(self.scans),
+      self.descriptor_bytes / 1024,
+      if self.stopped_generating { "; the budget ran out generating one" } else { "" }
+    )
+  }
+}
+
+/// Turns the references generated since the last call (`Shared::lazy_refs`) into activations:
+/// a body referencing a symbol a lazy statement declares activates that statement. Each one is
+/// added once per body, at the end of its pending constraints.
+///
+/// `generated` is the deferred statement just generated, during the solve: its body is installed
+/// right after, so its activations join its pending constraints like any other body's. A body
+/// the solve already activated (its constraints may be installed) activates the statement at
+/// once instead, so that a reference found after its owner ran is not stranded. The generator
+/// makes neither today: a deferred statement's references are owned by it or by the functions
+/// inside it, which can only be activated after it is installed.
+fn add_activations(
+  a: &mut Analysis,
+  sh: &mut Shared<'_>,
+  seen: &mut FxHashSet<(FnId, FnId)>,
+  generated: Option<FnId>,
+) {
+  for (owner, sym) in sh.lazy_refs.drain(..) {
+    if let Some(l) = sh.lazy_decls.get(&sym).copied() {
+      if l != owner && seen.insert((owner, l)) {
+        if generated.is_some_and(|g| g != owner) && a.fns[owner].activated {
+          a.activate(l);
+        } else {
+          a.fns[owner].pending.push(Pending::Activate(l));
+        }
+      }
+    }
+  }
+}
+
+/// What registering the deferred statements takes, beyond what generating them would: each
+/// one's body (its `FnInfo` and variables), its descriptor and the module facts kept for it.
+/// The bodies and their variables count toward the limits like any other.
+fn deferred_bytes(
+  a: &Analysis,
+  deferred: &FxHashMap<FnId, (ModuleIdx, DeferredStatement)>,
+  modules: &FxHashMap<ModuleIdx, (ModuleFacts<'_>, u32)>,
+) -> usize {
+  let entry = std::mem::size_of::<(FnId, (ModuleIdx, DeferredStatement))>() + 1;
+  let facts: usize = modules
+    .values()
+    .map(|(m, _)| {
+      std::mem::size_of::<(ModuleIdx, (ModuleFacts<'_>, u32))>()
+        + m.external_imports.capacity()
+          * (std::mem::size_of::<(SymbolRef, (heap::ObjId, Option<ArcStr>))>() + 1)
+        + m.cjs_imports.capacity() * (std::mem::size_of::<SymbolRef>() + 1)
+        + m.dynamic_imports.capacity() * (std::mem::size_of::<(usize, Option<ModuleIdx>)>() + 1)
+        + m.lazy_stmts.capacity() * (std::mem::size_of::<(usize, Vec<SymbolRef>)>() + 1)
+        + m
+          .lazy_stmts
+          .values()
+          .map(|v| v.capacity() * std::mem::size_of::<SymbolRef>())
+          .sum::<usize>()
+    })
+    .sum();
+  deferred.capacity() * entry + deferred.len() * a.body_bytes() + facts
 }
 
 /// Whether a module is one of the `effect` package's.
@@ -236,8 +320,17 @@ impl EffectDeclarations {
 }
 
 /// The phases of one solve, as the report's `phases` line names them.
-const PHASES: [&str; 8] =
-  ["declarations", "bind", "generate", "solve", "after solve", "plan", "apply", "drop"];
+const PHASES: [&str; 9] = [
+  "declarations",
+  "bind",
+  "generate",
+  "solve",
+  "after solve",
+  "plan",
+  "apply",
+  "drop",
+  "deferred generate",
+];
 
 /// Wall time spent in each of `PHASES`, summed over the solves of one build. Measured in every
 /// build (a clock read per phase), so the report's numbers do not depend on the debug output.
@@ -259,6 +352,12 @@ impl Phases {
       self.spent[i] += now - at;
     }
     self.at = Some(now);
+  }
+
+  /// Moves `d` of phase `from` to phase `to`: work timed inside another phase.
+  fn moved(&mut self, from: usize, to: usize, d: std::time::Duration) {
+    self.spent[from] = self.spent[from].saturating_sub(d);
+    self.spent[to] += d;
   }
 
   fn report(&self) -> String {
@@ -329,6 +428,7 @@ impl LinkStage<'_> {
         rounds.phases.report()
       );
       eprintln!("[effect-service-shaking] time: {}", rounds.time_report(complete));
+      eprintln!("[effect-service-shaking] {}", rounds.deferred_report());
     }
   }
 
@@ -403,7 +503,11 @@ impl LinkStage<'_> {
       lazy_refs: vec![],
       lazy_by_module: FxHashMap::default(),
       resolve_global: host::resolve_global,
-      key_symbols: FxHashSet::default(),
+      key_symbols: FxHashMap::default(),
+      statements: 0,
+      lazy_spans: vec![],
+      kept_eager: 0,
+      scan_time: std::time::Duration::ZERO,
       key_ctor_symbols: FxHashSet::default(),
       key_ctor_members: FxHashSet::default(),
       hole_values: FxHashMap::default(),
@@ -806,8 +910,13 @@ impl LinkStage<'_> {
       sh.hole_values.insert(module, value);
     }
 
-    // == per-module facts and constraint generation
+    // == per-module facts and constraint generation. Lazy statements are generated when the solve
+    // first installs them (deferred generation, implementation.md), unless eager generation is
+    // asked for: the facts of their modules stay here until the solve ends.
+    let defer = !self.eager_generation();
     let mut module_fns = vec![];
+    let mut deferred: FxHashMap<FnId, (ModuleIdx, DeferredStatement)> = FxHashMap::default();
+    let mut deferred_modules: FxHashMap<ModuleIdx, (ModuleFacts<'_>, u32)> = FxHashMap::default();
     for module in order.iter().map(|idx| &self.module_table.modules[*idx]) {
       let Module::Normal(normal) = module else { continue };
       let Some(ast) = self.ast_table[normal.idx].as_ref() else { continue };
@@ -878,8 +987,13 @@ impl LinkStage<'_> {
         lazy_stmts: self.lazy_statements(normal.idx, ast.program()),
       };
       let mut g = Gen::new(&mut a, &mut sh, &facts);
-      g.program(ast.program());
+      let statements = g.program(ast.program(), defer);
+      let next_case = g.next_case();
       module_fns.push(g.module_fn());
+      if !statements.is_empty() {
+        deferred.extend(statements.into_iter().map(|d| (d.lazy, (normal.idx, d))));
+        deferred_modules.insert(normal.idx, (facts, next_case));
+      }
       phase!("generated {} ({} vars, {} objs)", normal.id.as_ref(), a.vars.len(), a.objs.len());
     }
 
@@ -919,15 +1033,9 @@ impl LinkStage<'_> {
 
     // == lazy top-level statements: a reference activates the statement declaring the symbol
     // (design.md, principle 2). Roots are the references made outside generated code.
+    let mut seen: FxHashSet<(FnId, FnId)> = FxHashSet::default();
     {
-      let mut seen: FxHashSet<(FnId, FnId)> = FxHashSet::default();
-      for (owner, sym) in std::mem::take(&mut sh.lazy_refs) {
-        if let Some(l) = sh.lazy_decls.get(&sym).copied() {
-          if l != owner && seen.insert((owner, l)) {
-            a.fns[owner].pending.push(Pending::Activate(l));
-          }
-        }
-      }
+      add_activations(&mut a, &mut sh, &mut seen, None);
       for module in order.iter().copied() {
         let Some(ns) = sh.namespace_objs.get(&module).copied() else { continue };
         let mut all: Vec<FnId> = sh.lazy_by_module.get(&module).cloned().unwrap_or_default();
@@ -964,20 +1072,49 @@ impl LinkStage<'_> {
       }
     }
 
-    // == solve
+    // == solve. A deferred statement is generated when the solve first installs it, and the
+    // activations its references add join its bodies' pending constraints, as `add_activations`
+    // adds them above for the rest.
     for f in module_fns {
       a.activate(f);
     }
+    rounds.deferred += deferred.len();
+    rounds.kept_eager += sh.kept_eager;
+    rounds.scans += sh.scan_time;
+    rounds.descriptor_bytes += deferred_bytes(&a, &deferred, &deferred_modules);
     rounds.phases.lap(2);
     phase!("solving");
     let solve_start = std::time::Instant::now();
-    a.solve();
+    let mut generation = std::time::Duration::ZERO;
+    {
+      let ast_table = &self.ast_table;
+      let mut generated: FxHashSet<FnId> = FxHashSet::default();
+      let mut generate = |a: &mut Analysis, lazy: FnId| {
+        let began = std::time::Instant::now();
+        let (module, d) = deferred[&lazy];
+        let (facts, next_case) = deferred_modules.get_mut(&module).expect("registered with it");
+        let program = ast_table[module].as_ref().expect("a generated module has its AST").program();
+        let mut g = Gen::resume(a, &mut sh, facts, *next_case);
+        g.deferred_statement(d, &program.body[d.index]);
+        *next_case = g.next_case();
+        add_activations(a, &mut sh, &mut seen, Some(lazy));
+        let first = generated.insert(lazy);
+        debug_assert!(first, "a deferred statement is generated once");
+        rounds.generated += 1;
+        generation += began.elapsed();
+      };
+      a.solve_with(&mut generate);
+    }
+    drop(deferred_modules);
     rounds.phases.lap(3);
+    rounds.phases.moved(3, 8, generation);
+    rounds.generation += generation;
+    rounds.stopped_generating |= a.budget_exceeded_generating;
     rounds.count += 1;
     rounds.entries += a.total_pts + a.total_copies;
     rounds.steps += a.steps;
     rounds.per_solve.push((a.total_pts + a.total_copies, a.steps));
-    rounds.solve += solve_start.elapsed();
+    rounds.solve += solve_start.elapsed().saturating_sub(generation);
     // Refinement: a module hole that a service, a key or a provider reached is analysed in the
     // next solve, so that it keeps no more methods than its code reads.
     let reached: Vec<ModuleIdx> = {
@@ -1192,6 +1329,9 @@ impl LinkStage<'_> {
       objs = a.objs.len(),
       steps = a.steps,
       removed = total_removed,
+      deferred = rounds.deferred,
+      generated = rounds.generated,
+      budget_exceeded_generating = a.budget_exceeded_generating,
       solve_ms = solved.as_millis(),
       active_ms = rounds.active.as_millis(),
       "effect service shaking"
@@ -1256,6 +1396,14 @@ impl LinkStage<'_> {
     drop(edits);
     rounds.phases.lap(7);
     false
+  }
+
+  /// Whether lazy statements are generated up front, as before deferred generation: the
+  /// comparison baseline for tests (`effectServiceShakingEagerGeneration`, or the
+  /// `ROLLDOWN_EFFECT_SERVICE_SHAKING_EAGER_GENERATION` variable for every build in a process).
+  fn eager_generation(&self) -> bool {
+    self.options.experimental.effect_service_shaking_eager_generation == Some(true)
+      || std::env::var_os("ROLLDOWN_EFFECT_SERVICE_SHAKING_EAGER_GENERATION").is_some()
   }
 
   /// The modules left as holes: those whose static imports, followed transitively, never reach a

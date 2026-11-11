@@ -1098,6 +1098,13 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "effectServiceShakingEagerGeneration": {
+          "description": "Test knob for `effectServiceShaking`: generate every lazy top-level statement up front, as\nbefore deferred generation, instead of when the analysis first reaches it. The comparison\nbaseline for deferred generation; the `ROLLDOWN_EFFECT_SERVICE_SHAKING_EAGER_GENERATION`\nvariable sets it for every build in a process.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

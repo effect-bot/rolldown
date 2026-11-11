@@ -95,6 +95,12 @@ pub struct ExperimentalOptions {
   /// every build in a process.
   #[doc(hidden)]
   pub effect_service_shaking_max_entries: Option<u64>,
+  /// Test knob for `effectServiceShaking`: generate every lazy top-level statement up front, as
+  /// before deferred generation, instead of when the analysis first reaches it. The comparison
+  /// baseline for deferred generation; the `ROLLDOWN_EFFECT_SERVICE_SHAKING_EAGER_GENERATION`
+  /// variable sets it for every build in a process.
+  #[doc(hidden)]
+  pub effect_service_shaking_eager_generation: Option<bool>,
 }
 
 impl ExperimentalOptions {
