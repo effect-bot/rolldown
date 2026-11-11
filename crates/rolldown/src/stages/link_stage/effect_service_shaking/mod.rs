@@ -45,6 +45,45 @@ struct Rounds {
   /// The `.d.ts` files the previous solve parsed. They depend on nothing but the files, so the
   /// next solve starts with them instead of parsing them again.
   dts: Option<dts::Dts>,
+  /// Each solve's own entries and steps, for the report.
+  per_solve: Vec<(u64, u64)>,
+  phases: Phases,
+}
+
+/// The phases of one solve, as the report's `phases` line names them.
+const PHASES: [&str; 8] =
+  ["declarations", "bind", "generate", "solve", "after solve", "plan", "apply", "drop"];
+
+/// Wall time spent in each of `PHASES`, summed over the solves of one build. Measured in every
+/// build (a clock read per phase), so the report's numbers do not depend on the debug output.
+#[derive(Default)]
+struct Phases {
+  at: Option<std::time::Instant>,
+  spent: [std::time::Duration; PHASES.len()],
+}
+
+impl Phases {
+  fn start(&mut self) {
+    self.at = Some(std::time::Instant::now());
+  }
+
+  /// Ends phase `i` (an index into `PHASES`) now; the next phase starts here.
+  fn lap(&mut self, i: usize) {
+    let now = std::time::Instant::now();
+    if let Some(at) = self.at {
+      self.spent[i] += now - at;
+    }
+    self.at = Some(now);
+  }
+
+  fn report(&self) -> String {
+    let parts: Vec<String> = PHASES
+      .iter()
+      .zip(self.spent)
+      .map(|(name, d)| format!("{name} {:.1}", d.as_secs_f64() * 1000.0))
+      .collect();
+    format!("{} ms", parts.join(", "))
+  }
 }
 
 impl LinkStage<'_> {
@@ -87,6 +126,7 @@ impl LinkStage<'_> {
         }
       };
     }
+    rounds.phases.start();
     let mut a = Analysis::new();
     let decls = Decls::default();
     if let Some(limit) = self.options.experimental.effect_service_shaking_widen {
@@ -295,6 +335,7 @@ impl LinkStage<'_> {
         return false;
       }
     }
+    rounds.phases.lap(0);
     let mut modelled: FxHashSet<ModuleIdx> = public_modules.iter().map(|(m, _)| *m).collect();
     for (module, specs) in &public_modules {
       for (name, export) in &self.metas[*module].resolved_exports {
@@ -512,6 +553,7 @@ impl LinkStage<'_> {
       a.copy(to, from);
     }
 
+    rounds.phases.lap(1);
     phase!("model bound, {} rule symbols", sh.rule_symbols.len());
     if debug {
       for (i, m) in self.module_table.modules.iter().enumerate() {
@@ -712,12 +754,15 @@ impl LinkStage<'_> {
     for f in module_fns {
       a.activate(f);
     }
+    rounds.phases.lap(2);
     phase!("solving");
     let solve_start = std::time::Instant::now();
     a.solve();
+    rounds.phases.lap(3);
     rounds.count += 1;
     rounds.entries += a.total_pts + a.total_copies;
     rounds.steps += a.steps;
+    rounds.per_solve.push((a.total_pts + a.total_copies, a.steps));
     rounds.solve += solve_start.elapsed();
     // Refinement: a module hole that a service, a key or a provider reached is analysed in the
     // next solve, so that it keeps no more methods than its code reads.
@@ -740,6 +785,10 @@ impl LinkStage<'_> {
       }
       analysed_holes.extend(reached);
       rounds.dts = Some(std::mem::take(&mut a.dts));
+      rounds.phases.lap(4);
+      drop(a);
+      drop(decls);
+      rounds.phases.lap(7);
       return true;
     }
     if debug {
@@ -906,10 +955,12 @@ impl LinkStage<'_> {
     }
 
     // == prune
+    rounds.phases.lap(4);
     let names: Vec<String> = self.module_table.modules.iter().map(|m| m.id().to_string()).collect();
     let (edits, mut report) =
       prune::plan(&mut a, &sh, &|idx: ModuleIdx| names[idx.index()].clone());
     report.bail_reasons.clone_from(&a.bail_reasons);
+    rounds.phases.lap(5);
     phase!("planned {} removals", report.removed.len());
     drop(sh);
     for (module, properties) in &edits.properties {
@@ -918,6 +969,7 @@ impl LinkStage<'_> {
         prune::apply(ast, scoping, &mut self.stmt_infos[*module], *module, properties);
       }
     }
+    rounds.phases.lap(6);
 
     let total_removed = report.removed.len();
     tracing::debug!(
@@ -979,6 +1031,21 @@ impl LinkStage<'_> {
       for (module, start, name) in removed {
         eprintln!("[effect-service-shaking] removed {name} at {module}:{start}");
       }
+    }
+    // The report's own printing is not a phase.
+    rounds.phases.start();
+    drop(a);
+    drop(decls);
+    drop(edits);
+    rounds.phases.lap(7);
+    if report_enabled {
+      let per_solve: Vec<String> =
+        rounds.per_solve.iter().map(|(e, s)| format!("{e} entries / {s} steps")).collect();
+      eprintln!(
+        "[effect-service-shaking] each solve: [{}]; phases over all solves: {}",
+        per_solve.join(", "),
+        rounds.phases.report()
+      );
     }
     false
   }
