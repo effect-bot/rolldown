@@ -15,17 +15,15 @@ for (const name of [
   'mappedUsed',
   'madeUsed',
   'omittedUsed',
+  // Kept since the escape batch. Unfinished: the record escapes to a host
+  // builtin and then into effect's code, and an escape into effect's code keeps
+  // every method. Its removal held only while the host escape arrived first and
+  // the later escape was skipped.
+  'omittedUnused',
 ]) {
   if (!kept(name)) failures.push(`${name} should be kept`);
 }
-for (const name of [
-  'passedUnused',
-  'layerUnused',
-  'builtUnused',
-  'mappedUnused',
-  'madeUnused',
-  'omittedUnused',
-]) {
+for (const name of ['passedUnused', 'layerUnused', 'builtUnused', 'mappedUnused', 'madeUnused']) {
   if (kept(name)) failures.push(`${name} should be removed`);
 }
 assert.deepStrictEqual(failures, []);
