@@ -9256,6 +9256,19 @@ mod tests {
     (missing.collect(), a.objs[closure].escaped == Some(Flavour::Ext))
   }
 
+  /// A plain record escapes to a host builtin, the solve drains, then it escapes to code the
+  /// pass can't see: it is stored as escaped there, with every member demanded, which is what
+  /// `prune` reads to keep every method.
+  #[test]
+  fn host_then_genuine_escape_of_a_record_demands_all() {
+    let mut a = Analysis::new();
+    let record = a.alloc(ObjKind::Object, None);
+    Obligation::Host.escape(&mut a, record);
+    Obligation::Genuine.escape(&mut a, record);
+    let o = &a.objs[record];
+    assert_eq!((o.demand.is_all(), o.escaped), (true, Some(Flavour::Ext)));
+  }
+
   #[test]
   fn host_then_effect_escape_runs() {
     assert_eq!(obligations_in_order(Obligation::Host, Obligation::Effect), (vec![], true));

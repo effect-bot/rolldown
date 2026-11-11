@@ -1,5 +1,5 @@
 {
-  "_comment": "A service handed to a host builtin (`process.zzHost`, a member of `process`) and also exported from the entry: the host escape comes first, and the entry export's escape to code the pass can't see must still keep every method. The program calls one method and the test calls the other through the export.",
+  "_comment": "Control. A service handed to a host builtin (`process.zzHost`, a member of `process`) and exported from the entry, in that source order; the program calls one method and the test calls the other through the export. Green before and after the escape marks repair: every method stays. Why it is green before the repair is a reading of the code, not a probe: the call waits for the member load on `process`, so the export's escape to code the pass can't see is likely the first to run.",
   "config": {
     "experimental": {
       "effectServiceShaking": true
