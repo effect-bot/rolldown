@@ -318,7 +318,10 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
     // The one stretch of a build with no plugin in it, which is what makes it a usable
     // baseline for "was this build plugin-bound?" — see `BuildTimings`.
     let link_start = self.plugin_driver.build_timings.start();
-    let (mut link_stage_output, ast_table, used_symbol_refs_builder) =
+    // The effect service shaking pass's analysis, freed on its own thread while the build goes
+    // on. Held to the end of this function on every path: dropping it joins the free, so it ends
+    // before the build returns.
+    let (mut link_stage_output, ast_table, used_symbol_refs_builder, _analysis_drop) =
       LinkStage::new(scan_stage_output, &self.options).link();
     self.plugin_driver.build_timings.record_link_stage(link_start);
 
