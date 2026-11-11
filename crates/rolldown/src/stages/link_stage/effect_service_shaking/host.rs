@@ -1278,6 +1278,7 @@ fn global_object(a: &mut Analysis, name: &str) -> ObjId {
         a.alloc(ObjKind::External { flavour: Flavour::Ext, name: ArcStr::from(name) }, None);
       let proto = a.alloc(ObjKind::Object, None);
       a.objs[proto].builtin_proto = true;
+      a.graph_changed();
       for m in ["call", "apply", "bind"] {
         let id = a.rule_id(&format!("Function.prototype.{m}")).expect("registered");
         let b = a.builtin(id, None, None);
@@ -1304,6 +1305,7 @@ fn global_object(a: &mut Analysis, name: &str) -> ObjId {
 fn builtin_prototype(a: &mut Analysis, ctor: ObjId) {
   let proto = a.alloc(ObjKind::Object, None);
   a.objs[proto].builtin_proto = true;
+  a.graph_changed();
   let f = a.field(ctor, &ArcStr::from("prototype"));
   a.seed(f, proto);
 }

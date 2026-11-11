@@ -858,6 +858,83 @@ pub struct Var {
   widened: bool,
 }
 
+/// The budget's overrides from the environment (`ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_*`), read
+/// once per analysis. An entry override takes precedence over `max_entries`.
+struct EnvLimits {
+  objects: usize,
+  vars: usize,
+  entries: Option<u64>,
+}
+
+impl EnvLimits {
+  fn read() -> Self {
+    fn var<T: std::str::FromStr>(name: &str) -> Option<T> {
+      std::env::var(name).ok().and_then(|s| s.parse().ok())
+    }
+    Self {
+      objects: var("ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_OBJECTS").unwrap_or(Analysis::MAX_OBJECTS),
+      vars: var("ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_VARS").unwrap_or(Analysis::MAX_VARS),
+      entries: var("ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_ENTRIES"),
+    }
+  }
+}
+
+/// What the walks of `Analysis::reaches` have visited: a stamp per object and variable, so
+/// starting a walk costs nothing and a visit is an array access rather than a hash.
+///
+/// A walk that answers false has visited every object it reaches, and found none that counts.
+/// Until the graph changes (`Analysis::graph_changed`), a later walk that meets one of those
+/// objects again can skip it, so the walks of one unchanged graph share their stamp. A walk
+/// that answers true stops early and leaves objects it has not explored marked, so it starts a
+/// new stamp.
+#[derive(Default)]
+struct Marks {
+  walk: u32,
+  objs: Vec<u32>,
+  vars: Vec<u32>,
+  /// The graph the current stamp's negative walks explored (`Analysis::graph_version`).
+  graph: (u64, usize),
+  /// How many objects the walks of the current stamp have visited.
+  visited: usize,
+}
+
+impl Marks {
+  /// Prepares a walk over `objs` objects and `vars` variables of the graph `graph`.
+  fn begin(&mut self, objs: usize, vars: usize, graph: (u64, usize)) {
+    if self.graph != graph {
+      self.graph = graph;
+      self.restart();
+    }
+    if self.objs.len() < objs {
+      self.objs.resize(objs, 0);
+    }
+    if self.vars.len() < vars {
+      self.vars.resize(vars, 0);
+    }
+  }
+
+  /// Forgets what earlier walks visited.
+  fn restart(&mut self) {
+    if self.walk == u32::MAX {
+      self.walk = 0;
+      self.objs.fill(0);
+      self.vars.fill(0);
+    }
+    self.walk += 1;
+    self.visited = 0;
+  }
+
+  /// Whether `o` is visited for the first time under this stamp; marks it visited.
+  fn visit_obj(&mut self, o: ObjId) -> bool {
+    std::mem::replace(&mut self.objs[o.index()], self.walk) != self.walk
+  }
+
+  /// Whether `v` is visited for the first time under this stamp; marks it visited.
+  fn visit_var(&mut self, v: VarId) -> bool {
+    std::mem::replace(&mut self.vars[v.index()], self.walk) != self.walk
+  }
+}
+
 #[expect(clippy::struct_excessive_bools, reason = "independent switches of the analysis")]
 pub struct Analysis {
   pub vars: IndexVec<VarId, Var>,
@@ -967,6 +1044,7 @@ pub struct Analysis {
   pub widen_limit: usize,
   /// The entries budget (`MAX_ENTRIES` unless the build sets one).
   pub max_entries: u64,
+  env_limits: EnvLimits,
   widened_class: Option<ObjId>,
   /// The boundary of program code the pass does not follow (`unfollowed`).
   unfollowed_class: Option<ObjId>,
@@ -1046,6 +1124,11 @@ pub struct Analysis {
   live_never_prune: usize,
   /// Objects known to reach code (`reaches_code` only grows).
   live_code: FxHashSet<ObjId>,
+  /// What the walks of `reaches` have visited, for `may_hold` and `reaches_code`.
+  marks: [Marks; 2],
+  /// Counts the changes to what `reaches` reads: points-to sets, the variables an object
+  /// reaches through, accessors and keys (`graph_changed`).
+  graph_version: u64,
   /// Admission counters for the report: admitted, held back, tainted stand-ins.
   pub admission_stats: (u64, u64, u64),
   /// What awaiting each summary gives (`AwaitOf` on a `Wrap`).
@@ -1223,6 +1306,8 @@ impl Analysis {
       held_admissions_seen: FxHashSet::default(),
       live: FxHashSet::default(),
       live_code: FxHashSet::default(),
+      marks: Default::default(),
+      graph_version: 0,
       live_never_prune: 0,
       admission_stats: (0, 0, 0),
       typed_args_seen: FxHashSet::default(),
@@ -1249,6 +1334,7 @@ impl Analysis {
       callable_filter_vars: FxHashSet::default(),
       callable_filters: FxHashMap::default(),
       max_entries: Self::MAX_ENTRIES,
+      env_limits: EnvLimits::read(),
       widen_limit: std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_WIDEN")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1451,6 +1537,7 @@ impl Analysis {
     }
     let v = self.var();
     self.key_values.insert(key.clone(), v);
+    self.graph_changed();
     // Lookups through unknown keys see every key, and every key sees what unknown keys provide.
     self.copy(v, self.all_values);
     self.copy(self.unknown_key_values, v);
@@ -1719,6 +1806,7 @@ impl Analysis {
       return;
     }
     list.push(acc.clone());
+    self.graph_changed();
     self.recheck_tree(target);
     if let Some(heirs) = self.heirs.get(&target).cloned() {
       for heir in heirs {
@@ -1738,6 +1826,11 @@ impl Analysis {
 
   // == edges and seeds
 
+  /// Something `reaches` reads has changed, so what earlier walks found holds no longer.
+  pub fn graph_changed(&mut self) {
+    self.graph_version += 1;
+  }
+
   pub fn seed(&mut self, var: VarId, obj: ObjId) {
     if self.vars[var].widened && !self.opaque_class.contains_key(&obj) && !self.keeps_identity(obj)
     {
@@ -1746,6 +1839,7 @@ impl Analysis {
       return;
     }
     if self.vars[var].pts.insert(obj) {
+      self.graph_changed();
       self.total_pts += 1;
       self.vars[var].delta.push(obj);
       self.enqueue(var);
@@ -1829,6 +1923,7 @@ impl Analysis {
     if var.index() < self.init_vars || self.key_values.values().any(|v| *v == var) {
       return;
     }
+    self.graph_changed();
     self.vars[var].widened = true;
     self.widened_vars += 1;
     let class = self.widen_class();
@@ -1902,28 +1997,12 @@ impl Analysis {
   const MAX_VARS: usize = 30_000_000;
   const MAX_ENTRIES: u64 = 32_000_000;
 
+  /// Checked on every turn of the solve loop, so the environment overrides are read once, in
+  /// `new` (`EnvLimits`).
   fn over_budget(&self) -> bool {
-    self.objs.len() > self.max_objects()
-      || self.vars.len() > self.max_vars()
-      || self.total_pts + self.total_copies
-        > std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_ENTRIES")
-          .ok()
-          .and_then(|s| s.parse().ok())
-          .unwrap_or(self.max_entries)
-  }
-
-  fn max_objects(&self) -> usize {
-    std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_OBJECTS")
-      .ok()
-      .and_then(|s| s.parse().ok())
-      .unwrap_or(Self::MAX_OBJECTS)
-  }
-
-  fn max_vars(&self) -> usize {
-    std::env::var("ROLLDOWN_EFFECT_SERVICE_SHAKING_MAX_VARS")
-      .ok()
-      .and_then(|s| s.parse().ok())
-      .unwrap_or(Self::MAX_VARS)
+    self.objs.len() > self.env_limits.objects
+      || self.vars.len() > self.env_limits.vars
+      || self.total_pts + self.total_copies > self.env_limits.entries.unwrap_or(self.max_entries)
   }
 
   /// Counts of objects by kind (and builtins by rule), for diagnosing runaway analyses.
@@ -2853,6 +2932,7 @@ impl Analysis {
         }
         if !self.objs[obj].unknown_stores.contains(&src) {
           self.objs[obj].unknown_stores.push(src);
+          self.graph_changed();
           self.recheck_tree(obj);
         }
         let fields: Vec<VarId> = self.objs[obj]
@@ -3865,11 +3945,31 @@ impl Analysis {
     if live.contains(&obj) {
       return true;
     }
-    let mut seen: FxHashSet<ObjId> = FxHashSet::default();
+    // Each object and variable is visited once (`Marks`): the variables of a large record or
+    // summary often share their points-to sets, so the walk would otherwise push the same
+    // objects many times over. Objects an earlier walk over the same graph found nothing from
+    // are skipped too, unless the walks of this graph have visited more than `LIMIT` objects
+    // between them: the walk then starts over alone, so it stops at `LIMIT` as it would alone.
+    let mode = usize::from(code);
+    self.marks[mode].begin(
+      self.objs.len(),
+      self.vars.len(),
+      (self.graph_version, self.never_prune.len()),
+    );
+    if !self.marks[mode].visit_obj(obj) {
+      return false;
+    }
+    let mut alone = self.marks[mode].visited == 0;
     let mut stack = vec![obj];
     let mut vars: Vec<VarId> = vec![];
     while let Some(o) = stack.pop() {
-      if !seen.insert(o) {
+      self.marks[mode].visited += 1;
+      if self.marks[mode].visited > LIMIT && !alone {
+        self.marks[mode].restart();
+        self.marks[mode].visit_obj(obj);
+        alone = true;
+        stack.clear();
+        stack.push(obj);
         continue;
       }
       let known = if code { &self.live_code } else { &self.live };
@@ -3886,7 +3986,8 @@ impl Analysis {
             | ObjKind::AllKeys
         )
         && self.prunable_service(o);
-      if known.contains(&o) || provided || seen.len() > LIMIT {
+      if known.contains(&o) || provided || self.marks[mode].visited > LIMIT {
+        self.marks[mode].restart();
         if code {
           self.live_code.insert(obj)
         } else {
@@ -3924,6 +4025,7 @@ impl Analysis {
           if !code || matches!(ob.kind, ObjKind::Object | ObjKind::Array) =>
         {
           if code && (ob.builtin_proto || self.accessors.contains_key(&o)) {
+            self.marks[mode].restart();
             self.live_code.insert(obj);
             return true;
           }
@@ -3937,6 +4039,7 @@ impl Analysis {
         ObjKind::Typed { slot, .. } if !code => vars.push(*slot),
         ObjKind::Promise { value } => vars.push(*value),
         _ => {
+          self.marks[mode].restart();
           if code {
             self.live_code.insert(obj)
           } else {
@@ -3946,7 +4049,10 @@ impl Analysis {
         }
       }
       for v in vars.drain(..) {
-        stack.extend(self.vars[v].pts.iter().copied());
+        if self.marks[mode].visit_var(v) {
+          let marks = &mut self.marks[mode];
+          stack.extend(self.vars[v].pts.iter().copied().filter(|p| marks.visit_obj(*p)));
+        }
       }
     }
     false
@@ -6053,6 +6159,7 @@ impl Analysis {
         let holder = self.holder(obj);
         if !self.objs[target].spread_from.contains(&holder) {
           self.objs[target].spread_from.push(holder);
+          self.graph_changed();
           self.recheck_tree(target);
           // A source spread into an object after it crossed into class code crosses too, as
           // the sources it had then did (`class_escape`).
@@ -6182,6 +6289,7 @@ impl Analysis {
         self.seed(elem, op);
         if !self.objs[obj].unknown_stores.contains(&elem) {
           self.objs[obj].unknown_stores.push(elem);
+          self.graph_changed();
         }
         self.recheck_tree(obj);
         for src in self.objs[obj].spread_from.clone() {
@@ -6587,6 +6695,7 @@ impl Analysis {
     self.seed(elem, top);
     if !self.objs[obj].unknown_stores.contains(&elem) {
       self.objs[obj].unknown_stores.push(elem);
+      self.graph_changed();
       self.recheck_tree(obj);
     }
   }
