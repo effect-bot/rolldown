@@ -1288,6 +1288,10 @@ pub struct Analysis {
   /// Rows of the objects' named-load indexes (`Obj::named_loads`), counted as entries: each is
   /// a read edge from an object to a variable, as a copy edge is.
   pub total_named_loads: u64,
+  /// The loads replay queues on a spread source's holder (`spread_into`), counted as entries
+  /// as each is queued: the solve applies one spread to every object its variable holds before
+  /// it checks the budget again, so a row counted only once its load runs would come too late.
+  pub total_replay_loads: u64,
   /// Replay or the named-load index found the analysis over budget (`replay_stopped`). Latched:
   /// the solve stops even if widening later takes the totals back under the cap.
   replay_over: bool,
@@ -1476,6 +1480,7 @@ impl Analysis {
       total_pts: 0,
       total_copies: 0,
       total_named_loads: 0,
+      total_replay_loads: 0,
       replay_over: false,
     };
     this.seed(ambient_keys, all_keys);
@@ -2224,9 +2229,10 @@ impl Analysis {
       || self.entries() > self.env_limits.entries.unwrap_or(self.max_entries)
   }
 
-  /// The entries the budget counts: points-to entries, copy edges and named-load rows.
+  /// The entries the budget counts: points-to entries, copy edges, named-load rows and the
+  /// loads replay queued.
   pub(super) fn entries(&self) -> u64 {
-    self.total_pts + self.total_copies + self.total_named_loads
+    self.total_pts + self.total_copies + self.total_named_loads + self.total_replay_loads
   }
 
   /// Sets the entry cap, for tests that run out of entries at a chosen point.
@@ -6515,13 +6521,16 @@ impl Analysis {
         // And the named reads made on the target before this source arrived. Each is a load on
         // the source's holder, as a read made after it is (`load_name`): a field the source
         // gains later reaches it (`field`), and so does what a source spread into this one
-        // later holds.
+        // later holds. Each is an entry as it is queued (`total_replay_loads`), so the budget
+        // check before the next one sees it.
         named.extend(self.named_loads(target));
         for (name, dst) in named {
           if self.replay_stopped() {
             break;
           }
+          let queued = self.vars[holder].constraints.len();
           self.constrain(holder, Constraint::Load { key: Key::Name(name), dst });
+          self.total_replay_loads += (self.vars[holder].constraints.len() - queued) as u64;
         }
       }
       ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => {
@@ -8550,9 +8559,46 @@ mod tests {
     assert_eq!(wrong, Vec::<String>::new());
   }
 
-  /// A target with `k` fields and `k` named reads, solved, then `sources` empty objects
-  /// spread into it. Returns the analysis, the sources and the entries before the spreads.
-  fn fan_out(k: usize, sources: usize, cap: Option<u64>) -> (Analysis, Vec<ObjId>, u64) {
+  /// What a spread queued and kept (`fan_out`).
+  #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+  struct Fanned {
+    entries: u64,
+    replay_loads: u64,
+    /// Constraints on every variable: each constraint queued once (`constrain`), so this
+    /// bounds how many the queue held at its peak.
+    constraints: usize,
+    /// Registrations in `loads_by_name`.
+    registrations: usize,
+    rows: usize,
+  }
+
+  impl Fanned {
+    fn of(a: &Analysis) -> Self {
+      Fanned {
+        entries: a.entries(),
+        replay_loads: a.total_replay_loads,
+        constraints: a.vars.iter().map(|v| v.constraints.len()).sum(),
+        registrations: a.loads_by_name.values().map(FxHashSet::len).sum(),
+        rows: a.objs.iter().map(|o| o.named_loads.as_ref().map_or(0, |l| l.len())).sum(),
+      }
+    }
+
+    fn since(self, before: Self) -> Self {
+      Fanned {
+        entries: self.entries - before.entries,
+        replay_loads: self.replay_loads - before.replay_loads,
+        constraints: self.constraints - before.constraints,
+        registrations: self.registrations - before.registrations,
+        rows: self.rows - before.rows,
+      }
+    }
+  }
+
+  /// A target with `k` fields and `k` named reads, and `sources` empty objects in one variable,
+  /// each with its holder, all solved. With `room` the entry cap is set that far above the
+  /// entries just before the variable is spread into the target, so the spread's own batch is
+  /// all the cap sees. Returns the analysis, the sources and what the spread added.
+  fn fan_out(k: usize, sources: usize, room: Option<u64>) -> (Analysis, Vec<ObjId>, Fanned) {
     let mut a = Analysis::new();
     let target = a.alloc(ObjKind::Object, None);
     let recv = a.var();
@@ -8563,47 +8609,183 @@ mod tests {
       let dst = a.var();
       a.constrain(recv, Constraint::Load { key: Key::Name(name), dst });
     }
-    a.solve();
-    let entries = a.entries();
-    if let Some(room) = cap {
-      a.set_entry_cap(entries + room);
-    }
     let objs: Vec<ObjId> = (0..sources).map(|_| a.alloc(ObjKind::Object, None)).collect();
+    let src = a.var();
     for o in &objs {
-      let src = a.var();
+      a.holder(*o);
       a.seed(src, *o);
-      a.constrain(src, Constraint::SpreadInto(target));
     }
     a.solve();
-    (a, objs, entries)
+    let before = Fanned::of(&a);
+    if let Some(room) = room {
+      a.set_entry_cap(before.entries + room);
+    }
+    a.constrain(src, Constraint::SpreadInto(target));
+    a.solve();
+    let added = Fanned::of(&a).since(before);
+    (a, objs, added)
   }
 
-  /// Guard: the named-load index is bounded by the budget (`Obj::named_loads`). Spreading 16
-  /// empty sources into a target with 8 fields and 8 reads gives each source 16 rows, one per
-  /// field and read replayed into it, each counted as an entry, and the 8 names as demand; the
-  /// only other entries are each source in its own variable and its holder. With room for 10
-  /// more entries the solve stops, keeping everything, with at most 10 rows.
+  /// Guard: replay fan-out is bounded by the budget as it is queued (`spread_into`). One
+  /// variable holding 16 empty sources, spread into a target with 8 fields and 8 reads, queues
+  /// 16 loads on each source's holder, one per field and read, each an entry, and each load
+  /// gives its source a row, also an entry, and its name as demand. With room for 10 more
+  /// entries, set just before the spread, replay starts and stops within the spread's one
+  /// batch: at most 11 loads queued and registered, no more rows than the room, and the solve
+  /// stops keeping everything.
   #[test]
   fn named_load_fan_out_is_counted_and_bounded() {
     let (k, sources) = (8, 16);
-    let (a, objs, entries) = fan_out(k, sources, None);
+    let (a, objs, added) = fan_out(k, sources, None);
     let rows: Vec<usize> =
       objs.iter().map(|o| a.objs[*o].named_loads.as_ref().map_or(0, |l| l.len())).collect();
     assert_eq!(rows, vec![2 * k; sources]);
     let demand: Vec<bool> =
       objs.iter().map(|o| (0..k).all(|i| a.objs[*o].demand.has(&format!("f{i}")))).collect();
     assert_eq!(demand, vec![true; sources]);
+    let fanned = 2 * k * sources;
     assert_eq!(
-      a.total_named_loads,
-      (2 * k * sources + k) as u64,
-      "the target's reads, and the rows"
+      added,
+      Fanned {
+        entries: 2 * fanned as u64,
+        replay_loads: fanned as u64,
+        constraints: fanned + 1,
+        registrations: fanned,
+        rows: fanned,
+      },
+      "the loads and rows, and the spread itself"
     );
-    assert_eq!(a.entries() - entries, (2 * k * sources + 2 * sources) as u64);
     assert!(!a.budget_exceeded);
-    let (a, objs, _) = fan_out(k, sources, Some(10));
-    let rows: usize =
-      objs.iter().map(|o| a.objs[*o].named_loads.as_ref().map_or(0, |l| l.len())).sum();
-    assert!(rows <= 10 && a.budget_exceeded, "{rows} rows");
+    let room = 10;
+    let (a, _, added) = fan_out(k, sources, Some(room));
+    assert!(a.budget_exceeded, "the solve stops");
+    assert!(added.replay_loads >= 1, "replay starts: {added:?}");
+    assert!(
+      added.replay_loads <= room + 1
+        && added.constraints as u64 <= room + 2
+        && added.registrations as u64 <= room + 1
+        && added.rows as u64 <= room
+        && added.entries <= room + 1,
+      "{added:?}"
+    );
+  }
+
+  /// Replay-induced widening, as in `deferred_late_arrivals` (`reversed.js:317`): a read of
+  /// `pick` on a target holds the target's own `test/C` and, through a spread, `test/D` from a
+  /// field the source gains after the spread, then a third value there widens it past a limit of
+  /// two. The read comes first, so what the source holds reaches it through replay
+  /// (`spread_into`), or last. A lookup through what the read holds uses the names as keys, and
+  /// `test/F` arrives after it and after widening. Returns the widened state, and the decisions:
+  /// which keys the lookup sees and the demand.
+  fn replay_widening(read_first: bool, opaque_third: bool) -> (String, String) {
+    let mut a = Analysis::new();
+    a.widen_limit = 2;
+    let pick = ArcStr::from("pick");
+    let names = ["test/C", "test/D", "test/F", "test/Other"];
+    let provided: Vec<ObjId> = names
+      .iter()
+      .map(|n| {
+        let p = a.alloc(ObjKind::Object, None);
+        let v = a.key_value_var(&ArcStr::from(*n));
+        a.seed(v, p);
+        p
+      })
+      .collect();
+    let [target, source] = [0, 1].map(|_| a.alloc(ObjKind::Object, None));
+    // The third value: an object, or the opaque value of a set already widened.
+    let third = if opaque_third {
+      let wide = a.var();
+      for _ in 0..3 {
+        let o = a.alloc(ObjKind::Object, None);
+        a.seed(wide, o);
+      }
+      a.solve();
+      *a.pts(wide).iter().next().expect("the opaque value")
+    } else {
+      a.alloc(ObjKind::Object, None)
+    };
+    let [recv, read] = [0, 1].map(|_| a.var());
+    a.seed(recv, target);
+    let reads = |a: &mut Analysis| {
+      a.constrain(recv, Constraint::Load { key: Key::Name(pick.clone()), dst: read });
+    };
+    if read_first {
+      reads(&mut a);
+      a.solve();
+    }
+    let own = a.field(target, &pick);
+    let c = a.str("test/C");
+    a.seed(own, c);
+    let src = a.var();
+    a.seed(src, source);
+    a.constrain(src, Constraint::SpreadInto(target));
+    a.solve();
+    // The source's field is new after the spread.
+    let late = a.field(source, &pick);
+    let d = a.str("test/D");
+    a.seed(late, d);
+    a.solve();
+    a.seed(late, third);
+    a.solve();
+    if !read_first {
+      reads(&mut a);
+      a.solve();
+    }
+    // The lookup's own result holds three keys' values: past the limit it would widen too.
+    // The read stays widened (`widen`).
+    a.widen_limit = 8;
+    let [key, dst] = [0, 1].map(|_| a.var());
+    a.copy(read, key);
+    a.constrain(key, Constraint::KeyNameUse(KeyUse::Lookup(dst)));
+    a.solve();
+    // A name after widening and after the lookup, through the target's own field, which holds
+    // two values: only the read is widened on its way.
+    let f = a.str("test/F");
+    a.seed(own, f);
+    a.solve();
+    let mut held: Vec<String> = a
+      .pts(read)
+      .iter()
+      .map(|o| {
+        format!("{:?}", a.objs[*o].kind).split([' ', '(', '{']).next().unwrap_or("").to_string()
+      })
+      .collect();
+    held.sort();
+    (
+      format!("widened {} of {}, holds {held:?}", a.vars[read].widened, a.widened_vars),
+      format!(
+        "sees {:?}, demand {:?}",
+        provided.iter().map(|p| a.pts(dst).contains(p)).collect::<Vec<_>>(),
+        [target, source].map(|o| a.objs[o].demand.has("pick")),
+      ),
+    )
+  }
+
+  /// Guard: a read widened by what replay brings it decides as one made last (`widen`): the
+  /// names it held cross the boundary, as does one arriving after it widened, so a lookup
+  /// through it sees the keys under all three either way, and demand is the same. With an
+  /// object as the third value it widens either way and holds only the opaque value. With the
+  /// opaque value as the third, the read made last does not widen: the target's field widened
+  /// first and gives it the opaque value in place of `test/C`, so it holds two values. Copy edges
+  /// alone count the same way (widening is first come), and lookups through either state see
+  /// the same keys.
+  #[test]
+  fn replay_widening_matches_read_last() {
+    let mut wrong = vec![];
+    for opaque_third in [false, true] {
+      let (last_state, last) = replay_widening(false, opaque_third);
+      if last != "sees [true, true, true, false], demand [true, true]" {
+        wrong.push(format!("opaque {opaque_third} read last: {last}"));
+      }
+      let (first_state, first) = replay_widening(true, opaque_third);
+      if first != last {
+        wrong.push(format!("opaque {opaque_third} read first: {first} / read last {last}"));
+      }
+      if !first_state.starts_with("widened true") || !opaque_third && first_state != last_state {
+        wrong.push(format!("opaque {opaque_third}: {first_state} / read last {last_state}"));
+      }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
   }
 
   /// Guard: over the budget, replay and the named-load index stop (`replay_stopped`). A read,
