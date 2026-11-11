@@ -998,6 +998,7 @@ impl LinkStage<'_> {
       let statements = g.program(ast.program(), defer);
       let next_case = g.next_case();
       module_fns.push(g.module_fn());
+      drop(g);
       if !statements.is_empty() {
         deferred.extend(statements.into_iter().map(|d| (d.lazy, (normal.idx, d))));
         deferred_modules.insert(normal.idx, (facts, next_case));
@@ -1105,6 +1106,7 @@ impl LinkStage<'_> {
         let mut g = Gen::resume(a, &mut sh, facts, *next_case);
         g.deferred_statement(d, &program.body[d.index]);
         *next_case = g.next_case();
+        drop(g);
         add_activations(a, &mut sh, &mut seen, Some(lazy));
         let first = generated.insert(lazy);
         debug_assert!(first, "a deferred statement is generated once");

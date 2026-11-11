@@ -197,6 +197,13 @@ pub struct Gen<'a, 'l, 's> {
   stopped: bool,
 }
 
+/// The analysis allocates as usual again once generation is over (`Analysis::generating`).
+impl Drop for Gen<'_, '_, '_> {
+  fn drop(&mut self) {
+    self.a.generating = false;
+  }
+}
+
 /// A lazy top-level statement whose generation is deferred to its first activation: its body,
 /// its index in the module's program and its position (`Shared::statements`).
 #[derive(Clone, Copy, Debug)]
@@ -237,6 +244,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   ) -> Self {
     let this = a.fns[module_fn].this;
     let stopped = a.generation_stopped.is_some();
+    a.generating = true;
     Self {
       a,
       sh,
@@ -287,7 +295,17 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn emit(&mut self, p: Pending) {
-    self.a.fns[self.cur].pending.push(p);
+    if !self.a.generation_exhausted() {
+      self.a.fns[self.cur].pending.push(p);
+    }
+  }
+
+  /// Adds a copy to the analysis now rather than when the function is reached, unless the
+  /// budget is over (`Analysis::generation_exhausted`).
+  fn install(&mut self, src: VarId, dst: VarId) {
+    if !self.a.generation_exhausted() {
+      self.a.copy(src, dst);
+    }
   }
 
   fn copy(&mut self, src: VarId, dst: VarId) {
@@ -311,7 +329,8 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   /// heritages).
   /// Once it has run out, generation stops for the rest of the solve: what was generated stays
   /// partial, and the solve ends at once keeping everything (`Analysis::solve_with`), so no
-  /// partial body is ever pruned against.
+  /// partial body is ever pruned against. This bounds how far generation walks; what the nodes
+  /// it is inside allocate as they complete is bounded by `Analysis::generation_exhausted`.
   fn checkpoint(&mut self, start: u32) -> bool {
     if !self.stopped && self.a.over_budget() {
       self.stopped = true;
@@ -321,8 +340,9 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
   }
 
   fn fresh(&mut self) -> VarId {
+    let sink = self.a.generation_exhausted();
     let v = self.a.var();
-    if self.cur != self.module_fn {
+    if self.cur != self.module_fn && !sink {
       self.a.fns[self.cur].locals.push(v);
     }
     v
@@ -1090,7 +1110,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     // The function's own name binding, for named function expressions.
     if let Some(name) = &f.id {
       if let Some(bv) = self.binding_var(name) {
-        self.a.copy(v, bv);
+        self.install(v, bv);
       }
     }
     let outer = self.cur;
@@ -1130,7 +1150,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     // Arrows share `this` with the enclosing function.
     let enclosing_this = *self.this_stack.last().unwrap();
     let this = self.a.fns[id].this;
-    self.a.copy(enclosing_this, this);
+    self.install(enclosing_this, this);
     self.a.fns[id].enclosing_this = Some(enclosing_this);
     let outer = self.cur;
     self.a.fns[outer].leaf = false;
@@ -1267,7 +1287,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     if let Some(id) = &c.id {
       if let Some(bv) = self.binding_var(id) {
-        self.a.copy(cv, bv);
+        self.install(cv, bv);
       }
     }
     self.a.hole(class_obj, proto_obj);
@@ -1319,7 +1339,7 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
     }
     if let Some(id) = &c.id {
       if let Some(bv) = self.binding_var(id) {
-        self.a.copy(cv, bv);
+        self.install(cv, bv);
       }
     }
     self.class_stack.push(heritage);
@@ -2319,6 +2339,11 @@ mod tests {
     /// Variables allocated: all of them, and those past the cap.
     used: usize,
     overshoot: usize,
+    /// Objects allocated, and points-to and copy entries installed.
+    objects: usize,
+    entries: u64,
+    /// Constraints left pending for when the functions are reached.
+    pending: usize,
     /// The generator's context (enclosing functions, classes, `switch` cases, `try` blocks,
     /// binding being declared) is back at the top level.
     restored: bool,
@@ -2387,6 +2412,8 @@ mod tests {
     };
     let mut g = Gen::new(&mut a, &mut sh, &facts);
     let start = g.a.vars.len();
+    let objects = g.a.objs.len();
+    let entries = g.a.total_pts + g.a.total_copies;
     let cap = start + headroom;
     g.a.set_var_cap(cap);
     g.program(program, false);
@@ -2398,6 +2425,7 @@ mod tests {
       && g.case_stack.is_empty()
       && g.try_throws.is_empty()
       && g.lazy_owner.is_none();
+    drop(g);
     let (used, overshoot) = (a.vars.len() - start, a.vars.len().saturating_sub(cap));
     let declared = sh.decls.keys().map(|s| scoping.symbol_name(s.symbol).to_string()).collect();
     let closures = a.objs.iter().filter(|o| matches!(o.kind, ObjKind::Closure(_))).count();
@@ -2407,6 +2435,9 @@ mod tests {
       closures,
       used,
       overshoot,
+      objects: a.objs.len() - objects,
+      entries: a.total_pts + a.total_copies - entries,
+      pending: a.fns.iter().map(|f| f.pending.len()).sum(),
       restored,
     }
   }
@@ -2488,7 +2519,59 @@ mod tests {
     let walked = walk(&with, base + 10, Some("K"));
     let at = u32::try_from(with.find("super").unwrap()).unwrap();
     assert_eq!(walked.stopped, Some(at));
-    // One heritage load crosses the cap; `.x` is the member read's own load, after the stop.
+    // One heritage load crosses the cap; `.x`, the member read's own load, is the sink.
     assert!(walked.overshoot <= 2 && walked.restored, "{} over", walked.overshoot);
+  }
+
+  /// Guard: what a node does after its children return is bounded as well as what it does on
+  /// the way down. Right-nested logical and conditional expressions and class heritages each
+  /// allocate their own result once the child below returns, and a named class copies itself
+  /// into its name, here already read in its heritage. With the cap crossed by the innermost
+  /// node (an arrow), every node above still completes, and the next statement is where
+  /// generation stops; or a child stops at its own check, and the nodes above complete after
+  /// it. Either way they add nothing past the cap: the variables over it, the objects, the
+  /// entries and the pending constraints are the same at two depths.
+  #[test]
+  fn generation_allocates_nothing_past_the_cap_while_unwinding() {
+    let chain = |open: &str, leaf: &str, close: &str, n: usize| {
+      format!("const v = {}{leaf}{};\nconst after = 0;", open.repeat(n), close.repeat(n))
+    };
+    // (open, leaf, close, variables allocated per level on the way down)
+    let shapes = [
+      ("null || (", "() => {}", ")", 0),
+      ("null ? null : (", "() => {}", ")", 0),
+      ("(class extends ", "(() => {})", " {})", 0),
+      ("(class A extends (A, ", "() => {}", ") {})", 1),
+      ("[] || (", "null", ")", 0),
+    ];
+    for (open, leaf, close, per_level) in shapes {
+      let mut past = vec![];
+      for n in [50, 100] {
+        let source = chain(open, leaf, close, n);
+        let whole = walk(&source, 100_000, None);
+        assert_eq!((whole.stopped, whole.restored), (None, true));
+        assert!(whole.used > n, "{} variables: {source:.30}", whole.used);
+        let walked = if leaf == "null" {
+          // Each `[]` allocates on the way down: the right operand at the cap stops.
+          let walked = walk(&source, 50, None);
+          stopped_between(&walked, &source, "[] || ([]", "null");
+          walked
+        } else {
+          // The arrow's own variables cross the cap; nothing checks it until `after`.
+          let walked = walk(&source, per_level * n + 3, None);
+          let after = u32::try_from(source.find("const after").unwrap()).unwrap();
+          assert_eq!(walked.stopped, Some(after), "{source:.30}");
+          assert!(walked.objects <= 1, "{} objects: {source:.30}", walked.objects);
+          walked
+        };
+        assert!(
+          walked.overshoot <= 2 && walked.restored,
+          "{} over: {source:.30}",
+          walked.overshoot
+        );
+        past.push((walked.overshoot, walked.objects, walked.entries, walked.pending));
+      }
+      assert_eq!(past[0], past[1], "(over, objects, entries, pending) by depth: {open}");
+    }
   }
 }

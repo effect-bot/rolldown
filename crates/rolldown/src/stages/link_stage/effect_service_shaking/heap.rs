@@ -999,6 +999,13 @@ pub struct Analysis {
   /// Where generation found the budget run out and stopped (`Gen::checkpoint`), leaving the
   /// statement it was in partial. The solve then stops at once, keeping everything.
   pub generation_stopped: Option<Site>,
+  /// Set while a generator (`Gen`) runs. Once the budget is over, every variable and object
+  /// generation has the analysis allocate is one sink (`sink_var`, `sink_obj`), so what the
+  /// nodes it is inside do after a child returns allocates nothing, however deep they nest
+  /// (`generation_exhausted`).
+  pub(super) generating: bool,
+  sink_var: Option<VarId>,
+  sink_obj: Option<ObjId>,
   /// Objects each walk pool has walked.
   walked: FxHashSet<(VarId, ObjId)>,
   /// The program-wide pools of the protocol and hashing walks (`Walk`).
@@ -1292,6 +1299,9 @@ impl Analysis {
       budget_exceeded: false,
       budget_exceeded_generating: false,
       generation_stopped: None,
+      generating: false,
+      sink_var: None,
+      sink_obj: None,
       walked: FxHashSet::default(),
       ignored_pool: None,
       prim_arg: None,
@@ -1427,12 +1437,43 @@ impl Analysis {
   // == construction
 
   pub fn var(&mut self) -> VarId {
+    if self.generation_exhausted() {
+      if let Some(v) = self.sink_var {
+        return v;
+      }
+      let v = self.new_var();
+      self.sink_var = Some(v);
+      return v;
+    }
+    self.new_var()
+  }
+
+  fn new_var(&mut self) -> VarId {
     self.var_origin.push(self.var_tag);
     self.vars.push(Var::default())
   }
 
   pub fn alloc(&mut self, kind: ObjKind, site: Option<Site>) -> ObjId {
+    if self.generation_exhausted() {
+      if let Some(o) = self.sink_obj {
+        return o;
+      }
+      let o = self.objs.push(Obj::new(ObjKind::Object, None));
+      self.sink_obj = Some(o);
+      return o;
+    }
     self.objs.push(Obj::new(kind, site))
+  }
+
+  /// Generation ran past the budget: the solve will stop before installing anything more
+  /// (`solve_with`), keeping everything, so what generation still does is only unwinding. From
+  /// here every variable and object it allocates is the sink (`var`, `alloc`), and it drops
+  /// what it would add to the analysis (`Gen::emit`, `Gen::install`). Past the cap, a
+  /// generator allocates at most the sink variable and object, wherever it is, and nothing in
+  /// proportion to how deep it is when the cap is crossed or after a child stopped.
+  #[inline]
+  pub(super) fn generation_exhausted(&self) -> bool {
+    self.generating && self.over_budget()
   }
 
   pub fn rule(&mut self, name: &'static str, rule: Rule) -> u16 {
