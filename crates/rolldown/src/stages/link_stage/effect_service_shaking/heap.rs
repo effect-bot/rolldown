@@ -7252,4 +7252,94 @@ mod tests {
       assert!(a.objs[service].escaped.is_some(), "{held:?}: the late service bails");
     }
   }
+
+  /// The edge a `late_edge_turns_negative_positive` case adds once the negatives are cached.
+  #[derive(Clone, Copy, Debug)]
+  enum LateEdge {
+    Spread,
+    UnknownStore,
+    Field,
+  }
+
+  /// `reaches` shares negative results between walks while the graph is unchanged
+  /// (`Marks`). An edge to a source that already holds a service, added after `target` and
+  /// `outer` (whose field holds `target`) were found to hold none, must turn both positive:
+  /// the edge changes the graph, so the cached negatives are not reused.
+  fn late_edge_turns_negative_positive(edge: LateEdge) -> (bool, bool) {
+    let mut a = Analysis::new();
+    let service = a.alloc(ObjKind::Object, None);
+    a.seed(a.all_values, service);
+    a.seed(a.unknown_key_values, service);
+    let source = a.alloc(ObjKind::Object, None);
+    let held = a.field(source, &ArcStr::from("service"));
+    a.seed(held, service);
+    // The variable a spread reads the source through, populated before the negatives.
+    let source_var = a.holder(source);
+    let target = a.alloc(ObjKind::Object, None);
+    let outer = a.alloc(ObjKind::Object, None);
+    let slot = a.field(outer, &ArcStr::from("target"));
+    a.seed(slot, target);
+    assert!(!a.may_hold(outer), "{edge:?}: outer holds no service yet");
+    assert!(!a.may_hold(target), "{edge:?}: target holds no service yet");
+    match edge {
+      LateEdge::Spread => a.spread_into(source, target),
+      // The store goes through an admission filter, which the solve fills.
+      LateEdge::UnknownStore => {
+        a.store_unknown(target, source_var);
+        a.solve();
+      }
+      LateEdge::Field => {
+        let late = a.field(target, &ArcStr::from("late"));
+        a.seed(late, source);
+      }
+    }
+    (a.may_hold(target), a.may_hold(outer))
+  }
+
+  #[test]
+  fn late_edge_invalidates_cached_negatives() {
+    for edge in [LateEdge::Spread, LateEdge::UnknownStore, LateEdge::Field] {
+      assert_eq!(late_edge_turns_negative_positive(edge), (true, true), "{edge:?}");
+    }
+  }
+
+  /// A chain of `n` objects, each holding the next in a field: a walk from its head visits
+  /// `n`. (One set holding many objects would widen.)
+  fn chain(a: &mut Analysis, n: usize) -> ObjId {
+    let next = ArcStr::from("next");
+    let head = a.alloc(ObjKind::Object, None);
+    let mut last = head;
+    for _ in 1..n {
+      let obj = a.alloc(ObjKind::Object, None);
+      let f = a.field(last, &next);
+      a.seed(f, obj);
+      last = obj;
+    }
+    head
+  }
+
+  /// The visit limit (`reaches`'s `LIMIT`, 1 << 17 objects) holds per walk. Negative walks
+  /// over an unchanged graph share their marks, so their visits add up: three chains of 45,000
+  /// objects each cross the limit together but not alone, and each still holds no service.
+  /// A root whose own walk crosses the limit counts as holding one (the conservative answer),
+  /// whether it is walked before or after the others.
+  #[test]
+  fn visit_limit_is_per_root() {
+    for big_first in [false, true] {
+      let mut a = Analysis::new();
+      let small: Vec<ObjId> = (0..3).map(|_| chain(&mut a, 45_000)).collect();
+      let big = chain(&mut a, 132_000);
+      let mut got = vec![];
+      if big_first {
+        assert!(a.may_hold(big), "over the limit alone, walked first");
+      }
+      for root in &small {
+        got.push(a.may_hold(*root));
+      }
+      if !big_first {
+        assert!(a.may_hold(big), "over the limit alone, walked last");
+      }
+      assert_eq!(got, vec![false; 3], "big first: {big_first}");
+    }
+  }
 }

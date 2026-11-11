@@ -2294,4 +2294,56 @@ mod tests {
     assert_eq!(dts.opaque_positions(&path, "both", 1), Some(vec![false]));
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
   }
+
+  /// A declaration file is effect's public module by its directory (`dist`), whatever path
+  /// reached it: `Tracer.d.ts`'s `Span` is inert (`INERT_TYPES`) whether it is imported as
+  /// `./Tracer.js` from `dist` or as `../Tracer.js` from `dist/http`, in either order. Before
+  /// paths were normalized, the second was read under the directory `dist/http/..` and `Span`
+  /// was classified by its members. The same file under `dist/internal` is no public module,
+  /// also when reached through a parent segment.
+  #[test]
+  fn public_declarations_by_any_path() {
+    let root =
+      std::env::temp_dir().join(format!("rolldown-effect-dts-{}-normalized", std::process::id()));
+    let dist = root.join("dist");
+    std::fs::create_dir_all(dist.join("http")).unwrap();
+    std::fs::create_dir_all(dist.join("internal")).unwrap();
+    let span = "export interface Span { readonly name: string; end(): void }\n";
+    std::fs::write(dist.join("Tracer.d.ts"), span).unwrap();
+    std::fs::write(dist.join("internal").join("Tracer.d.ts"), span).unwrap();
+    let user = |spec: &str| {
+      format!(
+        "import type {{ Span }} from \"{spec}\";\nexport declare const use: (span: Span) => void;\n"
+      )
+    };
+    let direct = dist.join("Direct.d.ts");
+    let nested = dist.join("http").join("Nested.d.ts");
+    let internal = dist.join("Internal.d.ts");
+    let internal_nested = dist.join("http").join("InternalNested.d.ts");
+    std::fs::write(&direct, user("./Tracer.js")).unwrap();
+    std::fs::write(&nested, user("../Tracer.js")).unwrap();
+    std::fs::write(&internal, user("./internal/Tracer.js")).unwrap();
+    std::fs::write(&internal_nested, user("../internal/Tracer.js")).unwrap();
+    let inert = |dts: &Dts, path: &std::path::Path| {
+      let b = dts.bounds(path, "use", 1);
+      b.params[0].as_ref().is_some_and(|t| t.ignored && t.prim_only())
+    };
+    for nested_first in [false, true] {
+      let dts = Dts::default();
+      let order = if nested_first { [&nested, &direct] } else { [&direct, &nested] };
+      for path in order {
+        assert!(inert(&dts, path), "{}, nested first: {nested_first}", path.display());
+      }
+      // Each of the three files once: the public `Tracer.d.ts` is one file by both paths.
+      assert_eq!(dts.files_parsed.get(), 3, "nested first: {nested_first}");
+      for path in [&internal, &internal_nested] {
+        assert!(!inert(&dts, path), "{}, nested first: {nested_first}", path.display());
+      }
+    }
+    // The queried file itself reached through a parent segment.
+    let dts = Dts::default();
+    assert!(inert(&dts, &dist.join("http").join("..").join("Direct.d.ts")));
+    assert!(!inert(&dts, &dist.join("http").join("..").join("Internal.d.ts")));
+    let _ = std::fs::remove_dir_all(&root);
+  }
 }
