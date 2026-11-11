@@ -1798,6 +1798,12 @@ impl Analysis {
     }
     let v = self.var();
     self.objs[obj].named_elem = Some(v);
+    // Named reads create it (`load_name`), so no load has missed it; replayed for any that did.
+    for (name, dst) in self.named_loads_on(obj) {
+      if self.load_reads_elem(obj, &name) == Some(true) {
+        self.copy(v, dst);
+      }
+    }
     v
   }
 
@@ -1807,6 +1813,12 @@ impl Analysis {
     }
     let v = self.var();
     self.objs[obj].elem = Some(v);
+    // Named loads that read this object before it had elements (`load_name`).
+    for (name, dst) in self.named_loads_on(obj) {
+      if self.load_reads_elem(obj, &name) == Some(false) {
+        self.copy(v, dst);
+      }
+    }
     v
   }
 
@@ -1824,7 +1836,70 @@ impl Analysis {
         self.constrain(v, Constraint::Inherits(heir));
       }
     }
+    // Loads that read this object before it had a prototype read through it now
+    // (`load_name`, `load_unknown`).
+    if replays_late_inputs(&self.objs[obj].kind) {
+      for (name, dst) in self.named_loads_on(obj) {
+        if self.load_reads_late_inputs(obj, &name) {
+          self.constrain(v, Constraint::Load { key: Key::Name(name), dst });
+        }
+      }
+      for dst in self.objs[obj].unknown_loads.clone() {
+        self.constrain(v, Constraint::Load { key: Key::Unknown, dst });
+      }
+    }
     v
+  }
+
+  /// The named loads registered on variables that hold `obj` (`loads_by_name`), under the names
+  /// demanded of it: every `Load` that has read, or is about to read, one of its members. A
+  /// prototype, elements or a spread source that `obj` gains later are replayed into them, as
+  /// `field` does for a field (`load_name`). Only the kinds whose loads read those inputs.
+  fn named_loads_on(&self, obj: ObjId) -> Vec<(ArcStr, VarId)> {
+    if !replays_late_inputs(&self.objs[obj].kind) {
+      return vec![];
+    }
+    let mut out = vec![];
+    let mut add = |name: &ArcStr, loads: &FxHashSet<(VarId, VarId)>| {
+      for (base, dst) in loads {
+        if self.vars[*base].pts.contains(&obj) {
+          out.push((name.clone(), *dst));
+        }
+      }
+    };
+    match &self.objs[obj].demand {
+      Demand::None => {}
+      Demand::Names(names) => {
+        for name in names {
+          if let Some(loads) = self.loads_by_name.get(name) {
+            add(name, loads);
+          }
+        }
+      }
+      Demand::All => {
+        for (name, loads) in &self.loads_by_name {
+          add(name, loads);
+        }
+      }
+    }
+    out.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(x.1.cmp(&y.1)));
+    out
+  }
+
+  /// Whether a named load of `name` on `obj` goes on past its own members to the elements,
+  /// spread sources and prototype (`load_name`): not a function's `call`/`apply`/`bind`.
+  fn load_reads_late_inputs(&self, obj: ObjId, name: &str) -> bool {
+    !(matches!(self.objs[obj].kind, ObjKind::Closure(_))
+      && function_prototype_rule(self, name).is_some())
+  }
+
+  /// Which element slot a named load of `name` on `obj` reads (`load_name`): `Some(true)`
+  /// for an array's named slot, `Some(false)` for the elements, `None` for neither.
+  fn load_reads_elem(&self, obj: ObjId, name: &str) -> Option<bool> {
+    if !self.load_reads_late_inputs(obj, name) || is_effect_member(name) {
+      return None;
+    }
+    Some(matches!(self.objs[obj].kind, ObjKind::Array) && !is_index(name))
   }
 
   /// `heir` inherits from `ancestor`: the accessors declared on `ancestor` run on `heir`, and
@@ -2301,7 +2376,7 @@ impl Analysis {
       return;
     }
     match c {
-      Constraint::Load { key, dst } => self.load(obj, key, *dst),
+      Constraint::Load { key, dst } => self.load(var, obj, key, *dst),
       Constraint::Store { key, src } => self.store(obj, key, *src),
       Constraint::LoadThrough { base, dst } => self.load_through(obj, *base, *dst),
       Constraint::StoreThrough { base, src } => self.store_through(var, obj, *base, *src),
@@ -2656,9 +2731,9 @@ impl Analysis {
     }
   }
 
-  fn load(&mut self, obj: ObjId, key: &Key, dst: VarId) {
+  fn load(&mut self, base: VarId, obj: ObjId, key: &Key, dst: VarId) {
     match key {
-      Key::Name(name) => self.load_name(obj, name, dst),
+      Key::Name(name) => self.load_name(Some(base), obj, name, dst),
       Key::Unknown => self.load_unknown(obj, dst),
       Key::Var(key_var) => {
         // Re-evaluated when the key variable grows: the key objects drive the load.
@@ -2674,7 +2749,7 @@ impl Analysis {
       ObjKind::Str(name) => {
         self.loads_by_name.entry(name.clone()).or_default().insert((base, dst));
         for b in bases {
-          self.load_name(b, &name, dst);
+          self.load_name(Some(base), b, &name, dst);
         }
       }
       _ => {
@@ -2724,7 +2799,20 @@ impl Analysis {
     }
   }
 
-  pub fn load_name(&mut self, obj: ObjId, name: &ArcStr, dst: VarId) {
+  /// `obj.name` into `dst`, for a load registered on `base` (`loads_by_name`). On the kinds
+  /// whose loads read inputs the object may gain later (`replays_late_inputs`), it must be registered:
+  /// `field`, `elem`, `named_elem`, `proto_var` and `spread_into` find the loads to replay
+  /// there. Callers outside `Load` and `LoadThrough` pass `None`, for the other kinds only.
+  pub fn load_name(&mut self, base: Option<VarId>, obj: ObjId, name: &ArcStr, dst: VarId) {
+    debug_assert!(
+      !replays_late_inputs(&self.objs[obj].kind)
+        || base.is_some_and(|b| {
+          self.loads_by_name.get(name).is_some_and(|l| l.contains(&(b, dst)))
+            && self.vars[b].pts.contains(&obj)
+        }),
+      "a named load on {:?} is not registered (load it through `Constraint::Load`)",
+      self.objs[obj].kind
+    );
     self.touch_namespace(obj, Some(name));
     match self.objs[obj].kind.clone() {
       ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
@@ -6292,15 +6380,17 @@ impl Analysis {
         if !self.objs[obj].spread_into.contains(&target) {
           self.objs[obj].spread_into.push(target);
         }
-        // Loads already registered on the target must also see this source.
+        // Loads already registered on the target must also see this source: its unknown and
+        // named loads, and its fields.
         let loads = self.objs[target].unknown_loads.clone();
         for dst in loads {
           self.load_unknown(obj, dst);
         }
-        let named: Vec<(ArcStr, VarId)> =
+        let mut named: Vec<(ArcStr, VarId)> =
           self.objs[target].fields.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        named.extend(self.named_loads_on(target));
         for (name, dst) in named {
-          self.load_name(obj, &name, dst);
+          self.constrain(holder, Constraint::Load { key: Key::Name(name), dst });
         }
       }
       ObjKind::Wrap(inner) | ObjKind::Typed { slot: inner, .. } => {
@@ -6524,7 +6614,7 @@ impl Analysis {
     match (&self.objs[obj].kind, path.split_first()) {
       (ObjKind::Namespace, Some((name, rest))) => {
         let member = self.var();
-        self.load_name(obj, name, member);
+        self.load_name(None, obj, name, member);
         self.constrain(member, Constraint::ClassRef(class, rest.to_vec()));
       }
       _ => self.class_escape(obj, class, CLASS_REFERENCED),
@@ -6559,8 +6649,9 @@ impl Analysis {
       }
       ObjKind::Closure(_) | ObjKind::Class { .. } | ObjKind::Object => {
         let method = self.var();
-        self.load_name(obj, &ArcStr::from("@@hasInstance"), method);
         let holder = self.holder(obj);
+        let key = Key::Name(ArcStr::from("@@hasInstance"));
+        self.constrain(holder, Constraint::Load { key, dst: method });
         let call = Call {
           site,
           this: Some(holder),
@@ -6920,6 +7011,12 @@ pub fn model_kind_name(kind: &ObjKind) -> &'static str {
 }
 
 /// The rule of `Function.prototype.call`, `apply` or `bind`, for a read of `name` on a callable.
+/// The kinds whose named loads read a prototype, elements and spread sources the object may
+/// gain after the load (`load_name`), so those are replayed into earlier loads.
+fn replays_late_inputs(kind: &ObjKind) -> bool {
+  matches!(kind, ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. })
+}
+
 fn function_prototype_rule(a: &Analysis, name: &str) -> Option<u16> {
   a.rule_id(match name {
     "call" => "Function.prototype.call",
@@ -8023,5 +8120,147 @@ mod tests {
          slot [], widened false",
       ]
     );
+  }
+
+  /// What a named load's object gains after the load ran (`named_loads_on`).
+  #[derive(Clone, Copy, Debug)]
+  enum Late {
+    /// A prototype holding the value under the name (`SetProto`).
+    Proto,
+    /// A namespace as the prototype, whose export of the name is lazy: its body seeds the value.
+    LazyProto,
+    /// A spread source holding the value under the name.
+    Spread,
+    /// A store under an unknown key: the elements, and an array's named slot.
+    UnknownStore,
+  }
+
+  /// A named load of `name` on a fresh object of `kind`, registered before or after `late`,
+  /// solving after each step or once. Returns what the load holds (how many values, and
+  /// whether the service is one: a store under an unknown key may stand a value in for it,
+  /// `admitted_values`), and whether a lazy export ran, labelled.
+  fn late_case(kind: &str, late: Late, name: &str, load_first: bool, solve_each: bool) -> String {
+    let mut a = Analysis::new();
+    let service = a.alloc(ObjKind::Object, None);
+    let obj_kind = match kind {
+      "array" => ObjKind::Array,
+      "closure" => {
+        let [this, ret, yielded_fail, yielded, args] = std::array::from_fn(|_| a.var());
+        let f = FnInfo::new(
+          ModuleIdx::from_raw_unchecked(0),
+          0,
+          FnKind::Normal,
+          [this, ret, yielded_fail, yielded, args],
+        );
+        ObjKind::Closure(a.fns.push(f))
+      }
+      _ => ObjKind::Object,
+    };
+    let obj = a.alloc(obj_kind, None);
+    let recv = a.var();
+    a.seed(recv, obj);
+    let dst = a.var();
+    let ran = a.var();
+    let key = ArcStr::from(name);
+    let load = |a: &mut Analysis| {
+      a.constrain(recv, Constraint::Load { key: Key::Name(key.clone()), dst });
+    };
+    let event = |a: &mut Analysis| match late {
+      Late::Proto | Late::LazyProto => {
+        let proto = if let Late::Proto = late {
+          let proto = a.alloc(ObjKind::Object, None);
+          let field = a.field(proto, &ArcStr::from(name));
+          a.seed(field, service);
+          proto
+        } else {
+          let ns = a.alloc(ObjKind::Namespace, None);
+          let [this, ret, yielded_fail, yielded, args] = std::array::from_fn(|_| a.var());
+          let mut f = FnInfo::new(
+            ModuleIdx::from_raw_unchecked(0),
+            0,
+            FnKind::Normal,
+            [this, ret, yielded_fail, yielded, args],
+          );
+          f.pending.push(Pending::Seed(ran, service));
+          let export = a.var();
+          f.pending.push(Pending::Seed(export, service));
+          let f = a.fns.push(f);
+          let field = a.field(ns, &ArcStr::from(name));
+          a.copy(export, field);
+          a.lazy_exports.insert((ns, ArcStr::from(name)), f);
+          ns
+        };
+        let src = a.var();
+        a.seed(src, proto);
+        a.constrain(recv, Constraint::SetProto(src));
+      }
+      Late::Spread => {
+        let source = a.alloc(ObjKind::Object, None);
+        let field = a.field(source, &ArcStr::from(name));
+        a.seed(field, service);
+        let src = a.var();
+        a.seed(src, source);
+        a.constrain(src, Constraint::SpreadInto(obj));
+      }
+      Late::UnknownStore => {
+        let src = a.var();
+        a.seed(src, service);
+        a.constrain(recv, Constraint::Store { key: Key::Unknown, src });
+      }
+    };
+    if load_first {
+      load(&mut a);
+    } else {
+      event(&mut a);
+    }
+    if solve_each {
+      a.solve();
+    }
+    if load_first {
+      event(&mut a);
+    } else {
+      load(&mut a);
+    }
+    a.solve();
+    format!(
+      "load holds {} values, service {}, lazy export ran {}",
+      a.vars[dst].pts.len(),
+      a.vars[dst].pts.contains(&service),
+      a.vars[ran].pts.contains(&service)
+    )
+  }
+
+  /// Guard: replay of late inputs. A named load registered before its object gains a
+  /// prototype, a lazy namespace prototype, a spread source or elements holds what a load
+  /// registered after it does, on objects, arrays (a named and an index read) and closures,
+  /// solving between the two or not. The prototype's lazy export runs either way, and every
+  /// case reaches the load.
+  #[test]
+  fn late_inputs_reach_earlier_named_loads() {
+    let mut wrong = vec![];
+    let mut unreached = vec![];
+    for kind in ["object", "array", "closure"] {
+      for late in [Late::Proto, Late::LazyProto, Late::Spread, Late::UnknownStore] {
+        for name in ["handler", "0"] {
+          if name == "0" && kind != "array" {
+            continue;
+          }
+          let after = late_case(kind, late, name, false, true);
+          if after.starts_with("load holds 0 values") {
+            unreached.push(format!("{kind} {late:?} {name}"));
+          }
+          for solve_each in [true, false] {
+            let before = late_case(kind, late, name, true, solve_each);
+            if before != after {
+              wrong.push(format!(
+                "{kind} {late:?} {name} solve each {solve_each}: before {before} / after {after}"
+              ));
+            }
+          }
+        }
+      }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(unreached, Vec::<String>::new());
   }
 }
