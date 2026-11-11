@@ -849,10 +849,9 @@ pub struct Obj {
 pub struct Var {
   pub pts: FxHashSet<ObjId>,
   pub copies: FxHashSet<VarId>,
-  pub constraints: Vec<Constraint>,
-  /// The constraints above, for deduplication: a constraint registered twice would re-fire
+  /// In the order they were registered, each once: a constraint registered twice would re-fire
   /// on every object and could never settle in a prototype or spread cycle.
-  constraint_set: FxHashSet<Constraint>,
+  pub constraints: indexmap::IndexSet<Constraint, rustc_hash::FxBuildHasher>,
   delta: Vec<ObjId>,
   queued: bool,
   /// Widened (`Analysis::widen`): it holds an opaque value instead of what flows in.
@@ -1956,21 +1955,16 @@ impl Analysis {
   }
 
   pub fn constrain(&mut self, var: VarId, constraint: Constraint) {
-    if !self.vars[var].constraint_set.insert(constraint.clone()) {
+    let (index, new) = self.vars[var].constraints.insert_full(constraint);
+    if !new {
       return;
     }
-    match &constraint {
-      Constraint::Load { key: Key::Name(name), dst } => {
-        self.loads_by_name.entry(name.clone()).or_default().insert((var, *dst));
-      }
-      Constraint::LoadThrough { base, dst } => {
-        // The key is dynamic: register under every name once it is known (see `load_through`).
-        let _ = (base, dst);
-      }
-      _ => {}
+    // A `LoadThrough`'s key is dynamic: it registers under every name once it is known
+    // (`load_through`).
+    if let Constraint::Load { key: Key::Name(name), dst } = &self.vars[var].constraints[index] {
+      let entry = (var, *dst);
+      self.loads_by_name.entry(name.clone()).or_default().insert(entry);
     }
-    self.vars[var].constraints.push(constraint);
-    let index = self.vars[var].constraints.len() - 1;
     self.new_constraints.push((var, index));
   }
 
