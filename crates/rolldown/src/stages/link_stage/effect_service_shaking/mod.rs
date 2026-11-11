@@ -358,6 +358,8 @@ impl AnalysisDrop {
   }
 }
 
+/// Joins the free. A panic in it is raised here, unless this thread is already unwinding: the free
+/// is joined all the same, and its panic is not raised a second time.
 impl Drop for AnalysisDrop {
   fn drop(&mut self) {
     #[cfg(not(target_family = "wasm"))]
@@ -2043,7 +2045,7 @@ mod tests {
   use std::sync::atomic::Ordering;
   use std::sync::{Arc, Mutex, mpsc};
 
-  use super::{EffectDeclarations, Loading, Preload, dts};
+  use super::{AnalysisDrop, EffectDeclarations, Loading, Preload, dts};
 
   /// A pass that ends at a contract check (`effect` external, an unsupported version, missing
   /// exports) drops the declarations it never adopted. The load is held unfinished across that
@@ -2081,5 +2083,39 @@ mod tests {
     pass.join().expect("the pass thread");
     assert_eq!(*log.lock().unwrap(), ["load ended", "pass returned"]);
     assert!(saw_cancel.load(Ordering::Relaxed), "the load was asked to stop");
+  }
+
+  /// Dropping the handle of the last analysis's free returns only once the free has ended. The
+  /// free is held unfinished; the drop runs on its own thread and is given time to return early.
+  #[test]
+  fn analysis_drop_joins_the_free() {
+    let log: Arc<Mutex<Vec<&str>>> = Arc::default();
+    let (release, gate) = mpsc::channel::<()>();
+    let free = {
+      let log = Arc::clone(&log);
+      std::thread::spawn(move || {
+        let _ = gate.recv_timeout(std::time::Duration::from_secs(30));
+        log.lock().unwrap().push("free ended");
+      })
+    };
+    let handle = AnalysisDrop { handle: Some(free) };
+    let (dropping, started) = mpsc::channel::<()>();
+    let owner = {
+      let log = Arc::clone(&log);
+      std::thread::spawn(move || {
+        dropping.send(()).expect("the test waits");
+        drop(handle);
+        log.lock().unwrap().push("drop returned");
+      })
+    };
+    started.recv().expect("the owner starts");
+    let begun = std::time::Instant::now();
+    while !owner.is_finished() && begun.elapsed() < std::time::Duration::from_millis(200) {
+      std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Released and joined before asserting, so that a failure strands no thread.
+    let _ = release.send(());
+    owner.join().expect("the owner thread");
+    assert_eq!(*log.lock().unwrap(), ["free ended", "drop returned"]);
   }
 }
