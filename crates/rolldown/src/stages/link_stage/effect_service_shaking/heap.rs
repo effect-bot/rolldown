@@ -2622,16 +2622,23 @@ impl Analysis {
         self.host_protocol(obj, *protocol);
       }
       Constraint::SpreadInto(target) => self.spread_into(obj, *target),
-      Constraint::SpreadTarget(src) => self.constrain(*src, Constraint::SpreadInto(obj)),
-      Constraint::ProtoOf(dst) => {
-        if matches!(
-          self.objs[obj].kind,
-          ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. }
-        ) {
+      Constraint::SpreadTarget(src) => {
+        self.cross_stored(obj, *src);
+        self.constrain(*src, Constraint::SpreadInto(obj));
+      }
+      Constraint::ProtoOf(dst) => match self.objs[obj].kind {
+        ObjKind::Object | ObjKind::Array | ObjKind::Closure(_) | ObjKind::Class { .. } => {
           let pv = self.proto_var(obj);
           self.copy(pv, *dst);
         }
-      }
+        // A boundary's value inherits from that boundary: the opaque value from its class
+        // (whatever crossed into it), any other from code the pass can't see.
+        ObjKind::Top(_) | ObjKind::External { .. } => {
+          let t = self.top_of(obj);
+          self.seed(*dst, t);
+        }
+        _ => {}
+      },
       Constraint::Provision => match self.objs[obj].kind {
         ObjKind::Builtin { .. } if self.is_default(obj) => {
           // A default-modelled effect layer provides effect-declared keys with values the pass
@@ -2789,6 +2796,18 @@ impl Analysis {
           let pv = self.proto_var(obj);
           self.copy(*src, pv);
         }
+        self.cross_stored(obj, *src);
+      }
+    }
+  }
+
+  /// What is set on a boundary's value, as its prototype or spread into it, crosses into the
+  /// boundary as a value stored on it does (`store_name`).
+  fn cross_stored(&mut self, obj: ObjId, src: VarId) {
+    if let ObjKind::Top(flavour) | ObjKind::External { flavour, .. } = self.objs[obj].kind {
+      match self.opaque_class.get(&obj) {
+        Some(&class) => self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED)),
+        None => self.constrain(src, Constraint::Escape(flavour, None)),
       }
     }
   }
