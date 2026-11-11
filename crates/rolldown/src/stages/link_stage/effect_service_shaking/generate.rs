@@ -319,8 +319,8 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   /// `Analysis::generation_exhausted`. Past the cap the generator adds nothing to the
   /// analysis (`emit`, `Gen::new`) or to the tables it records into (`symbol_var`,
-  /// `record_decl`, `object`'s literal, `call_expr`'s method name), and a module stops at
-  /// its next statement (`program`).
+  /// `record_decl`, `object`'s literal, `call_expr`'s method name, `run_time_string`'s
+  /// prefix), and a module stops at its next statement (`program`).
   fn exhausted(&mut self) -> bool {
     let exhausted = self.a.generation_exhausted();
     #[cfg(test)]
@@ -378,8 +378,13 @@ impl<'a, 'l, 's> Gen<'a, 'l, 's> {
 
   /// A string built at run time: host data, or a string known to start with a constant
   /// (`Analysis::prefixed_host`). An addition with no constant string at its start may be a
-  /// number, which is host data too.
+  /// number, which is host data too. Past the cap it is the sink, with no prefix computed or
+  /// kept (`Analysis::generation_exhausted`): an addition completes after its operands, and
+  /// each enclosing one would otherwise keep a longer prefix.
   fn run_time_string(&mut self, expr: &Expression<'_>) -> VarId {
+    if self.exhausted() {
+      return self.a.var();
+    }
     match Self::const_prefix(expr) {
       Some(prefix) if !prefix.is_empty() => {
         let obj = self.a.prefixed_host(&prefix);
@@ -2408,6 +2413,7 @@ mod tests {
       fns: now.fns - then.fns,
       locals: now.locals - then.locals,
       slots: now.slots - then.slots,
+      prefix_text: now.prefix_text - then.prefix_text,
       records: now.records - then.records,
     }
   }
@@ -2618,13 +2624,14 @@ mod tests {
   /// (`Analysis::method_names`); an array literal stores into its elements; a getter is copied
   /// in as the object's `this`; a named function expression copies itself into its name; and a
   /// class declaration in an arrow, declared once its heritage returns, records its name and
-  /// makes it a local of the arrow.
+  /// makes it a local of the arrow; and an addition to a constant string keeps its constant
+  /// prefix, one longer at each level (`Analysis::prefixed_host`).
   /// With the cap crossed by the innermost node (an arrow), every node above still completes,
   /// and the next statement is where generation stops; or a child stops at its own check, and
   /// the nodes above complete after it. Either way what was made past the cap is the same at
   /// two depths: variables, objects, entries, installed constraints, queued work, pending
-  /// constraints, functions, locals, object slots, records in the analysis and in the shared
-  /// tables.
+  /// constraints, functions, locals, object slots, records in the analysis (prefix tables and
+  /// the prefix text they keep among them) and in the shared tables.
   #[test]
   fn generation_allocates_nothing_past_the_cap_while_unwinding() {
     let chain = |open: &str, leaf: &str, close: &str, n: usize| {
@@ -2641,6 +2648,7 @@ mod tests {
       ("({ get a() { return ", "() => {}", " } })"),
       ("(function f() { return ", "() => {}", " })"),
       ("(() => { class A extends (", "() => {}", ") {} })"),
+      ("\"p\" + (", "() => {}", ")"),
       ("[] || (", "null", ")"),
     ];
     for (open, leaf, close) in shapes {

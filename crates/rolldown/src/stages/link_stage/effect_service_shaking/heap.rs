@@ -948,7 +948,8 @@ impl Marks {
 /// constraints installed, and variables, constraints and functions queued for the solve;
 /// constraints pending in function bodies; functions and their locals; object slots (fields, elements,
 /// prototypes); and records keyed by site or object (method names, builtins, inheritance,
-/// class crossings, hole relations).
+/// class crossings, hole relations, prefixed strings); and the prefix text the prefix tables
+/// keep.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Work {
@@ -962,6 +963,7 @@ pub(super) struct Work {
   pub locals: usize,
   pub slots: usize,
   pub records: usize,
+  pub prefix_text: usize,
 }
 
 #[expect(clippy::struct_excessive_bools, reason = "independent switches of the analysis")]
@@ -2195,7 +2197,10 @@ impl Analysis {
         + self.builtins.len()
         + self.inherits.len()
         + self.class_escaped.len()
-        + self.hole_related.len(),
+        + self.hole_related.len()
+        + self.prefixes.len()
+        + self.prefix_hosts.len(),
+      prefix_text: self.prefixes.values().chain(self.prefix_hosts.keys()).map(ArcStr::len).sum(),
     }
   }
 
