@@ -1,0 +1,10 @@
+{
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    },
+    "external": ["./ext/reg.js"]
+  },
+  "snapshot": false,
+  "extendedTests": false
+}

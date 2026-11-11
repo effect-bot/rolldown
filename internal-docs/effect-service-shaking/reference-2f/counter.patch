@@ -1,0 +1,291 @@
+diff --git a/crates/rolldown/src/stages/link_stage/effect_service_shaking/heap.rs b/crates/rolldown/src/stages/link_stage/effect_service_shaking/heap.rs
+index e3d45273..80dce706 100644
+--- a/crates/rolldown/src/stages/link_stage/effect_service_shaking/heap.rs
++++ b/crates/rolldown/src/stages/link_stage/effect_service_shaking/heap.rs
+@@ -1081,6 +1081,11 @@ pub struct Analysis {
+   /// (`escape_with`): their return goes over at the first escape that hands it.
+   ret_withheld: FxHashSet<ObjId>,
+   genuine_escaped: FxHashSet<ObjId>,
++  pub zz_tag: &'static str,
++  pub zz_ctag: FxHashMap<(VarId, Flavour, Option<Site>), &'static str>,
++  pub zz: std::collections::BTreeMap<String, u64>,
++  pub zz_default: FxHashSet<ObjId>,
++  pub zz_names: std::collections::BTreeSet<String>,
+   /// Keys handed across a boundary (`hand_key`): the objects handed, the key names they carry,
+   /// whether one names every key, and the lookups through keys from a boundary.
+   handed: FxHashSet<ObjId>,
+@@ -1408,6 +1413,11 @@ impl Analysis {
+       effect_escaped: FxHashSet::default(),
+       ret_withheld: FxHashSet::default(),
+       genuine_escaped: FxHashSet::default(),
++      zz_tag: "",
++      zz_ctag: FxHashMap::default(),
++      zz: std::collections::BTreeMap::new(),
++      zz_default: FxHashSet::default(),
++      zz_names: std::collections::BTreeSet::new(),
+       handed: FxHashSet::default(),
+       handed_names: FxHashSet::default(),
+       handed_all: false,
+@@ -2176,6 +2186,19 @@ impl Analysis {
+     if !new {
+       return;
+     }
++    if !self.zz_tag.is_empty() {
++      let k = match &self.vars[var].constraints[index] {
++        Constraint::Escape(f, s)
++        | Constraint::EscapeReceiver(f, s, _)
++        | Constraint::EscapeIfOpaque(_, f, s) => Some((var, *f, *s)),
++        Constraint::EscapeHeld => Some((var, Flavour::Ext, Some(EFFECT_ESCAPE))),
++        _ => None,
++      };
++      if let Some(k) = k {
++        let t = self.zz_tag;
++        self.zz_ctag.entry(k).or_insert(t);
++      }
++    }
+     // A `LoadThrough`'s key is dynamic: it registers under every name once it is known
+     // (`load_through`).
+     if let Constraint::Load { key: Key::Name(name), dst } = &self.vars[var].constraints[index] {
+@@ -2489,7 +2512,18 @@ impl Analysis {
+   fn apply(&mut self, var: VarId, obj: ObjId, c: &Constraint) {
+     let saved = self.var_tag;
+     self.var_tag = self.constraint_tag(c);
++    let zz_saved = self.zz_tag;
++    self.zz_tag = match c {
++      Constraint::Escape(f, s)
++      | Constraint::EscapeReceiver(f, s, _)
++      | Constraint::EscapeIfOpaque(_, f, s) => self.zz_ctag.get(&(var, *f, *s)).copied().unwrap_or(""),
++      Constraint::EscapeHeld => {
++        self.zz_ctag.get(&(var, Flavour::Ext, Some(EFFECT_ESCAPE))).copied().unwrap_or("")
++      }
++      _ => "",
++    };
+     self.apply_inner(var, obj, c);
++    self.zz_tag = zz_saved;
+     self.var_tag = saved;
+   }
+ 
+@@ -3216,9 +3250,13 @@ impl Analysis {
+           // `F.prototype = x`: instances created later read x. Approximate: x escapes nowhere, but
+           // reads through `prototype` see it.
+         }
++        self.zz_late("late-store", obj);
+         if let Some(Flavour::Ext) = self.objs[obj].escaped {
+           let site = (!self.genuine_escaped.contains(&obj)).then_some(EFFECT_ESCAPE);
++          let zz_saved = self.zz_tag;
++          self.zz_tag = "@late-store";
+           self.constrain(src, Constraint::Escape(Flavour::Ext, site));
++          self.zz_tag = zz_saved;
+         }
+         for class in self.crossed_classes(obj) {
+           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
+@@ -3271,9 +3309,13 @@ impl Analysis {
+       | ObjKind::Class { .. }
+       | ObjKind::Namespace
+       | ObjKind::Builtin { .. } => {
++        self.zz_late("late-unknown-store", obj);
+         if let Some(Flavour::Ext) = self.objs[obj].escaped {
+           let site = (!self.genuine_escaped.contains(&obj)).then_some(EFFECT_ESCAPE);
++          let zz_saved = self.zz_tag;
++          self.zz_tag = "@late-unknown-store";
+           self.constrain(src, Constraint::Escape(Flavour::Ext, site));
++          self.zz_tag = zz_saved;
+         }
+         for class in self.crossed_classes(obj) {
+           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
+@@ -3413,6 +3455,8 @@ impl Analysis {
+         let r = self.rules[rule as usize].1;
+         let saved_tag = self.var_tag;
+         self.var_tag = self.rules[rule as usize].0;
++        let zz_saved = self.zz_tag;
++        self.zz_tag = self.rules[rule as usize].0;
+         // Fresh variables per position: later calls merge into them, never into the callers'
+         // own variables (which may be shared literals).
+         let this = this.map(|t| {
+@@ -3446,6 +3490,7 @@ impl Analysis {
+         };
+         self.rule_memo.insert((call.site, callee), merged.clone());
+         r(self, &merged);
++        self.zz_tag = zz_saved;
+         self.var_tag = saved_tag;
+       }
+       // A function effect's code made runs effect's code: what it is handed goes there. As for
+@@ -3468,7 +3513,16 @@ impl Analysis {
+         self.seed(call.ret, callee);
+       }
+       ObjKind::Top(flavour) | ObjKind::External { flavour, .. } => {
++        let zz_saved = self.zz_tag;
++        self.zz_tag = if self.zz_default.contains(&callee) {
++          "@default-host"
++        } else if flavour == Flavour::Ext {
++          "@external-call"
++        } else {
++          "@host-value-call"
++        };
+         self.escape_args(call, flavour);
++        self.zz_tag = zz_saved;
+         let t = self.top_of(callee);
+         self.seed(call.ret, t);
+       }
+@@ -3490,7 +3544,10 @@ impl Analysis {
+       }
+       ObjKind::Key { .. } => {
+         // `K(...)` is not a call form Effect supports; treat as opaque host behaviour.
++        let zz_saved = self.zz_tag;
++        self.zz_tag = "@K-arm";
+         self.escape_args(call, Flavour::Host);
++        self.zz_tag = zz_saved;
+       }
+       ObjKind::Typed { slot, export } => self.typed_call(callee, slot, export, call),
+       _ => {}
+@@ -6527,9 +6584,13 @@ impl Analysis {
+             self.constrain(holder, Constraint::ClassEscape(class, CLASS_STORED));
+           }
+           // And one spread into it after it escaped escapes too, as a value stored on it does.
++          self.zz_late("late-spread", target);
+           if let Some(Flavour::Ext) = self.objs[target].escaped {
+             let site = (!self.genuine_escaped.contains(&target)).then_some(EFFECT_ESCAPE);
++            let zz_saved = self.zz_tag;
++            self.zz_tag = "@late-spread";
+             self.constrain(holder, Constraint::Escape(Flavour::Ext, site));
++            self.zz_tag = zz_saved;
+           }
+         }
+         if !self.objs[obj].spread_into.contains(&target) {
+@@ -6938,7 +6999,90 @@ impl Analysis {
+   /// `escape`. With `ret` false, a function that goes to effect's code goes without what it
+   /// returns (`typed_callback`'s callbacks declared to return no service); the first
+   /// escape that hands its return over, whenever it comes, does.
++  fn zz_state(&self, obj: ObjId) -> &'static str {
++    match self.objs[obj].escaped {
++      None => "none",
++      Some(Flavour::Host) => "host",
++      Some(Flavour::Ext) if self.genuine_escaped.contains(&obj) => "genuine",
++      Some(Flavour::Ext) => "effect",
++    }
++  }
++
++  fn zz_kind(&self, obj: ObjId) -> &'static str {
++    match self.objs[obj].kind {
++      ObjKind::Object => "Object",
++      ObjKind::Array => "Array",
++      ObjKind::Closure(_) => "Closure",
++      ObjKind::Class { .. } => "Class",
++      ObjKind::Namespace => "Namespace",
++      ObjKind::Promise { .. } => "Promise",
++      ObjKind::Wrap(_) => "Wrap",
++      ObjKind::Typed { .. } => "Typed",
++      ObjKind::Iterator(_) => "Iterator",
++      ObjKind::Top(_) => "Top",
++      ObjKind::External { .. } => "External",
++      ObjKind::Builtin { .. } => "Builtin",
++      ObjKind::Str(_) => "Str",
++      ObjKind::Key { .. } => "Key",
++      _ => "other",
++    }
++  }
++
++  fn zz_late(&mut self, arm: &str, target: ObjId) {
++    let state = self.zz_state(target);
++    if state != "none" {
++      let kind = self.zz_kind(target);
++      *self.zz.entry(format!("late {arm} target={state} kind={kind}")).or_default() += 1;
++    }
++  }
++
++  pub fn zz_dump(&mut self, solve: usize) {
++    for (k, n) in std::mem::take(&mut self.zz) {
++      eprintln!("ZZC solve={solve} {k} n={n}");
++    }
++    let names: Vec<String> = std::mem::take(&mut self.zz_names).into_iter().collect();
++    eprintln!("ZZC solve={solve} default-host-names {} [{}]", names.len(), names.join(" "));
++  }
++
+   fn escape_with(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>, ret: bool) {
++    let into_effect = flavour == Flavour::Ext && site == Some(EFFECT_ESCAPE);
++    let state = self.zz_state(obj);
++    let incoming = if into_effect {
++      "effect"
++    } else if flavour == Flavour::Ext {
++      "genuine"
++    } else {
++      "host"
++    };
++    let escaped = self.objs[obj].escaped;
++    let repeat = if into_effect {
++      escaped.is_some() || self.effect_escaped.contains(&obj)
++    } else {
++      escaped.is_some()
++        && !(flavour == Flavour::Ext
++          && self.effect_escaped.contains(&obj)
++          && escaped == Some(Flavour::Ext)
++          && !self.genuine_escaped.contains(&obj))
++    };
++    let tag = if !self.zz_tag.is_empty() {
++      self.zz_tag
++    } else if into_effect {
++      "@effect-code"
++    } else if site.is_some() {
++      "@unattributed-call-site"
++    } else {
++      "@unattributed"
++    };
++    let kind = self.zz_kind(obj);
++    let what = if repeat { "skip" } else { "run" };
++    *self.zz.entry(format!("{what} state={state} in={incoming} kind={kind} tag={tag}")).or_default() += 1;
++    let zz_saved = self.zz_tag;
++    self.zz_tag = tag;
++    self.escape_with_zz_inner(obj, flavour, site, ret);
++    self.zz_tag = zz_saved;
++  }
++
++  fn escape_with_zz_inner(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>, ret: bool) {
+     // An escape into effect's code runs once; one into code the pass can't see runs once too,
+     // even after the first (it hands over more: values from unseen code may be anything).
+     let into_effect = flavour == Flavour::Ext && site == Some(EFFECT_ESCAPE);
+diff --git a/crates/rolldown/src/stages/link_stage/effect_service_shaking/host.rs b/crates/rolldown/src/stages/link_stage/effect_service_shaking/host.rs
+index c704e1e9..2f6aa0d7 100644
+--- a/crates/rolldown/src/stages/link_stage/effect_service_shaking/host.rs
++++ b/crates/rolldown/src/stages/link_stage/effect_service_shaking/host.rs
+@@ -1298,7 +1298,12 @@ fn global_object(a: &mut Analysis, name: &str) -> ObjId {
+     "process" => {
+       a.alloc(ObjKind::External { flavour: Flavour::Host, name: ArcStr::from("process") }, None)
+     }
+-    _ => a.alloc(ObjKind::External { flavour: Flavour::Host, name: ArcStr::from(name) }, None),
++    _ => {
++      let o = a.alloc(ObjKind::External { flavour: Flavour::Host, name: ArcStr::from(name) }, None);
++      a.zz_default.insert(o);
++      a.zz_names.insert(name.to_string());
++      o
++    }
+   }
+ }
+ 
+diff --git a/crates/rolldown/src/stages/link_stage/effect_service_shaking/mod.rs b/crates/rolldown/src/stages/link_stage/effect_service_shaking/mod.rs
+index 5d9cad78..5553415a 100644
+--- a/crates/rolldown/src/stages/link_stage/effect_service_shaking/mod.rs
++++ b/crates/rolldown/src/stages/link_stage/effect_service_shaking/mod.rs
+@@ -1033,6 +1033,7 @@ impl LinkStage<'_> {
+       }
+ 
+       // == entry exports escape to the consumer
++      a.zz_tag = "@entry-export";
+       for idx in self.user_defined_entry_modules.iter().copied().collect::<Vec<_>>() {
+         let Module::Normal(normal) = &self.module_table.modules[idx] else { continue };
+         let exports: Vec<(ArcStr, SymbolRef)> = self.sorted_exports(idx);
+@@ -1049,6 +1050,7 @@ impl LinkStage<'_> {
+         }
+       }
+ 
++      a.zz_tag = "";
+       // == lazy top-level statements: a reference activates the statement declaring the symbol
+       // (design.md, principle 2). Roots are the references made outside generated code.
+       {
+@@ -1140,6 +1142,7 @@ impl LinkStage<'_> {
+     rounds.entries += a.entries();
+     rounds.steps += a.steps;
+     rounds.per_solve.push((a.entries(), a.steps));
++    a.zz_dump(rounds.per_solve.len());
+     rounds.solve += solve_start.elapsed().saturating_sub(generation);
+     // Refinement: a module hole that a service, a key or a provider reached is analysed in the
+     // next solve, so that it keeps no more methods than its code reads.
