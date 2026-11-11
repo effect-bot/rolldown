@@ -9,7 +9,11 @@ use sugar_path::SugarPath;
 // alternating which goes first, and reports the output sizes, every build's time, the host's
 // one-minute load average around each pair, and the medians and their ratio.
 //
-// cargo run --release --example effect_service_shaking -- <entry> <out-dir> [runs]
+// cargo run --release --example effect_service_shaking -- <entry> <out-dir> [runs] [off|on]
+//
+// With `off` or `on` it builds only that configuration, so that a driver can alternate
+// processes: each process's first build then includes its cold start inside the process
+// (thread pools, allocator, first file reads), which repeated builds in one process do not.
 
 async fn build(entry: &std::path::Path, out_dir: &std::path::Path, enabled: bool) -> f64 {
   let mut bundler = Bundler::new(BundlerOptions {
@@ -60,6 +64,22 @@ async fn main() {
   let entry = std::path::Path::new(&args[1]).absolutize().into_owned();
   let out = std::path::Path::new(&args[2]).absolutize().into_owned();
   let runs: usize = args.get(3).and_then(|n| n.parse().ok()).unwrap_or(7);
+  if let Some(only) = args.get(4) {
+    let enabled = match only.as_str() {
+      "off" => false,
+      "on" => true,
+      other => panic!("expected `off` or `on`, not `{other}`"),
+    };
+    let dir = out.join(only);
+    for run in 0..runs {
+      let before = load();
+      let t = build(&entry, &dir, enabled).await;
+      println!("run {}: {only} {t:.1} ms, load {before:.1} -> {:.1}", run + 1, load());
+    }
+    let size = std::fs::metadata(dir.join("main.js")).map(|m| m.len()).unwrap_or_default();
+    println!("{only}: {size} bytes");
+    return;
+  }
   // Alternate the two configurations, and which of them goes first, so machine load and
   // warm caches affect both alike.
   let mut times = [vec![], vec![]];
