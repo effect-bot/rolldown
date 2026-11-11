@@ -9084,6 +9084,120 @@ mod tests {
     assert_eq!(wrong, Vec::<String>::new());
   }
 
+  /// How a late-input probe's target reaches code outside the analysis: to code the pass
+  /// can't see (genuine), or only to effect's code (`EFFECT_ESCAPE`).
+  #[derive(Clone, Copy, Debug, PartialEq)]
+  enum Escaped {
+    Genuine,
+    Effect,
+  }
+
+  /// What is put on an escaped target, and when: a spread of a fresh source after the escape,
+  /// a spread registered before it whose source value arrives after, and the controls (a
+  /// named store after the escape, a spread before it, a store registered before it whose
+  /// value arrives after).
+  #[derive(Clone, Copy, Debug, PartialEq)]
+  enum LateInput {
+    SpreadAfter,
+    SpreadThenValue,
+    StoreAfter,
+    SpreadBefore,
+    StoreThenValue,
+  }
+
+  /// An empty object escapes and the solve drains; then a fresh source naming
+  /// `test/Assigned` reaches it as `input` says. Code outside may read the source's `key`
+  /// through the target and look the service up with it: returns that lookup's result
+  /// (`looked_up` through `top_ext`).
+  fn late_into_escaped(escaped: Escaped, input: LateInput) -> String {
+    let mut a = Analysis::new();
+    let (provided, keyed) = provided_key(&mut a, "test/Assigned");
+    let target = a.alloc(ObjKind::Object, None);
+    let [tv, src, esc] = [0, 1, 2].map(|_| a.var());
+    a.seed(tv, target);
+    let store = Constraint::Store { key: Key::Name(ArcStr::from("assigned")), src };
+    match input {
+      LateInput::SpreadBefore => {
+        a.seed(src, keyed);
+        a.constrain(tv, Constraint::SpreadTarget(src));
+      }
+      LateInput::SpreadThenValue => a.constrain(tv, Constraint::SpreadTarget(src)),
+      LateInput::StoreThenValue => a.constrain(tv, store.clone()),
+      LateInput::SpreadAfter | LateInput::StoreAfter => {}
+    }
+    a.solve();
+    let site = (escaped == Escaped::Effect).then_some(EFFECT_ESCAPE);
+    a.seed(esc, target);
+    a.constrain(esc, Constraint::Escape(Flavour::Ext, site));
+    a.solve();
+    assert_eq!(a.objs[target].escaped, Some(Flavour::Ext), "setup: the target escaped");
+    assert_eq!(
+      a.genuine_escaped.contains(&target),
+      escaped == Escaped::Genuine,
+      "setup: genuine or effect-only"
+    );
+    if matches!(input, LateInput::SpreadAfter | LateInput::SpreadThenValue) {
+      assert!(
+        a.objs[target].fields.is_empty()
+          && a.named_loads(target).is_empty()
+          && a.objs[target].unknown_loads.is_empty()
+          && a.crossed_classes(target).is_empty(),
+        "setup: the target has no fields, no reads and crossed no class"
+      );
+      assert!(!a.handed_names.contains("test/Assigned"), "setup: the name is fresh");
+      assert!(
+        a.objs[keyed].escaped.is_none() && !a.class_escaped.contains_key(&keyed),
+        "setup: the source has not escaped"
+      );
+    }
+    match input {
+      LateInput::SpreadAfter => {
+        a.seed(src, keyed);
+        a.constrain(tv, Constraint::SpreadTarget(src));
+      }
+      LateInput::StoreAfter => {
+        a.seed(src, keyed);
+        a.constrain(tv, store);
+      }
+      LateInput::SpreadThenValue | LateInput::StoreThenValue => a.seed(src, keyed),
+      LateInput::SpreadBefore => {}
+    }
+    a.solve();
+    let outside = a.var();
+    let top = a.top_ext;
+    a.seed(outside, top);
+    looked_up(&mut a, outside, provided)
+  }
+
+  /// Guard: a source spread into an object after it escaped to code the pass can't see
+  /// escapes with it, as a value stored on it does (`spread_into`, `store_name`).
+  #[test]
+  fn late_spread_into_escaped_target_escapes() {
+    for control in [LateInput::StoreAfter, LateInput::SpreadBefore] {
+      assert_eq!(late_into_escaped(Escaped::Genuine, control), FOUND, "control {control:?}");
+    }
+    assert_eq!(late_into_escaped(Escaped::Genuine, LateInput::SpreadAfter), FOUND);
+  }
+
+  /// Guard: the same after an escape only into effect's code.
+  #[test]
+  fn late_spread_into_effect_escaped_target_escapes() {
+    for control in [LateInput::StoreAfter, LateInput::SpreadBefore] {
+      assert_eq!(late_into_escaped(Escaped::Effect, control), FOUND, "control {control:?}");
+    }
+    assert_eq!(late_into_escaped(Escaped::Effect, LateInput::SpreadAfter), FOUND);
+  }
+
+  /// Guard: a spread registered before the target escaped, whose source value arrives after
+  /// the escape drained, escapes with it.
+  #[test]
+  fn spread_source_arriving_after_escape_escapes() {
+    for control in [LateInput::StoreThenValue, LateInput::SpreadBefore] {
+      assert_eq!(late_into_escaped(Escaped::Genuine, control), FOUND, "control {control:?}");
+    }
+    assert_eq!(late_into_escaped(Escaped::Genuine, LateInput::SpreadThenValue), FOUND);
+  }
+
   /// Guard: over the budget, replay and the named-load index stop (`replay_stopped`). A read,
   /// a late element, prototype or spread source adds no row, copy or constraint, and the solve
   /// stops keeping everything even after the totals come back under the cap, as widening may
