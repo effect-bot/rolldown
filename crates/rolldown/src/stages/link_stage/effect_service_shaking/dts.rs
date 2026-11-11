@@ -26,7 +26,9 @@ use oxc::ast::ast::{
 };
 use oxc::parser::Parser;
 use oxc::span::SourceType;
-use rolldown_utils::rayon::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+#[cfg(not(target_family = "wasm"))]
+use rolldown_utils::rayon::IndexedParallelIterator;
+use rolldown_utils::rayon::{IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::FxHashMap;
 use self_cell::self_cell;
 use sugar_path::SugarPath;
@@ -209,11 +211,13 @@ impl Loaded {
 /// (`Dts::file`). It depends on nothing but the files, so it can run before the analysis
 /// exists, while the link stage does other work (`LinkStage::preload_effect_declarations`).
 pub fn load(paths: &[PathBuf]) -> Loaded {
+  let paths = paths.par_iter();
+  // One task per file: a few large files (`Effect.d.ts`) take most of the time. Without threads
+  // (wasm) the iterator is sequential and has no task size.
+  #[cfg(not(target_family = "wasm"))]
+  let paths = paths.with_max_len(1);
   Loaded(
     paths
-      .par_iter()
-      // One task per file: a few large files (`Effect.d.ts`) take most of the time.
-      .with_max_len(1)
       .map(|path| {
         let path = path.normalize().into_owned();
         let read = if path.is_file() {
