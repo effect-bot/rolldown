@@ -8675,9 +8675,11 @@ mod tests {
   /// field the source gains after the spread, then a third value there widens it past a limit of
   /// two. The read comes first, so what the source holds reaches it through replay
   /// (`spread_into`), or last. A lookup through what the read holds uses the names as keys, and
-  /// `test/F` arrives after it and after widening. Returns the widened state, and the decisions:
-  /// which keys the lookup sees and the demand.
-  fn replay_widening(read_first: bool, opaque_third: bool) -> (String, String) {
+  /// `test/F` arrives after it and after widening. Returns the read's state (widened, and what
+  /// it holds), the decisions (which keys the lookup sees, and the demand), and where each
+  /// arriving value is: held, or crossed the widening boundary (a name into `handed_names`,
+  /// the object third value into `widen_escaped`).
+  fn replay_widening(read_first: bool, opaque_third: bool) -> (String, String, String) {
     let mut a = Analysis::new();
     a.widen_limit = 2;
     let pick = ArcStr::from("pick");
@@ -8743,46 +8745,84 @@ mod tests {
     let f = a.str("test/F");
     a.seed(own, f);
     a.solve();
-    let mut held: Vec<String> = a
-      .pts(read)
-      .iter()
-      .map(|o| {
-        format!("{:?}", a.objs[*o].kind).split([' ', '(', '{']).next().unwrap_or("").to_string()
-      })
-      .collect();
+    let class = a.widened_class.expect("a set widened");
+    let opaque = a.opaque(class);
+    let label = |o: &ObjId| match &a.objs[*o].kind {
+      _ if *o == opaque => "opaque".to_string(),
+      ObjKind::Str(name) => name.to_string(),
+      _ => "object".to_string(),
+    };
+    let mut held: Vec<String> = a.pts(read).iter().map(label).collect();
     held.sort();
+    let mut kept: Vec<String> = ["test/C", "test/D", "test/F"]
+      .map(|name| {
+        let place = if a.pts(read).iter().any(|o| label(o) == name) {
+          "held"
+        } else if a.handed_names.contains(name) {
+          "handed"
+        } else {
+          "lost"
+        };
+        format!("{name} {place}")
+      })
+      .to_vec();
+    if !opaque_third {
+      let place = if a.pts(read).contains(&third) {
+        "held"
+      } else if a.widen_escaped.contains(&third) {
+        "crossed"
+      } else {
+        "lost"
+      };
+      kept.push(format!("object {place}"));
+    }
+    kept.push(format!("opaque held {}", a.pts(read).contains(&opaque)));
     (
-      format!("widened {} of {}, holds {held:?}", a.vars[read].widened, a.widened_vars),
+      format!("widened {}, holds {held:?}", a.vars[read].widened),
       format!(
         "sees {:?}, demand {:?}",
         provided.iter().map(|p| a.pts(dst).contains(p)).collect::<Vec<_>>(),
         [target, source].map(|o| a.objs[o].demand.has("pick")),
       ),
+      kept.join(", "),
     )
   }
 
-  /// Guard: a read widened by what replay brings it decides as one made last (`widen`): the
-  /// names it held cross the boundary, as does one arriving after it widened, so a lookup
-  /// through it sees the keys under all three either way, and demand is the same. With an
-  /// object as the third value it widens either way and holds only the opaque value. With the
-  /// opaque value as the third, the read made last does not widen: the target's field widened
-  /// first and gives it the opaque value in place of `test/C`, so it holds two values. Copy edges
-  /// alone count the same way (widening is first come), and lookups through either state see
-  /// the same keys.
+  /// Guard: a read widened by what replay brings it keeps every value it was given, as one made
+  /// last does (`widen`). In either order each name, and the object third value, is still held
+  /// or crossed the widening boundary (a name into `handed_names`, for lookups registered before
+  /// or after), and the opaque value is held. With an object as the third value the read widens
+  /// either way and holds only the opaque value. With the opaque value as the third, the read
+  /// made last does not widen (cascaded widening): the target's own field widened first and
+  /// gives it the opaque value in place of `test/C`, so it holds exactly the opaque value and
+  /// `test/D`, while the read made first widens. Copy edges alone do the same at `39fab47d`,
+  /// before replay: widening counts values in arrival order (first come). Lookups through either
+  /// state see the same keys and demand is the same here, but that is this shape's, not a
+  /// general guarantee.
   #[test]
   fn replay_widening_matches_read_last() {
     let mut wrong = vec![];
     for opaque_third in [false, true] {
-      let (last_state, last) = replay_widening(false, opaque_third);
+      let (last_state, last, last_kept) = replay_widening(false, opaque_third);
       if last != "sees [true, true, true, false], demand [true, true]" {
         wrong.push(format!("opaque {opaque_third} read last: {last}"));
       }
-      let (first_state, first) = replay_widening(true, opaque_third);
+      let (first_state, first, first_kept) = replay_widening(true, opaque_third);
       if first != last {
         wrong.push(format!("opaque {opaque_third} read first: {first} / read last {last}"));
       }
-      if !first_state.starts_with("widened true") || !opaque_third && first_state != last_state {
-        wrong.push(format!("opaque {opaque_third}: {first_state} / read last {last_state}"));
+      for (order, kept) in [("first", &first_kept), ("last", &last_kept)] {
+        if kept.contains("lost") || !kept.ends_with("opaque held true") {
+          wrong.push(format!("opaque {opaque_third} read {order}: {kept}"));
+        }
+      }
+      let expected_last = if opaque_third {
+        r#"widened false, holds ["opaque", "test/D"]"#
+      } else {
+        r#"widened true, holds ["opaque"]"#
+      };
+      if first_state != r#"widened true, holds ["opaque"]"# || last_state != expected_last {
+        wrong.push(format!("opaque {opaque_third}: read first {first_state} / last {last_state}"));
       }
     }
     assert_eq!(wrong, Vec::<String>::new());
