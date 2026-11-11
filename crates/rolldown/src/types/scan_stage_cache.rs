@@ -354,6 +354,7 @@ impl ScanStageCache {
       user_defined_entry_modules: cache.user_defined_entry_modules.clone(),
       tla_module_count: cache.tla_module_count,
       tla_keyword_span_map: cache.tla_keyword_span_map.clone(),
+      effect_declarations: None,
     }
   }
 }

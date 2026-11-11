@@ -28,7 +28,9 @@ use std::cell::{OnceCell, RefCell};
 use arcstr::ArcStr;
 use oxc::ast::ast::{ClassElement, Expression, Statement};
 use oxc_index::IndexVec;
-use rolldown_common::{ExportsKind, Module, ModuleIdx, Specifier, SymbolRef};
+use rolldown_common::{
+  ExportsKind, Module, ModuleIdx, ModuleTable, NormalizedBundlerOptions, Specifier, SymbolRef,
+};
 use rolldown_error::{BuildDiagnostic, EventKindSwitcher};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -50,7 +52,7 @@ struct Rounds {
   dts: Option<dts::Dts>,
   /// Each solve's own entries and steps, for the report.
   per_solve: Vec<(u64, u64)>,
-  /// The declarations the link stage started loading, for the first solve.
+  /// The declarations whose load started when the module table was complete, for the first solve.
   declarations: Option<EffectDeclarations>,
   phases: Phases,
   /// How the declarations were loaded, for the report.
@@ -90,7 +92,7 @@ impl Rounds {
     let phases: std::time::Duration = self.phases.spent.iter().sum();
     let loaded = match self.loaded {
       Some(t) if t.preloaded => format!(
-        "declarations preloaded on the rayon pool in {:.1} ms (the load's own wall time, started with the link stage), the pass waiting {:.1} ms for it",
+        "declarations preloaded on the rayon pool in {:.1} ms (the load's own wall time, started when the module table was complete), the pass waiting {:.1} ms for it",
         ms(t.work),
         ms(t.wait)
       ),
@@ -203,12 +205,28 @@ fn declarations_of(module: &Module) -> Option<std::path::PathBuf> {
   module.id().as_str().strip_suffix(".js").map(|js| std::path::PathBuf::from(format!("{js}.d.ts")))
 }
 
-/// The declarations of `effect`'s modules, read and parsed on the rayon pool while the link
-/// stage runs up to the pass (`LinkStage::preload_effect_declarations`).
-pub(super) struct EffectDeclarations {
+/// The declarations of `effect`'s modules, read and parsed on the rayon pool from the moment the
+/// module table is complete while the rest of the scan's tail and the link stage run up to the
+/// pass (`preload_effect_declarations`). It travels with the scan's output into the link stage, so
+/// a build that ends before the pass drops it, which ends the load (`Preload`'s `Drop`).
+pub struct EffectDeclarations {
   /// Each module of `effect`, with the `.d.ts` beside it if its id names one.
   modules: Vec<(ModuleIdx, Option<std::path::PathBuf>)>,
   loading: Loading,
+}
+
+impl std::fmt::Debug for EffectDeclarations {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let started = match self.loading {
+      #[cfg(not(target_family = "wasm"))]
+      Loading::Started(_) => true,
+      Loading::Deferred => false,
+    };
+    f.debug_struct("EffectDeclarations")
+      .field("modules", &self.modules.len())
+      .field("started", &started)
+      .finish()
+  }
 }
 
 enum Loading {
@@ -224,10 +242,14 @@ enum Loading {
 struct Preload {
   /// Set when the pass ends without the files: the load stops starting new ones.
   cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-  /// Taken once the result is received.
-  receiver:
-    Option<std::sync::mpsc::Receiver<(std::thread::Result<dts::Loaded>, std::time::Duration)>>,
+  /// Taken once the result is received. In a `Mutex`, never locked, only so that the scan's
+  /// output that carries it to the link stage stays `Sync`.
+  receiver: Option<std::sync::Mutex<std::sync::mpsc::Receiver<Loaded>>>,
 }
+
+/// What a load sends: the files, or its panic, with the time it took.
+#[cfg(not(target_family = "wasm"))]
+type Loaded = (std::thread::Result<dts::Loaded>, std::time::Duration);
 
 #[cfg(not(target_family = "wasm"))]
 impl Preload {
@@ -246,13 +268,19 @@ impl Preload {
       // Only fails if the receiver is gone, which `Drop` rules out until this is sent.
       let _ = sender.send((loaded, began.elapsed()));
     });
-    Self { cancel, receiver: Some(receiver) }
+    Self { cancel, receiver: Some(std::sync::Mutex::new(receiver)) }
   }
 
   /// Waits for the files, with the time the load took. `None` if it ended without sending
   /// them.
   fn wait(&mut self) -> Option<(dts::Loaded, std::time::Duration)> {
-    match self.receiver.take()?.recv() {
+    match self
+      .receiver
+      .take()?
+      .into_inner()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .recv()
+    {
       Ok((Ok(loaded), work)) => Some((loaded, work)),
       Ok((Err(panic), _)) => std::panic::resume_unwind(panic),
       Err(_) => None,
@@ -261,16 +289,17 @@ impl Preload {
 }
 
 /// The pass may end without the files: a contract check that fails (`effect` external, an
-/// unsupported version, missing exports) or a panic. The load must not outlive it, reading
-/// files and holding parsed arenas into rendering or the next build, so this stops the files
-/// not yet started and waits for those in flight. The pass is not on a rayon worker when a load
-/// was started (`preload_effect_declarations`), so the wait blocks no worker.
+/// unsupported version, missing exports), a panic, or a build that fails between the scan and the
+/// pass (a `buildEnd` hook). The load must not outlive it, reading files and holding parsed
+/// arenas into rendering or the next build, so this stops the files not yet started and waits
+/// for those in flight. The build is not on a rayon worker when a load was started
+/// (`preload_effect_declarations`), so the wait blocks no worker.
 #[cfg(not(target_family = "wasm"))]
 impl Drop for Preload {
   fn drop(&mut self) {
     if let Some(receiver) = self.receiver.take() {
       self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-      let _ = receiver.recv();
+      let _ = receiver.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
     }
   }
 }
@@ -327,6 +356,33 @@ impl EffectDeclarations {
   }
 }
 
+/// Starts reading and parsing the declarations of `effect`'s modules on the rayon pool as soon as
+/// the module table is complete, so that `buildEnd` and the link stage's work up to the pass hide
+/// it. They depend only on the module table. A build running on a rayon worker loads them when
+/// the pass needs them: it would block that worker waiting for them. The scan's tail and the link
+/// stage run in the same task, so the thread checked here is the thread that waits.
+pub fn preload_effect_declarations(
+  module_table: &ModuleTable,
+  options: &NormalizedBundlerOptions,
+) -> Option<EffectDeclarations> {
+  if !options.experimental.is_effect_service_shaking_enabled() {
+    return None;
+  }
+  let modules: Vec<&Module> = module_table.modules.iter().filter(|m| is_effect(m)).collect();
+  if modules.is_empty() {
+    return None;
+  }
+  let declarations = EffectDeclarations::new(&modules);
+  #[cfg(not(target_family = "wasm"))]
+  let declarations = if rayon::current_thread_index().is_none() {
+    let preload = Preload::start(paths_of(&declarations.modules), dts::load);
+    EffectDeclarations { loading: Loading::Started(preload), ..declarations }
+  } else {
+    declarations
+  };
+  Some(declarations)
+}
+
 /// The phases of one solve, as the report's `phases` line names them.
 const PHASES: [&str; 9] = [
   "declarations",
@@ -379,29 +435,6 @@ impl Phases {
 }
 
 impl LinkStage<'_> {
-  /// Starts reading and parsing the declarations of `effect`'s modules on the rayon pool, so
-  /// that the link stage's work up to the pass hides it. They depend only on the module table.
-  /// A link stage that runs on a rayon worker itself loads them when the pass needs them: it
-  /// would block that worker waiting for them.
-  pub(super) fn preload_effect_declarations(&self) -> Option<EffectDeclarations> {
-    if !self.options.experimental.is_effect_service_shaking_enabled() {
-      return None;
-    }
-    let modules: Vec<&Module> = self.module_table.modules.iter().filter(|m| is_effect(m)).collect();
-    if modules.is_empty() {
-      return None;
-    }
-    let declarations = EffectDeclarations::new(&modules);
-    #[cfg(not(target_family = "wasm"))]
-    let declarations = if rayon::current_thread_index().is_none() {
-      let preload = Preload::start(paths_of(&declarations.modules), dts::load);
-      EffectDeclarations { loading: Loading::Started(preload), ..declarations }
-    } else {
-      declarations
-    };
-    Some(declarations)
-  }
-
   fn warn_effect_service_shaking(&mut self, reason: String) {
     if self.options.checks.contains(EventKindSwitcher::EffectServiceShaking) {
       self
@@ -630,7 +663,7 @@ impl LinkStage<'_> {
     // `effect`'s bodies instead.
     let is_effect_module = |idx: ModuleIdx| is_effect(&self.module_table.modules[idx]);
     let declarations = |idx: ModuleIdx| declarations_of(&self.module_table.modules[idx]);
-    // They are read and parsed in parallel, from the start of the link stage, since the model
+    // They are read and parsed in parallel, from the moment the module table is complete, since the model
     // reads most of them (`preload_effect_declarations`). A later solve has the same modules,
     // whose declarations the first one found readable and parsed.
     let mut reads = if rounds.count == 0 {

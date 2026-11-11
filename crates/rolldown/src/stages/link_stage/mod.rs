@@ -38,6 +38,7 @@ mod create_exports_for_ecma_modules;
 mod cross_module_optimization;
 mod determine_module_exports_kind;
 mod effect_service_shaking;
+pub use effect_service_shaking::{EffectDeclarations, preload_effect_declarations};
 mod generate_lazy_export;
 mod patch_module_dependencies;
 mod reference_needed_symbols;
@@ -143,6 +144,9 @@ pub struct LinkStage<'a> {
   pub relaxed_side_effect_modules: FxHashSet<ModuleIdx>,
   /// Lazily computed static-import components for entry-independent constant lookups.
   import_cycles: refine_stmt_side_effects::ImportCycles,
+  /// The load of `effect`'s declarations started when the module table was complete, taken by
+  /// the effect service shaking pass. Dropping it unadopted ends the load.
+  effect_declarations: Option<EffectDeclarations>,
 }
 
 impl<'a> LinkStage<'a> {
@@ -193,6 +197,7 @@ impl<'a> LinkStage<'a> {
       scan_time_side_effects,
       relaxed_side_effect_modules: FxHashSet::default(),
       import_cycles: refine_stmt_side_effects::ImportCycles::default(),
+      effect_declarations: scan_stage_output.effect_declarations.take(),
       global_constant_symbol_map: constant_symbol_map,
       depended_runtime_helper: scan_stage_output
         .module_table
@@ -265,7 +270,7 @@ impl<'a> LinkStage<'a> {
 
   #[tracing::instrument(level = "debug", skip_all)]
   pub fn link(mut self) -> (LinkStageOutput, IndexEcmaAst, UsedSymbolRefsBuilder) {
-    let effect_declarations = self.preload_effect_declarations();
+    let effect_declarations = self.effect_declarations.take();
     self.sort_modules();
     self.compute_tla();
     self.determine_module_exports_kind();

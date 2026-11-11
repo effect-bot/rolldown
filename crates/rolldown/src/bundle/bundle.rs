@@ -5,7 +5,7 @@ use super::super::{
   module_loader::deferred_scan_data::defer_sync_scan_data,
   stages::{
     generate_stage::GenerateStage,
-    link_stage::LinkStage,
+    link_stage::{LinkStage, preload_effect_declarations},
     scan_stage::{NormalizedScanStageOutput, ScanStage, ScanStageOutput},
   },
   types::{bundle_output::BundleOutput, scan_stage_cache::ScanStageCache},
@@ -82,7 +82,10 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
   #[tracing::instrument(level = "debug", skip_all, parent = &self.bundle_span)]
   /// This method intentionally get the ownership of `self` to show that the method cannot be called multiple times.
   pub async fn scan(mut self) -> BuildResult<()> {
-    self.scan_modules(ScanMode::Full).await?;
+    self.plugin_driver.file_emitter.enter_build_phase();
+    let result = self.scan_modules_impl(ScanMode::Full, false).await;
+    self.plugin_driver.file_emitter.enter_output_phase();
+    result?;
 
     Ok(())
   }
@@ -96,14 +99,17 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
     // means a failed scan cannot leave the emitter stuck in the build phase, where a later emit
     // (e.g. an HMR patch after a failed rebuild) could still change an already-emitted filename.
     self.plugin_driver.file_emitter.enter_build_phase();
-    let result = self.scan_modules_impl(scan_mode).await;
+    let result = self.scan_modules_impl(scan_mode, true).await;
     self.plugin_driver.file_emitter.enter_output_phase();
     result
   }
 
+  /// `links`: whether the output goes on to the link stage, which is what reads the declarations
+  /// whose load starts here.
   async fn scan_modules_impl(
     &mut self,
     scan_mode: ScanMode<ArcStr>,
+    links: bool,
   ) -> BuildResult<NormalizedScanStageOutput> {
     trace_action!(action::BuildStart { action: "BuildStart" });
     let is_full_scan_mode = scan_mode.is_full();
@@ -132,9 +138,16 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
       }
     };
 
-    let scan_stage_output = self
+    let mut scan_stage_output = self
       .normalize_scan_stage_output_and_update_cache(scan_stage_output, is_full_scan_mode)
       .await?;
+    // The module table is complete: start loading `effect`'s declarations for the effect service
+    // shaking pass, so that `buildEnd` and the link stage up to the pass hide it. The load travels
+    // with the output, and every exit before the pass drops it, which ends the load.
+    if links {
+      scan_stage_output.effect_declarations =
+        preload_effect_declarations(&scan_stage_output.module_table, &self.options);
+    }
 
     // Make sure the cache is reset if incremental build is not enabled.
     if !self.options.experimental.is_incremental_build_enabled() {

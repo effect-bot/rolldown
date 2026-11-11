@@ -20,6 +20,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::{
   SharedOptions, SharedResolver,
   module_loader::{ModuleLoader, module_loader::ModuleLoaderOutput},
+  stages::link_stage::EffectDeclarations,
   type_alias::{IndexEcmaAst, IndexStmtInfos},
   types::scan_stage_cache::ScanStageCache,
   utils::load_entry_module::load_entry_module,
@@ -57,6 +58,9 @@ pub struct NormalizedScanStageOutput {
   pub user_defined_entry_modules: FxHashSet<ModuleIdx>,
   pub tla_module_count: usize,
   pub tla_keyword_span_map: FxHashMap<ModuleIdx, Span>,
+  /// The load of `effect`'s declarations for the effect service shaking pass, started once the
+  /// module table is complete (`Bundle::scan_modules`). It ends when this is dropped unadopted.
+  pub(crate) effect_declarations: Option<EffectDeclarations>,
 }
 
 impl NormalizedScanStageOutput {
@@ -85,6 +89,7 @@ impl NormalizedScanStageOutput {
       user_defined_entry_modules: self.user_defined_entry_modules.clone(),
       tla_module_count: self.tla_module_count,
       tla_keyword_span_map: self.tla_keyword_span_map.clone(),
+      effect_declarations: None,
     }
   }
 }
@@ -123,6 +128,7 @@ impl TryFrom<ScanStageOutput> for NormalizedScanStageOutput {
       user_defined_entry_modules: value.user_defined_entry_modules,
       tla_module_count: value.tla_module_count,
       tla_keyword_span_map: value.tla_keyword_span_map,
+      effect_declarations: None,
     })
   }
 }
