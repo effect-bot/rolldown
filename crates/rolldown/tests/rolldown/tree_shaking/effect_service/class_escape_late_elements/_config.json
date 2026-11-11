@@ -1,0 +1,10 @@
+{
+  "_comment": "Replay: box.handler is loaded before box is handed to class code. Class code may store anything into box, so the load must see the class's opaque value even though box got its elements after the load ran (Analysis::elem replays registered named loads). The opaque value is then called with the service, which escapes into class code: Store keeps every method. Without the replay, the load stayed empty, lateUnread was removed, and the program failed at run time.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
