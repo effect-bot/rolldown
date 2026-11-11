@@ -1267,7 +1267,7 @@ fn global_object(a: &mut Analysis, name: &str) -> ObjId {
     "globalThis" | "window" | "self" | "global" => {
       let obj = a.alloc(ObjKind::Object, None);
       // Anything stored on the global object is visible to code the pass cannot see.
-      a.objs[obj].escaped = Some(Flavour::Host);
+      a.mark_host_escaped(obj);
       let elem = a.elem(obj);
       a.seed(elem, a.top_host);
       obj

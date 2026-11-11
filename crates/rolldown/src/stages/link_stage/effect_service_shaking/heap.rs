@@ -1081,6 +1081,8 @@ pub struct Analysis {
   /// (`escape_with`): their return goes over at the first escape that hands it.
   ret_withheld: FxHashSet<ObjId>,
   genuine_escaped: FxHashSet<ObjId>,
+  /// Objects escaped to a host builtin: with the two sets above, one mark per obligation.
+  host_escaped: FxHashSet<ObjId>,
   /// Keys handed across a boundary (`hand_key`): the objects handed, the key names they carry,
   /// whether one names every key, and the lookups through keys from a boundary.
   handed: FxHashSet<ObjId>,
@@ -1408,6 +1410,7 @@ impl Analysis {
       effect_escaped: FxHashSet::default(),
       ret_withheld: FxHashSet::default(),
       genuine_escaped: FxHashSet::default(),
+      host_escaped: FxHashSet::default(),
       handed: FxHashSet::default(),
       handed_names: FxHashSet::default(),
       handed_all: false,
@@ -3216,10 +3219,7 @@ impl Analysis {
           // `F.prototype = x`: instances created later read x. Approximate: x escapes nowhere, but
           // reads through `prototype` see it.
         }
-        if let Some(Flavour::Ext) = self.objs[obj].escaped {
-          let site = (!self.genuine_escaped.contains(&obj)).then_some(EFFECT_ESCAPE);
-          self.constrain(src, Constraint::Escape(Flavour::Ext, site));
-        }
+        self.escape_late(obj, src);
         for class in self.crossed_classes(obj) {
           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
         }
@@ -3271,10 +3271,7 @@ impl Analysis {
       | ObjKind::Class { .. }
       | ObjKind::Namespace
       | ObjKind::Builtin { .. } => {
-        if let Some(Flavour::Ext) = self.objs[obj].escaped {
-          let site = (!self.genuine_escaped.contains(&obj)).then_some(EFFECT_ESCAPE);
-          self.constrain(src, Constraint::Escape(Flavour::Ext, site));
-        }
+        self.escape_late(obj, src);
         for class in self.crossed_classes(obj) {
           self.constrain(src, Constraint::ClassEscape(class, CLASS_STORED));
         }
@@ -6527,10 +6524,7 @@ impl Analysis {
             self.constrain(holder, Constraint::ClassEscape(class, CLASS_STORED));
           }
           // And one spread into it after it escaped escapes too, as a value stored on it does.
-          if let Some(Flavour::Ext) = self.objs[target].escaped {
-            let site = (!self.genuine_escaped.contains(&target)).then_some(EFFECT_ESCAPE);
-            self.constrain(holder, Constraint::Escape(Flavour::Ext, site));
-          }
+          self.escape_late(target, holder);
         }
         if !self.objs[obj].spread_into.contains(&target) {
           self.objs[obj].spread_into.push(target);
@@ -6930,6 +6924,26 @@ impl Analysis {
     }
   }
 
+  /// A value put on `obj` (stored or spread) escapes as `obj` did, once per obligation it ran.
+  fn escape_late(&mut self, obj: ObjId, src: VarId) {
+    for (marked, flavour, site) in [
+      (self.host_escaped.contains(&obj), Flavour::Host, None),
+      (self.effect_escaped.contains(&obj), Flavour::Ext, Some(EFFECT_ESCAPE)),
+      (self.genuine_escaped.contains(&obj), Flavour::Ext, None),
+    ] {
+      if marked {
+        self.constrain(src, Constraint::Escape(flavour, site));
+      }
+    }
+  }
+
+  /// Marks `obj` escaped to a host builtin without escaping what it holds now (the global
+  /// object): what is put on it later escapes there (`escape_late`).
+  pub fn mark_host_escaped(&mut self, obj: ObjId) {
+    self.host_escaped.insert(obj);
+    self.objs[obj].escaped = Some(Flavour::Host);
+  }
+
   /// A value handed to code the pass cannot see.
   pub fn escape(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>) {
     self.escape_with(obj, flavour, site, true);
@@ -6939,8 +6953,8 @@ impl Analysis {
   /// returns (`typed_callback`'s callbacks declared to return no service); the first
   /// escape that hands its return over, whenever it comes, does.
   fn escape_with(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>, ret: bool) {
-    // An escape into effect's code runs once; one into code the pass can't see runs once too,
-    // even after the first (it hands over more: values from unseen code may be anything).
+    // Each obligation (a host builtin, effect's code, code the pass can't see) runs once,
+    // whatever ran before: each hands over something the others don't.
     let into_effect = flavour == Flavour::Ext && site == Some(EFFECT_ESCAPE);
     // Only a function, or a record or array of them, has returns to hold back.
     let ret = ret
@@ -6948,29 +6962,27 @@ impl Analysis {
       || !matches!(self.objs[obj].kind, ObjKind::Closure(_) | ObjKind::Object | ObjKind::Array);
     let closure = matches!(self.objs[obj].kind, ObjKind::Closure(_));
     self.hand_key(obj, false);
-    let repeat = if into_effect {
-      self.objs[obj].escaped.is_some() || !self.effect_escaped.insert(obj)
-    } else {
-      self.objs[obj].escaped.is_some()
-        && !(flavour == Flavour::Ext
-          && self.effect_escaped.contains(&obj)
-          && self.objs[obj].escaped == Some(Flavour::Ext)
-          && self.genuine_escaped.insert(obj))
+    let marks = match flavour {
+      Flavour::Host => &mut self.host_escaped,
+      Flavour::Ext if into_effect => &mut self.effect_escaped,
+      Flavour::Ext => &mut self.genuine_escaped,
     };
+    let repeat = !marks.insert(obj);
+    // A later escape that hands over a return held back so far (whatever its order). A first
+    // escape to code the pass can't see hands the return over itself.
+    if ret && (repeat || flavour == Flavour::Host) && self.ret_withheld.remove(&obj) {
+      self.release_ret(obj);
+    }
     if repeat {
-      // A later escape that hands over a return held back so far (whatever its order).
-      if ret && self.ret_withheld.remove(&obj) {
-        self.release_ret(obj);
-      }
       return;
     }
     if !ret {
       self.ret_withheld.insert(obj);
     }
-    if !into_effect && flavour == Flavour::Ext {
-      self.genuine_escaped.insert(obj);
+    // The strongest state is kept: escaped to code outside, over escaped to a host builtin.
+    if flavour == Flavour::Ext || self.objs[obj].escaped.is_none() {
+      self.objs[obj].escaped = Some(flavour);
     }
-    self.objs[obj].escaped = Some(flavour);
     self.recheck_tree(obj);
     self.touch_namespace(obj, None);
     // Host builtins never look inside their arguments (a wrong builtin model is a compiler
