@@ -1,0 +1,10 @@
+{
+  "_comment": "A module namespace is a key: its `key` export names the service, and a lookup through the namespace reads that export (KeyNameUse). The export is a lazy top-level statement no other code reaches, so the read itself must run it (touch_namespace). The method read through the namespace stays; the unread one is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
