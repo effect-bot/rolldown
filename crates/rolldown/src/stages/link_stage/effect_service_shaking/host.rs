@@ -1194,6 +1194,30 @@ const PRIM_GLOBALS: &[&str] = &[
   "cancelAnimationFrame",
 ];
 
+/// Standard globals without a rule of their own, modelled as host builtins. Any other
+/// unresolved name may be code the pass can't see.
+const HOST_GLOBALS: &[&str] = &[
+  "AbortController",
+  "ArrayBuffer",
+  "Blob",
+  "Buffer",
+  "File",
+  "FinalizationRegistry",
+  "FormData",
+  "RegExp",
+  "Request",
+  "Response",
+  "TextDecoder",
+  "TextEncoder",
+  "URL",
+  "URLSearchParams",
+  "Uint8Array",
+  "atob",
+  "btoa",
+  "crypto",
+  "navigator",
+];
+
 /// Resolves a free global name to a variable holding its model.
 pub fn resolve_global(
   a: &mut Analysis,
@@ -1298,7 +1322,10 @@ fn global_object(a: &mut Analysis, name: &str) -> ObjId {
     "process" => {
       a.alloc(ObjKind::External { flavour: Flavour::Host, name: ArcStr::from("process") }, None)
     }
-    _ => a.alloc(ObjKind::External { flavour: Flavour::Host, name: ArcStr::from(name) }, None),
+    _ => {
+      let flavour = if HOST_GLOBALS.contains(&name) { Flavour::Host } else { Flavour::Ext };
+      a.alloc(ObjKind::External { flavour, name: ArcStr::from(name) }, None)
+    }
   }
 }
 

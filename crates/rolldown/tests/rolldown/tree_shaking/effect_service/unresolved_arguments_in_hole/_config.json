@@ -1,0 +1,10 @@
+{
+  "_comment": "`arguments` in a module whose imports never reach effect (a module hole) is an unresolved name to the pass, not a global. A function there forwards a service through `arguments` to a callback that reads one method. That method stays and the method nothing reads is removed.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
