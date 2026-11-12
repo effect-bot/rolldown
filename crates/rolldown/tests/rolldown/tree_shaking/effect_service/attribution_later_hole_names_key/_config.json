@@ -1,0 +1,10 @@
+{
+  "_comment": "An object crosses two boundaries and a module hole writes a key name onto it, which the program reads for Context.Service. One object crosses a program class's static method first and the hole second; the control crosses the hole first. Each program calls one method of its service, which must stay, and the bundle must run.",
+  "config": {
+    "experimental": {
+      "effectServiceShaking": true
+    }
+  },
+  "snapshot": false,
+  "extendedTests": false
+}
