@@ -1078,7 +1078,7 @@ pub struct Analysis {
   /// Objects escaped into effect's code, and into code the pass can't see (`escape`).
   effect_escaped: FxHashSet<ObjId>,
   /// Functions handed to effect's code so far only where their return is declared primitive
-  /// (`escape_with`): their return goes over at the first escape that hands it.
+  /// (`escape_with`): released by a later repeat or host escape that hands the return over.
   ret_withheld: FxHashSet<ObjId>,
   genuine_escaped: FxHashSet<ObjId>,
   /// Objects escaped to a host builtin: with the two sets above, one mark per obligation.
@@ -6950,8 +6950,8 @@ impl Analysis {
   }
 
   /// `escape`. With `ret` false, a function that goes to effect's code goes without what it
-  /// returns (`typed_callback`'s callbacks declared to return no service); the first
-  /// escape that hands its return over, whenever it comes, does.
+  /// returns (`typed_callback`'s callbacks declared to return no service). A repeat or host
+  /// escape that hands the return over later releases it into effect's code (`release_ret`).
   fn escape_with(&mut self, obj: ObjId, flavour: Flavour, site: Option<Site>, ret: bool) {
     // Each obligation (a host builtin, effect's code, code the pass can't see) runs once,
     // whatever ran before: each hands over something the others don't.
@@ -6968,8 +6968,8 @@ impl Analysis {
       Flavour::Ext => &mut self.genuine_escaped,
     };
     let repeat = !marks.insert(obj);
-    // A later escape that hands over a return held back so far (whatever its order). A first
-    // escape to code the pass can't see hands the return over itself.
+    // A return held back so far goes to effect's code at a repeat or host escape. A function's
+    // first escape to unseen code hands its return there only; the handover to effect stays owed.
     if ret && (repeat || flavour == Flavour::Host) && self.ret_withheld.remove(&obj) {
       self.release_ret(obj);
     }
@@ -7428,8 +7428,8 @@ mod tests {
 
   /// A function that returns an object is handed to effect's code twice: once without its
   /// return (a callback declared to return no service) and once by `second`. Each step is
-  /// solved before the next, in the order given. Returns whether the object it returns went to
-  /// effect's code.
+  /// solved before the next, in the order given. Returns whether the object it returns escaped,
+  /// under any flavour.
   fn withheld_return(withheld_first: bool, second: Option<fn(&mut Analysis, ObjId)>) -> bool {
     let mut a = Analysis::new();
     let vars = [a.var(), a.var(), a.var(), a.var(), a.var()];
@@ -7457,8 +7457,10 @@ mod tests {
   }
 
   /// Withholding a callback's return depends on no order: a later or earlier handover that
-  /// passes the return (into effect's code, unseen code or a host builtin) sends it, and only a
-  /// function never handed over with its return keeps it.
+  /// passes the return (into effect's code, unseen code or a host builtin) sends it somewhere,
+  /// and only a function never handed over with its return keeps it. This observes that the
+  /// return escaped under some flavour (`escaped`), not that it reached effect's code
+  /// (`effect_escaped`): after unseen code it does not (implementation.md, "Open before PR").
   #[test]
   fn withheld_return_is_order_independent() {
     let effect: fn(&mut Analysis, ObjId) = |a, f| a.escape(f, Flavour::Ext, Some(EFFECT_ESCAPE));
