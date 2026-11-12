@@ -2026,6 +2026,7 @@ export interface BindingChecksOptions {
   shimmedExport?: boolean
   deprecatedImportAssertion?: boolean
   invalidImportAttribute?: boolean
+  effectServiceShaking?: boolean
 }
 
 export interface BindingChunkImportMap {
@@ -2314,6 +2315,7 @@ export interface BindingExperimentalOptions {
   chunkOptimization?: boolean | BindingChunkOptimizationOptions
   lazyBarrel?: boolean
   importAttributes?: boolean
+  effectServiceShaking?: boolean
 }
 
 export interface BindingFilterToken {
