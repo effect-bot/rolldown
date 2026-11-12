@@ -9369,6 +9369,89 @@ mod tests {
     assert_eq!(late_after_two_marks(Arrival::Spread), vec![]);
   }
 
+  /// A function stored by name on `globalThis`, with no escape of its own, escapes to a host
+  /// builtin: the global object carries the Host mark (`mark_host_escaped`), and a value put on
+  /// it later escapes under that mark (`escape_late`).
+  #[test]
+  fn store_on_global_this_escapes_to_the_host() {
+    let mut a = Analysis::new();
+    let mut globals = FxHashMap::default();
+    let global = super::super::host::resolve_global(&mut a, &mut globals, "globalThis");
+    let (closure, param) = one_param_fn(&mut a);
+    let src = a.var();
+    a.seed(src, closure);
+    a.constrain(global, Constraint::Store { key: Key::Name(ArcStr::from("late")), src });
+    a.solve();
+    assert!(a.pts(param).contains(&a.top_host));
+  }
+
+  /// The flavour an unresolved global name resolves to (`resolve_global`).
+  fn global_flavour(name: &str) -> Option<Flavour> {
+    let mut a = Analysis::new();
+    let mut globals = FxHashMap::default();
+    let v = super::super::host::resolve_global(&mut a, &mut globals, name);
+    let objs: Vec<ObjId> = a.pts(v).iter().copied().collect();
+    assert_eq!(objs.len(), 1, "{name}");
+    match &a.objs[objs[0]].kind {
+      ObjKind::External { flavour, .. } => Some(*flavour),
+      _ => None,
+    }
+  }
+
+  /// The 19 standard globals without a rule of their own are host builtins; any other
+  /// unresolved name is code the pass can't see. The names are written out here, not read from
+  /// the list the model uses.
+  #[test]
+  fn unresolved_globals_are_host_only_when_listed() {
+    for name in [
+      "AbortController",
+      "ArrayBuffer",
+      "Blob",
+      "Buffer",
+      "File",
+      "FinalizationRegistry",
+      "FormData",
+      "RegExp",
+      "Request",
+      "Response",
+      "TextDecoder",
+      "TextEncoder",
+      "URL",
+      "URLSearchParams",
+      "Uint8Array",
+      "atob",
+      "btoa",
+      "crypto",
+      "navigator",
+    ] {
+      assert_eq!(global_flavour(name), Some(Flavour::Host), "{name}");
+    }
+    assert_eq!(global_flavour("zzUnlistedGlobal"), Some(Flavour::Ext));
+  }
+
+  /// A function goes to effect's code without its return, then to a host builtin, then to
+  /// effect's code with its return, each step solved. The object it returns goes to effect's
+  /// code: the host escape releases the withheld return (it drops the withheld mark), so the
+  /// later effect escape, a repeat, has nothing left to release.
+  #[test]
+  fn withheld_then_host_then_effect_sends_the_return_to_effect() {
+    let mut a = Analysis::new();
+    let vars = [a.var(), a.var(), a.var(), a.var(), a.var()];
+    let f = a.fns.push(FnInfo::new(ModuleIdx::from_raw_unchecked(0), 0, FnKind::Arrow, vars));
+    let closure = a.alloc(ObjKind::Closure(f), None);
+    a.fns[f].closure = Some(closure);
+    let returned = a.alloc(ObjKind::Object, None);
+    let ret = a.fns[f].ret;
+    a.seed(ret, returned);
+    a.escape_with(closure, Flavour::Ext, Some(EFFECT_ESCAPE), false);
+    a.solve();
+    a.escape(closure, Flavour::Host, None);
+    a.solve();
+    a.escape(closure, Flavour::Ext, Some(EFFECT_ESCAPE));
+    a.solve();
+    assert!(a.effect_escaped.contains(&returned));
+  }
+
   /// Guard: over the budget, replay and the named-load index stop (`replay_stopped`). A read,
   /// a late element, prototype or spread source adds no row, copy or constraint, and the solve
   /// stops keeping everything even after the totals come back under the cap, as widening may
